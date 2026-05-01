@@ -6,8 +6,11 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from vllm.v1.spec_decode.dynamic_tree import (  # noqa: E402
+    DynamicDraftTreeManager,
     build_dynamic_tree,
+    build_dynamic_tree_from_logits,
     verify_dynamic_tree_greedy,
+    verify_dynamic_tree_greedy_from_draft,
 )
 
 
@@ -258,6 +261,111 @@ def test_verify_dynamic_tree_greedy_invalid_tree_accepts_only_bonus():
     assert output.accept_index.tolist() == [[0, 0, 0]]
     assert output.accept_token.tolist() == [[11, 0, 0]]
     assert output.predicts.tolist() == [[11, 0, 0]]
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not _cuda_is_usable(), reason="CUDA is not usable"
+            ),
+        ),
+    ],
+)
+def test_build_dynamic_tree_from_logits_selects_and_verifies_tree(device):
+    top_k = 2
+    depth = 3
+    max_total_draft_tokens = 4
+
+    root_logits = torch.tensor([[0.0, 4.0, 3.0, -2.0, -2.0, -2.0]], device=device)
+    depth1_logits = torch.tensor(
+        [
+            [
+                [-2.0, -2.0, -2.0, 4.0, 3.0, -2.0],
+                [-2.0, -2.0, -2.0, -2.0, 1.0, 4.0],
+            ]
+        ],
+        device=device,
+    )
+    depth2_logits = torch.tensor(
+        [
+            [
+                [-2.0, -2.0, -2.0, -2.0, 4.0, 3.0],
+                [-2.0, -2.0, -2.0, 4.0, -2.0, 3.0],
+            ]
+        ],
+        device=device,
+    )
+
+    draft = build_dynamic_tree_from_logits(
+        root_logits,
+        [depth1_logits, depth2_logits],
+        top_k=top_k,
+        depth=depth,
+        max_total_draft_tokens=max_total_draft_tokens,
+    )
+
+    assert draft.draft_token_ids.cpu().tolist() == [[1, 2, 3, 4]]
+    assert draft.selected_index.cpu().tolist() == [[0, 1, 2, 6]]
+    assert draft.parent_list.cpu().tolist() == [[-1, 0, 1, 2, 4]]
+    assert draft.history_draft_token_ids.cpu().tolist() == [
+        [1, 2, 3, 4, 5, 4, 4, 5, 3, 5]
+    ]
+
+    build = draft.build_output
+    assert build.retrieve_next_token.cpu().tolist() == [[1, 3, -1, 4, -1]]
+    assert build.retrieve_next_sibling.cpu().tolist() == [[-1, 2, -1, -1, -1]]
+    assert build.positions.cpu().tolist() == [[0, 1, 1, 2, 3]]
+
+    candidates = draft.candidates(root_token_ids=torch.tensor([101], device=device))
+    assert candidates.cpu().tolist() == [[101, 1, 2, 3, 4]]
+
+    target_predict = torch.tensor([[1, 3, 99, 4, 42]], device=device)
+    verify = verify_dynamic_tree_greedy_from_draft(draft, target_predict)
+
+    assert verify.accept_token_num.cpu().tolist() == [3]
+    assert verify.accept_index.cpu().tolist() == [[0, 1, 3, 4]]
+    assert verify.accept_token.cpu().tolist() == [[1, 3, 4, 42]]
+    assert verify.predicts.cpu().tolist() == [[1, 3, 0, 4, 42]]
+
+
+def test_dynamic_draft_tree_manager_matches_functional_api():
+    manager = DynamicDraftTreeManager(
+        top_k=2,
+        depth=2,
+        max_total_draft_tokens=3,
+    )
+    root_logits = torch.tensor([[0.0, 4.0, 3.0, -2.0, -2.0]])
+    child_logits = torch.tensor(
+        [
+            [
+                [-2.0, -2.0, -2.0, 4.0, 3.0],
+                [-2.0, -2.0, -2.0, -2.0, 4.0],
+            ]
+        ]
+    )
+
+    direct = build_dynamic_tree_from_logits(
+        root_logits,
+        [child_logits],
+        top_k=2,
+        depth=2,
+        max_total_draft_tokens=3,
+    )
+    managed = manager.build_from_logits(root_logits, [child_logits])
+
+    assert torch.equal(managed.draft_token_ids, direct.draft_token_ids)
+    assert torch.equal(managed.selected_index, direct.selected_index)
+    assert torch.equal(managed.parent_list, direct.parent_list)
+
+    target_predict = torch.tensor([[1, 3, 99, 42]])
+    assert torch.equal(
+        manager.verify_greedy(managed, target_predict).accept_token,
+        verify_dynamic_tree_greedy_from_draft(direct, target_predict).accept_token,
+    )
 
 
 @pytest.mark.parametrize(
