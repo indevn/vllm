@@ -381,12 +381,13 @@ def _run_eagle_correctness(
     enable_chunked_prefill: bool,
     model_impl: str,
     attn_backend: str,
+    allow_tree_attn: bool = False,
 ):
     """
     Compare the outputs of an original LLM and a speculative LLM
     which should be the same when using eagle speculative decoding.
     """
-    if attn_backend == "TREE_ATTN":
+    if attn_backend == "TREE_ATTN" and not allow_tree_attn:
         pytest.skip(
             "TREE_ATTN is flaky in the test disable for now until it can be "
             "resolved (see https://github.com/vllm-project/vllm/issues/22922)"
@@ -537,6 +538,51 @@ def test_eagle_correctness_light(
         enable_chunked_prefill,
         model_impl,
         attn_backend,
+    )
+
+
+@single_gpu_only
+@pytest.mark.skipif(
+    os.environ.get("VLLM_ENABLE_TREE_ATTN_E2E_BASELINE") != "1",
+    reason=(
+        "TREE_ATTN EAGLE e2e baseline is opt-in because TREE_ATTN is "
+        "currently flaky; set VLLM_ENABLE_TREE_ATTN_E2E_BASELINE=1 to run."
+    ),
+)
+@pytest.mark.parametrize(
+    "repeat_idx",
+    range(max(1, int(os.environ.get("VLLM_TREE_ATTN_E2E_REPEATS", "1")))),
+)
+def test_eagle_tree_attn_correctness_light_baseline(
+    monkeypatch: pytest.MonkeyPatch,
+    sampling_config: SamplingParams,
+    repeat_idx: int,
+):
+    """Opt-in baseline to measure TREE_ATTN e2e flakiness.
+
+    This intentionally uses the light random EAGLE pair so developers can run
+    repeated attempts with stable prompts and sampling:
+
+    VLLM_ENABLE_TREE_ATTN_E2E_BASELINE=1 VLLM_TREE_ATTN_E2E_REPEATS=10 \
+        pytest tests/v1/e2e/spec_decode/test_spec_decode.py \
+        -k test_eagle_tree_attn_correctness_light_baseline
+    """
+    del repeat_idx
+    _run_eagle_correctness(
+        monkeypatch,
+        sampling_config,
+        (
+            "eagle",
+            "eagle618/deepseek-v3-random",
+            "eagle618/eagle-deepseek-v3-random",
+            1,
+        ),
+        False,
+        0.0,
+        False,
+        "auto",
+        "TREE_ATTN",
+        allow_tree_attn=True,
     )
 
 

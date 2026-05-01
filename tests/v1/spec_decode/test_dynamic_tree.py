@@ -1,0 +1,371 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+import pytest
+
+torch = pytest.importorskip("torch")
+
+from vllm.v1.spec_decode.dynamic_tree import (  # noqa: E402
+    build_dynamic_tree,
+    verify_dynamic_tree_greedy,
+)
+
+
+def _cuda_is_usable():
+    try:
+        torch.empty(1, device="cuda")
+    except Exception:
+        return False
+    return True
+
+
+def _reference_tree(parent_list, selected_index, top_k, depth):
+    num_draft_tokens = len(selected_index) + 1
+    selected_to_position = {
+        history_idx: pos + 1 for pos, history_idx in enumerate(selected_index)
+    }
+    mask = [[0] * num_draft_tokens for _ in range(num_draft_tokens)]
+    positions = [0] * num_draft_tokens
+    retrieve_index = list(range(num_draft_tokens))
+    next_token = [-1] * num_draft_tokens
+    next_sibling = [-1] * num_draft_tokens
+
+    for row in mask:
+        row[0] = 1
+
+    for local_idx in range(num_draft_tokens - 1, 0, -1):
+        parent_table_idx = selected_index[local_idx - 1] // top_k
+        if parent_table_idx == 0:
+            parent_position = 0
+        elif parent_table_idx >= len(parent_list):
+            continue
+        else:
+            parent_position = selected_to_position.get(parent_list[parent_table_idx])
+            if parent_position is None:
+                continue
+
+        old_first_child = next_token[parent_position]
+        next_token[parent_position] = local_idx
+        if old_first_child != -1:
+            next_sibling[local_idx] = old_first_child
+
+    for local_idx in range(1, num_draft_tokens):
+        selected_pos = local_idx - 1
+        position = 0
+        while position < depth + 1:
+            position += 1
+            mask[local_idx][selected_pos + 1] = 1
+
+            parent_table_idx = selected_index[selected_pos] // top_k
+            if parent_table_idx == 0:
+                break
+            parent_position = selected_to_position.get(parent_list[parent_table_idx])
+            if parent_position is None:
+                break
+            selected_pos = parent_position - 1
+        positions[local_idx] = position
+
+    return mask, positions, retrieve_index, next_token, next_sibling
+
+
+def _reference_verify(
+    candidates,
+    retrieve_index,
+    retrieve_next_token,
+    retrieve_next_sibling,
+    target_predict,
+    num_spec_steps,
+    tree_valid=True,
+):
+    num_draft_tokens = len(candidates)
+    predicts = [0] * num_draft_tokens
+    accept_index = [0] * num_spec_steps
+    accept_token = [0] * num_spec_steps
+
+    if not tree_valid:
+        accept_token[0] = target_predict[0]
+        predicts[0] = target_predict[0]
+        return predicts, accept_index, 0, accept_token
+
+    last_accepted_local_idx = retrieve_index[0]
+    accept_index[0] = last_accepted_local_idx
+    accept_token[0] = target_predict[last_accepted_local_idx]
+    cur_index = 0
+    num_accepted_tokens = 0
+
+    for _ in range(1, num_spec_steps):
+        cur_index = retrieve_next_token[cur_index]
+
+        while cur_index != -1:
+            draft_local_idx = retrieve_index[cur_index]
+            if candidates[cur_index] == target_predict[last_accepted_local_idx]:
+                predicts[last_accepted_local_idx] = target_predict[
+                    last_accepted_local_idx
+                ]
+                num_accepted_tokens += 1
+                accept_index[num_accepted_tokens] = draft_local_idx
+                accept_token[num_accepted_tokens] = target_predict[draft_local_idx]
+                last_accepted_local_idx = draft_local_idx
+                break
+            cur_index = retrieve_next_sibling[cur_index]
+
+        if cur_index == -1:
+            break
+
+    predicts[last_accepted_local_idx] = target_predict[last_accepted_local_idx]
+    return predicts, accept_index, num_accepted_tokens, accept_token
+
+
+def test_build_dynamic_tree_reference_branching():
+    # K=2 history layout:
+    #   selected 0, 1 -> root children
+    #   selected 2    -> child of selected 0
+    #   selected 4    -> child of selected 2
+    # Final local tree:
+    #   0(root) -> 1 -> 3 -> 4
+    #           -> 2
+    parent_list = torch.tensor([[0, 0, 2, 0, 0]], dtype=torch.int64)
+    selected_index = torch.tensor([[0, 1, 2, 4]], dtype=torch.int64)
+
+    output = build_dynamic_tree(
+        parent_list,
+        selected_index,
+        top_k=2,
+        depth=3,
+    )
+
+    expected_mask = torch.tensor(
+        [
+            [
+                [1, 0, 0, 0, 0],
+                [1, 1, 0, 0, 0],
+                [1, 0, 1, 0, 0],
+                [1, 1, 0, 1, 0],
+                [1, 1, 0, 1, 1],
+            ]
+        ],
+        dtype=torch.int32,
+    )
+    expected_positions = torch.tensor([[0, 1, 1, 2, 3]], dtype=torch.int32)
+    expected_retrieve = torch.tensor([[0, 1, 2, 3, 4]], dtype=torch.int32)
+    expected_next_token = torch.tensor([[1, 3, -1, 4, -1]], dtype=torch.int32)
+    expected_next_sibling = torch.tensor([[-1, 2, -1, -1, -1]], dtype=torch.int32)
+
+    assert torch.equal(output.tree_mask.cpu(), expected_mask)
+    assert torch.equal(output.positions.cpu(), expected_positions)
+    assert torch.equal(output.retrieve_index.cpu(), expected_retrieve)
+    assert torch.equal(output.retrieve_next_token.cpu(), expected_next_token)
+    assert torch.equal(output.retrieve_next_sibling.cpu(), expected_next_sibling)
+
+
+def test_build_dynamic_tree_ignores_unselected_parent_in_child_links():
+    parent_list = torch.tensor([[0, 0, 99]], dtype=torch.int64)
+    selected_index = torch.tensor([[0, 4]], dtype=torch.int64)
+
+    output = build_dynamic_tree(
+        parent_list,
+        selected_index,
+        top_k=2,
+        depth=2,
+    )
+
+    # selected 4 points at parent table row 2, whose history token 99 was not
+    # selected into the final tree.  The node remains addressable but is not
+    # linked as a reachable child, matching TRT's "ignored token" behavior.
+    assert output.retrieve_next_token.tolist() == [[1, -1, -1]]
+    assert output.retrieve_next_sibling.tolist() == [[-1, -1, -1]]
+    assert output.positions.tolist() == [[0, 1, 1]]
+    assert output.tree_mask.tolist() == [
+        [
+            [1, 0, 0],
+            [1, 1, 0],
+            [1, 0, 1],
+        ]
+    ]
+
+
+def test_verify_dynamic_tree_greedy_accepts_first_matching_path():
+    build = build_dynamic_tree(
+        torch.tensor([[0, 0, 2, 0, 0]], dtype=torch.int64),
+        torch.tensor([[0, 1, 2, 4]], dtype=torch.int64),
+        top_k=2,
+        depth=3,
+    )
+    candidates = torch.tensor([[101, 11, 12, 13, 14]], dtype=torch.int64)
+    target_predict = torch.tensor([[11, 13, 99, 14, 42]], dtype=torch.int64)
+
+    output = verify_dynamic_tree_greedy(
+        candidates,
+        build.retrieve_index,
+        build.retrieve_next_token,
+        build.retrieve_next_sibling,
+        target_predict,
+        num_spec_steps=4,
+    )
+
+    assert output.accept_token_num.tolist() == [3]
+    assert output.accept_index.tolist() == [[0, 1, 3, 4]]
+    assert output.accept_token.tolist() == [[11, 13, 14, 42]]
+    assert output.predicts.tolist() == [[11, 13, 0, 14, 42]]
+
+
+def test_verify_dynamic_tree_greedy_scans_siblings_and_stops_on_miss():
+    build = build_dynamic_tree(
+        torch.tensor([[0, 0, 2, 0, 0]], dtype=torch.int64),
+        torch.tensor([[0, 1, 2, 4]], dtype=torch.int64),
+        top_k=2,
+        depth=3,
+    )
+    candidates = torch.tensor([[101, 11, 12, 13, 14]], dtype=torch.int64)
+    target_predict = torch.tensor([[12, 77, 88, 99, 100]], dtype=torch.int64)
+
+    output = verify_dynamic_tree_greedy(
+        candidates,
+        build.retrieve_index,
+        build.retrieve_next_token,
+        build.retrieve_next_sibling,
+        target_predict,
+        num_spec_steps=4,
+    )
+
+    assert output.accept_token_num.tolist() == [1]
+    assert output.accept_index.tolist() == [[0, 2, 0, 0]]
+    assert output.accept_token.tolist() == [[12, 88, 0, 0]]
+    assert output.predicts.tolist() == [[12, 0, 88, 0, 0]]
+
+
+def test_verify_dynamic_tree_greedy_invalid_tree_accepts_only_bonus():
+    build = build_dynamic_tree(
+        torch.tensor([[0, 0, 2]], dtype=torch.int64),
+        torch.tensor([[0, 1]], dtype=torch.int64),
+        top_k=2,
+        depth=2,
+    )
+    candidates = torch.tensor([[101, 11, 12]], dtype=torch.int64)
+    target_predict = torch.tensor([[11, 13, 14]], dtype=torch.int64)
+
+    output = verify_dynamic_tree_greedy(
+        candidates,
+        build.retrieve_index,
+        build.retrieve_next_token,
+        build.retrieve_next_sibling,
+        target_predict,
+        num_spec_steps=3,
+        tree_valid=torch.tensor([False]),
+    )
+
+    assert output.accept_token_num.tolist() == [0]
+    assert output.accept_index.tolist() == [[0, 0, 0]]
+    assert output.accept_token.tolist() == [[11, 0, 0]]
+    assert output.predicts.tolist() == [[11, 0, 0]]
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not _cuda_is_usable(), reason="CUDA is not usable"
+            ),
+        ),
+    ],
+)
+def test_dynamic_tree_matches_independent_oracle_for_random_valid_trees(device):
+    generator = torch.Generator().manual_seed(0)
+    top_k = 3
+    depth = 4
+    batch_size = 4
+    num_selected = 9
+    parent_width = top_k * (depth - 1) + 1
+
+    parent_rows = []
+    selected_rows = []
+    for batch_idx in range(batch_size):
+        selected = list(range(num_selected))
+        parent = [0] * parent_width
+        for table_idx in range(1, parent_width):
+            parent[table_idx] = selected[(table_idx + batch_idx - 1) % table_idx]
+        parent_rows.append(parent)
+        selected_rows.append(selected)
+
+    parent_list = torch.tensor(parent_rows, dtype=torch.int64, device=device)
+    selected_index = torch.tensor(selected_rows, dtype=torch.int64, device=device)
+
+    build = build_dynamic_tree(
+        parent_list,
+        selected_index,
+        top_k=top_k,
+        depth=depth,
+    )
+
+    expected_masks = []
+    expected_positions = []
+    expected_retrieve = []
+    expected_next_token = []
+    expected_next_sibling = []
+    for parent, selected in zip(parent_rows, selected_rows):
+        mask, positions, retrieve, next_token, next_sibling = _reference_tree(
+            parent, selected, top_k, depth
+        )
+        expected_masks.append(mask)
+        expected_positions.append(positions)
+        expected_retrieve.append(retrieve)
+        expected_next_token.append(next_token)
+        expected_next_sibling.append(next_sibling)
+
+    assert build.tree_mask.cpu().tolist() == expected_masks
+    assert build.positions.cpu().tolist() == expected_positions
+    assert build.retrieve_index.cpu().tolist() == expected_retrieve
+    assert build.retrieve_next_token.cpu().tolist() == expected_next_token
+    assert build.retrieve_next_sibling.cpu().tolist() == expected_next_sibling
+
+    candidates = torch.randint(
+        10, 1000, (batch_size, num_selected + 1), generator=generator
+    ).to(device)
+    target_predict = torch.randint(
+        10, 1000, (batch_size, num_selected + 1), generator=generator
+    ).to(device)
+    tree_valid = torch.tensor([True, True, False, True], device=device)
+
+    # Force several deterministic accepted paths, including sibling fallback.
+    target_predict[0, 0] = candidates[0, 1]
+    target_predict[0, 1] = candidates[0, 4]
+    target_predict[1, 0] = candidates[1, 3]
+    target_predict[1, 3] = candidates[1, 8]
+    target_predict[3, 0] = candidates[3, 2]
+
+    verify = verify_dynamic_tree_greedy(
+        candidates,
+        build.retrieve_index,
+        build.retrieve_next_token,
+        build.retrieve_next_sibling,
+        target_predict,
+        num_spec_steps=depth + 1,
+        tree_valid=tree_valid,
+    )
+
+    expected_predicts = []
+    expected_accept_index = []
+    expected_accept_token_num = []
+    expected_accept_token = []
+    for batch_idx in range(batch_size):
+        predicts, accept_index, accept_token_num, accept_token = _reference_verify(
+            candidates[batch_idx].cpu().tolist(),
+            expected_retrieve[batch_idx],
+            expected_next_token[batch_idx],
+            expected_next_sibling[batch_idx],
+            target_predict[batch_idx].cpu().tolist(),
+            depth + 1,
+            bool(tree_valid[batch_idx].item()),
+        )
+        expected_predicts.append(predicts)
+        expected_accept_index.append(accept_index)
+        expected_accept_token_num.append(accept_token_num)
+        expected_accept_token.append(accept_token)
+
+    assert verify.predicts.cpu().tolist() == expected_predicts
+    assert verify.accept_index.cpu().tolist() == expected_accept_index
+    assert verify.accept_token_num.cpu().tolist() == expected_accept_token_num
+    assert verify.accept_token.cpu().tolist() == expected_accept_token
