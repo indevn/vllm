@@ -19,6 +19,7 @@ from vllm.v1.sample.ops.bad_words import apply_bad_words_with_drafts
 from vllm.v1.sample.ops.penalties import apply_all_penalties
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.sample.sampler import Sampler
+from vllm.v1.spec_decode.dynamic_tree import verify_dynamic_tree_greedy
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
 
@@ -116,6 +117,46 @@ class RejectionSampler(nn.Module):
                 requested.
         """
         assert metadata.max_spec_len <= MAX_SPEC_LEN
+        if metadata.has_tree_metadata:
+            if not sampling_metadata.all_greedy:
+                raise NotImplementedError(
+                    "Dynamic Draft Tree verification currently supports "
+                    "greedy sampling only."
+                )
+            if draft_probs is not None:
+                raise NotImplementedError(
+                    "Dynamic Draft Tree verification does not support "
+                    "draft probabilities yet."
+                )
+            if self.synthetic_mode:
+                raise NotImplementedError(
+                    "Dynamic Draft Tree verification does not support "
+                    "synthetic acceptance yet."
+                )
+            if sampling_metadata.max_num_logprobs is not None:
+                raise NotImplementedError(
+                    "Dynamic Draft Tree verification does not support "
+                    "spec decode logprobs yet."
+                )
+            if (
+                not sampling_metadata.no_penalties
+                or sampling_metadata.allowed_token_ids_mask is not None
+                or sampling_metadata.bad_words_token_ids
+                or sampling_metadata.logitsprocs.non_argmax_invariant
+            ):
+                raise NotImplementedError(
+                    "Dynamic Draft Tree verification does not support "
+                    "sampling constraints or logits processors yet."
+                )
+            output_token_ids = tree_rejection_greedy_sample(
+                metadata,
+                logits,
+                sampling_metadata,
+            )
+            return SamplerOutput(
+                sampled_token_ids=output_token_ids,
+                logprobs_tensors=None,
+            )
 
         bonus_logits_indices = metadata.bonus_logits_indices
         target_logits_indices = metadata.target_logits_indices
@@ -501,6 +542,123 @@ def rejection_sample(
         SYNTHETIC_MODE=synthetic_mode,
     )
     return output_token_ids
+
+
+def tree_rejection_greedy_sample(
+    metadata: SpecDecodeMetadata,
+    # [num_model_logits, vocab_size]
+    logits: torch.Tensor,
+    sampling_metadata: SamplingMetadata,
+) -> torch.Tensor:
+    """Greedy tree-aware verification for Dynamic Draft Tree metadata.
+
+    This path is intentionally narrow: it consumes root-inclusive tree logits
+    and retrieve links, verifies one accepted path per request, and writes the
+    accepted target tokens in vLLM's standard sampler output shape.  Stochastic
+    tree rejection and logprobs are handled by later phases.
+    """
+
+    if not metadata.has_tree_metadata:
+        raise ValueError("tree metadata is required")
+    if not sampling_metadata.all_greedy:
+        raise NotImplementedError(
+            "Dynamic Draft Tree verification currently supports greedy sampling only."
+        )
+
+    assert metadata.tree_target_logits_indices is not None
+    assert metadata.tree_retrieve_index is not None
+    assert metadata.tree_retrieve_next_token is not None
+    assert metadata.tree_retrieve_next_sibling is not None
+    assert metadata.tree_num_spec_steps is not None
+
+    tree_logits_indices = metadata.tree_target_logits_indices
+    retrieve_index = metadata.tree_retrieve_index
+    retrieve_next_token = metadata.tree_retrieve_next_token
+    retrieve_next_sibling = metadata.tree_retrieve_next_sibling
+    tree_num_spec_steps = metadata.tree_num_spec_steps
+    tree_valid = metadata.tree_valid
+
+    if tree_logits_indices.ndim != 2:
+        raise ValueError(
+            f"tree_target_logits_indices must be 2D, got {tree_logits_indices.shape}"
+        )
+    batch_size = len(metadata.num_draft_tokens)
+    max_tree_nodes = tree_logits_indices.shape[1]
+    if tree_logits_indices.shape[0] != batch_size:
+        raise ValueError(
+            "tree_target_logits_indices batch size must match metadata, got "
+            f"{tree_logits_indices.shape[0]} and {batch_size}"
+        )
+    for name, tensor in (
+        ("tree_retrieve_index", retrieve_index),
+        ("tree_retrieve_next_token", retrieve_next_token),
+        ("tree_retrieve_next_sibling", retrieve_next_sibling),
+    ):
+        if tensor.shape != (batch_size, max_tree_nodes):
+            raise ValueError(
+                f"{name} must have shape ({batch_size}, {max_tree_nodes}), "
+                f"got {tensor.shape}"
+            )
+    if tree_num_spec_steps <= 0 or tree_num_spec_steps > metadata.max_spec_len + 1:
+        raise ValueError(
+            "tree_num_spec_steps must fit the sampler output width, got "
+            f"{tree_num_spec_steps} for max_spec_len={metadata.max_spec_len}"
+        )
+
+    tree_logits = logits[tree_logits_indices.to(torch.long)].to(torch.float32)
+    target_predict = tree_logits.argmax(dim=-1)
+    candidates = _padded_tree_candidates(metadata.draft_token_ids, metadata)
+    verify = verify_dynamic_tree_greedy(
+        candidates,
+        retrieve_index,
+        retrieve_next_token,
+        retrieve_next_sibling,
+        target_predict,
+        num_spec_steps=tree_num_spec_steps,
+        tree_valid=tree_valid,
+    )
+
+    output_token_ids = torch.full(
+        (batch_size, metadata.max_spec_len + 1),
+        PLACEHOLDER_TOKEN_ID,
+        dtype=torch.int32,
+        device=logits.device,
+    )
+    valid_steps = (verify.accept_token_num + 1).clamp(max=tree_num_spec_steps)
+    offsets = torch.arange(tree_num_spec_steps, device=logits.device)
+    valid_mask = offsets.unsqueeze(0) < valid_steps.unsqueeze(1)
+    output_token_ids[:, :tree_num_spec_steps][valid_mask] = verify.accept_token.to(
+        torch.int32
+    )[valid_mask]
+    return output_token_ids
+
+
+def _padded_tree_candidates(
+    draft_token_ids: torch.Tensor,
+    metadata: SpecDecodeMetadata,
+) -> torch.Tensor:
+    assert metadata.tree_target_logits_indices is not None
+    batch_size, max_tree_nodes = metadata.tree_target_logits_indices.shape
+    candidates = torch.zeros(
+        (batch_size, max_tree_nodes),
+        dtype=draft_token_ids.dtype,
+        device=draft_token_ids.device,
+    )
+
+    start_idx = 0
+    for req_idx, num_draft_tokens in enumerate(metadata.num_draft_tokens):
+        end_idx = start_idx + num_draft_tokens
+        if num_draft_tokens > max_tree_nodes - 1:
+            raise ValueError(
+                "num_draft_tokens cannot exceed root-inclusive tree width - 1, "
+                f"got {num_draft_tokens} and width {max_tree_nodes}"
+            )
+        candidates[req_idx, 1 : num_draft_tokens + 1] = draft_token_ids[
+            start_idx:end_idx
+        ]
+        start_idx = end_idx
+
+    return candidates
 
 
 def apply_sampling_constraints(

@@ -22,9 +22,34 @@ class SpecDecodeMetadata:
     bonus_logits_indices: torch.Tensor
     # [num_tokens + batch_size]
     logits_indices: torch.Tensor
+    # Optional Dynamic Draft Tree metadata.  These tensors are root-inclusive
+    # and padded to a common per-batch tree width.
+    # [batch_size, max_tree_nodes]
+    tree_target_logits_indices: torch.Tensor | None = None
+    # [batch_size, max_tree_nodes]
+    tree_retrieve_index: torch.Tensor | None = None
+    # [batch_size, max_tree_nodes]
+    tree_retrieve_next_token: torch.Tensor | None = None
+    # [batch_size, max_tree_nodes]
+    tree_retrieve_next_sibling: torch.Tensor | None = None
+    # Number of output slots to verify: accepted draft path plus final target
+    # recovery/bonus token.  This is usually tree depth + 1.
+    tree_num_spec_steps: int | None = None
+    # [batch_size]
+    tree_valid: torch.Tensor | None = None
 
     def __post_init__(self):
         self.max_spec_len = max(self.num_draft_tokens)
+
+    @property
+    def has_tree_metadata(self) -> bool:
+        return (
+            self.tree_target_logits_indices is not None
+            and self.tree_retrieve_index is not None
+            and self.tree_retrieve_next_token is not None
+            and self.tree_retrieve_next_sibling is not None
+            and self.tree_num_spec_steps is not None
+        )
 
     @classmethod
     def make_dummy(

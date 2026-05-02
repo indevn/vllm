@@ -15,8 +15,14 @@ from vllm.v1.sample.rejection_sampler import (
     PLACEHOLDER_TOKEN_ID,
     RejectionSampler,
     sample_recovered_tokens,
+    tree_rejection_greedy_sample,
 )
 from vllm.v1.sample.sampler import Sampler, SamplerOutput
+from vllm.v1.spec_decode.dynamic_tree import (
+    DynamicTreeDraftOutput,
+    build_dynamic_tree,
+    build_dynamic_tree_from_logits,
+)
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 DEVICE_TYPE = current_platform.device_type
@@ -65,6 +71,14 @@ def create_logits_tensor(
         start_loc += len(tokens)
     if token_idx_to_override:
         logits[:, token_idx_to_override] = 99.0
+    return logits
+
+
+def create_argmax_logits(token_ids: list[int], vocab_size: int = 100) -> torch.Tensor:
+    vocab_size = max(vocab_size, max(token_ids) + 1)
+    logits = torch.full((len(token_ids), vocab_size), -100.0, device=DEVICE_TYPE)
+    for idx, token_id in enumerate(token_ids):
+        logits[idx, token_id] = 100.0
     return logits
 
 
@@ -303,6 +317,171 @@ def test_parametrized_cases(rejection_sampler, spec_tokens, output_tokens, expec
     )
     expected_tensor = torch.tensor(expected, dtype=torch.int, device=logits.device)
     assert torch.equal(output.sampled_token_ids, expected_tensor)
+
+
+#################### Tests for Greedy Dynamic Tree Sampling ############
+def create_tree_spec_decode_metadata(
+    draft_token_ids: list[list[int]],
+    target_token_ids: list[list[int]],
+    *,
+    top_k: int = 2,
+    depth: int = 3,
+) -> tuple[SpecDecodeMetadata, torch.Tensor]:
+    assert len(draft_token_ids) == len(target_token_ids)
+    build = build_dynamic_tree(
+        torch.tensor([[0, 0, 2, 0, 0]] * len(draft_token_ids), dtype=torch.int64),
+        torch.tensor([[0, 1, 2, 4]] * len(draft_token_ids), dtype=torch.int64),
+        top_k=top_k,
+        depth=depth,
+    )
+    logits = create_argmax_logits(sum(target_token_ids, []))
+    metadata = SpecDecodeMetadata.make_dummy(draft_token_ids, device=logits.device)
+    metadata.tree_target_logits_indices = torch.arange(
+        logits.shape[0], dtype=torch.int32, device=logits.device
+    ).view(len(draft_token_ids), -1)
+    metadata.tree_retrieve_index = build.retrieve_index.to(logits.device)
+    metadata.tree_retrieve_next_token = build.retrieve_next_token.to(logits.device)
+    metadata.tree_retrieve_next_sibling = build.retrieve_next_sibling.to(logits.device)
+    metadata.tree_num_spec_steps = depth + 1
+    return metadata, logits
+
+
+def create_dynamic_tree_spec_decode_metadata(
+    draft: DynamicTreeDraftOutput,
+    target_token_ids: list[list[int]],
+) -> tuple[SpecDecodeMetadata, torch.Tensor]:
+    logits = create_argmax_logits(sum(target_token_ids, []))
+    metadata = SpecDecodeMetadata.make_dummy(
+        draft.draft_token_ids.cpu().tolist(), device=logits.device
+    )
+    metadata.tree_target_logits_indices = torch.arange(
+        logits.shape[0], dtype=torch.int32, device=logits.device
+    ).view(draft.draft_token_ids.shape[0], -1)
+    metadata.tree_retrieve_index = draft.build_output.retrieve_index.to(logits.device)
+    metadata.tree_retrieve_next_token = draft.build_output.retrieve_next_token.to(
+        logits.device
+    )
+    metadata.tree_retrieve_next_sibling = draft.build_output.retrieve_next_sibling.to(
+        logits.device
+    )
+    metadata.tree_num_spec_steps = draft.depth + 1
+    return metadata, logits
+
+
+def test_tree_rejection_greedy_sample_accepts_branching_path():
+    metadata, logits = create_tree_spec_decode_metadata(
+        draft_token_ids=[[11, 12, 13, 14]],
+        target_token_ids=[[11, 13, 99, 14, 42]],
+    )
+    sampling_metadata = create_sampling_metadata(all_greedy=True)
+
+    output = tree_rejection_greedy_sample(metadata, logits, sampling_metadata)
+
+    expected = torch.tensor(
+        [[11, 13, 14, 42, PLACEHOLDER_TOKEN_ID]],
+        dtype=torch.int32,
+        device=DEVICE_TYPE,
+    )
+    assert torch.equal(output, expected)
+
+
+def test_tree_rejection_greedy_sample_scans_siblings_and_stops_on_miss():
+    metadata, logits = create_tree_spec_decode_metadata(
+        draft_token_ids=[[11, 12, 13, 14]],
+        target_token_ids=[[12, 77, 88, 99, 100]],
+    )
+    sampling_metadata = create_sampling_metadata(all_greedy=True)
+
+    output = tree_rejection_greedy_sample(metadata, logits, sampling_metadata)
+
+    expected = torch.tensor(
+        [[12, 88, PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID]],
+        dtype=torch.int32,
+        device=DEVICE_TYPE,
+    )
+    assert torch.equal(output, expected)
+
+
+def test_rejection_sampler_routes_tree_metadata_to_tree_verifier(rejection_sampler):
+    metadata, logits = create_tree_spec_decode_metadata(
+        draft_token_ids=[[11, 12, 13, 14], [21, 22, 23, 24]],
+        target_token_ids=[
+            [11, 13, 99, 14, 42],
+            [22, 77, 88, 99, 100],
+        ],
+    )
+    sampling_metadata = create_sampling_metadata(all_greedy=True)
+
+    output = rejection_sampler(
+        metadata,
+        draft_probs=None,
+        logits=logits,
+        sampling_metadata=sampling_metadata,
+    )
+
+    expected = torch.tensor(
+        [
+            [11, 13, 14, 42, PLACEHOLDER_TOKEN_ID],
+            [22, 88, PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID],
+        ],
+        dtype=torch.int32,
+        device=DEVICE_TYPE,
+    )
+    assert torch.equal(output.sampled_token_ids, expected)
+
+
+def test_rejection_sampler_closes_logits_built_dynamic_tree_loop(
+    rejection_sampler,
+):
+    root_logits = torch.tensor(
+        [[0.0, 4.0, 3.0, -2.0, -2.0, -2.0]],
+        device=DEVICE_TYPE,
+    )
+    depth1_logits = torch.tensor(
+        [
+            [
+                [-2.0, -2.0, -2.0, 4.0, 3.0, -2.0],
+                [-2.0, -2.0, -2.0, -2.0, 1.0, 4.0],
+            ]
+        ],
+        device=DEVICE_TYPE,
+    )
+    depth2_logits = torch.tensor(
+        [
+            [
+                [-2.0, -2.0, -2.0, -2.0, 4.0, 3.0],
+                [-2.0, -2.0, -2.0, 4.0, -2.0, 3.0],
+            ]
+        ],
+        device=DEVICE_TYPE,
+    )
+    draft = build_dynamic_tree_from_logits(
+        root_logits,
+        [depth1_logits, depth2_logits],
+        top_k=2,
+        depth=3,
+        max_total_draft_tokens=4,
+    )
+    metadata, logits = create_dynamic_tree_spec_decode_metadata(
+        draft,
+        target_token_ids=[[1, 3, 99, 4, 42]],
+    )
+    sampling_metadata = create_sampling_metadata(all_greedy=True)
+
+    output = rejection_sampler(
+        metadata,
+        draft_probs=None,
+        logits=logits,
+        sampling_metadata=sampling_metadata,
+    )
+
+    expected = torch.tensor(
+        [[1, 3, 4, 42, PLACEHOLDER_TOKEN_ID]],
+        dtype=torch.int32,
+        device=DEVICE_TYPE,
+    )
+    assert draft.draft_token_ids.tolist() == [[1, 2, 3, 4]]
+    assert torch.equal(output.sampled_token_ids, expected)
 
 
 ########################### Tests for Random Sampling ###################
