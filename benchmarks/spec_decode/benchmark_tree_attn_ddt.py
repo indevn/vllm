@@ -63,7 +63,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tree",
         default="[(0,), (1,), (0, 0), (0, 1)]",
-        help="Static speculative token tree for TREE_ATTN cases.",
+        help=(
+            "Static speculative token tree for TREE_ATTN cases. Use 'auto' to "
+            "omit and let vLLM resolve the default chain."
+        ),
     )
     parser.add_argument(
         "--draft-attn-backend",
@@ -75,6 +78,15 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Attention backend for the target model. Defaults to TREE_ATTN for "
         "ddt_bridge and auto for the other cases.",
+    )
+    parser.add_argument(
+        "--ddt-max-draft-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Maximum number of draft nodes selected into the runtime DDT "
+            "verify subtree. Only used by ddt_bridge."
+        ),
     )
     parser.add_argument(
         "--disable-mla",
@@ -116,14 +128,21 @@ def build_llm(args: argparse.Namespace) -> LLM:
     spec_config = {
         "method": args.method,
         "model": args.draft_model,
-        "num_speculative_tokens": len(ast.literal_eval(args.tree)),
-        "speculative_token_tree": args.tree,
         "max_model_len": args.max_model_len,
     }
+    if args.tree == "auto":
+        spec_config["num_speculative_tokens"] = 3
+    else:
+        spec_config["num_speculative_tokens"] = len(ast.literal_eval(args.tree))
+        spec_config["speculative_token_tree"] = args.tree
     if args.draft_attn_backend != "auto":
         spec_config["attention_backend"] = args.draft_attn_backend
     if args.case == "ddt_bridge":
         spec_config["enable_dynamic_draft_tree"] = True
+        if args.ddt_max_draft_tokens is not None:
+            spec_config["dynamic_draft_tree_max_draft_tokens"] = (
+                args.ddt_max_draft_tokens
+            )
 
     return LLM(**kwargs, speculative_config=spec_config)
 

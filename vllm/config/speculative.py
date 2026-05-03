@@ -151,9 +151,15 @@ class SpeculativeConfig:
     """Enable experimental tree-aware speculative verification.
 
     This is an opt-in runtime path for Dynamic Draft Tree development. The
-    current implementation is greedy-only and uses tree metadata generated from
-    the configured speculative token tree. Target and draft attention must both
-    use TREE_ATTN so target verification logits have tree semantics.
+    current implementation is greedy-only and selects a request-local verify
+    subtree from the configured speculative token tree using live draft logits.
+    Target and draft attention must both use TREE_ATTN so target verification
+    logits have tree semantics.
+    """
+    dynamic_draft_tree_max_draft_tokens: int | None = Field(default=None, gt=0)
+    """Maximum number of draft nodes selected into the runtime DDT verify
+    subtree. If unset, all nodes from ``speculative_token_tree`` remain
+    reachable, matching the static tree behavior.
     """
     parallel_drafting: bool = False
     """Enable parallel drafting, where all speculative tokens are generated

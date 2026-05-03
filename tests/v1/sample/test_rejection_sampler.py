@@ -375,7 +375,9 @@ def test_tree_rejection_greedy_sample_accepts_branching_path():
     )
     sampling_metadata = create_sampling_metadata(all_greedy=True)
 
-    output = tree_rejection_greedy_sample(metadata, logits, sampling_metadata)
+    output, accept_indices = tree_rejection_greedy_sample(
+        metadata, logits, sampling_metadata
+    )
 
     expected = torch.tensor(
         [[11, 13, 14, 42, PLACEHOLDER_TOKEN_ID]],
@@ -383,6 +385,12 @@ def test_tree_rejection_greedy_sample_accepts_branching_path():
         device=DEVICE_TYPE,
     )
     assert torch.equal(output, expected)
+    expected_accept_indices = torch.tensor(
+        [[0, 1, 3, 4, PLACEHOLDER_TOKEN_ID]],
+        dtype=torch.int32,
+        device=DEVICE_TYPE,
+    )
+    assert torch.equal(accept_indices, expected_accept_indices)
 
 
 def test_tree_rejection_greedy_sample_scans_siblings_and_stops_on_miss():
@@ -392,7 +400,7 @@ def test_tree_rejection_greedy_sample_scans_siblings_and_stops_on_miss():
     )
     sampling_metadata = create_sampling_metadata(all_greedy=True)
 
-    output = tree_rejection_greedy_sample(metadata, logits, sampling_metadata)
+    output, _ = tree_rejection_greedy_sample(metadata, logits, sampling_metadata)
 
     expected = torch.tensor(
         [[12, 88, PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID]],
@@ -410,7 +418,9 @@ def test_tree_rejection_greedy_sample_linear_kv_safe_rejects_branch_slot():
     metadata.tree_linear_kv_safe = True
     sampling_metadata = create_sampling_metadata(all_greedy=True)
 
-    output = tree_rejection_greedy_sample(metadata, logits, sampling_metadata)
+    output, accept_indices = tree_rejection_greedy_sample(
+        metadata, logits, sampling_metadata
+    )
 
     expected = torch.tensor(
         [[11, 13, PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID]],
@@ -418,6 +428,12 @@ def test_tree_rejection_greedy_sample_linear_kv_safe_rejects_branch_slot():
         device=DEVICE_TYPE,
     )
     assert torch.equal(output, expected)
+    expected_accept_indices = torch.tensor(
+        [[0, 1, PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID]],
+        dtype=torch.int32,
+        device=DEVICE_TYPE,
+    )
+    assert torch.equal(accept_indices, expected_accept_indices)
 
 
 def test_tree_rejection_greedy_sample_uses_bonus_for_rows_without_draft():
@@ -434,7 +450,7 @@ def test_tree_rejection_greedy_sample_uses_bonus_for_rows_without_draft():
     )
     sampling_metadata = create_sampling_metadata(all_greedy=True)
 
-    output = tree_rejection_greedy_sample(metadata, logits, sampling_metadata)
+    output, _ = tree_rejection_greedy_sample(metadata, logits, sampling_metadata)
 
     expected = torch.tensor(
         [
@@ -486,6 +502,16 @@ def test_rejection_sampler_routes_tree_metadata_to_tree_verifier(rejection_sampl
         device=DEVICE_TYPE,
     )
     assert torch.equal(output.sampled_token_ids, expected)
+    expected_accept_indices = torch.tensor(
+        [
+            [0, 1, 3, 4, PLACEHOLDER_TOKEN_ID],
+            [0, 2, PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID],
+        ],
+        dtype=torch.int32,
+        device=DEVICE_TYPE,
+    )
+    assert output.spec_decode_accept_indices is not None
+    assert torch.equal(output.spec_decode_accept_indices, expected_accept_indices)
 
 
 def test_rejection_sampler_closes_logits_built_dynamic_tree_loop(

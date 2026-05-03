@@ -51,6 +51,8 @@ def _create_proposer(
     attention_backend: str | None = None,
     speculative_token_tree: list[tuple[int, ...]] | None = None,
     parallel_drafting: bool = False,
+    enable_dynamic_draft_tree: bool = False,
+    dynamic_draft_tree_max_draft_tokens: int | None = None,
 ) -> EagleProposer:
     # Method-dependent setup
     if method == "eagle":
@@ -88,6 +90,9 @@ def _create_proposer(
         num_speculative_tokens=num_speculative_tokens,
         speculative_token_tree=spec_token_tree_str,
         parallel_drafting=parallel_drafting,
+        attention_backend=attention_backend,
+        enable_dynamic_draft_tree=enable_dynamic_draft_tree,
+        dynamic_draft_tree_max_draft_tokens=dynamic_draft_tree_max_draft_tokens,
     )
     if parallel_drafting:
         # Overwrite pard_token to avoid crash during init
@@ -1164,6 +1169,106 @@ def test_propose_tree(spec_token_tree):
             num_speculative_tokens + 1
         )
         assert tree_metadata["num_spec_steps"] == len(spec_token_tree[-1]) + 1
+
+
+def test_propose_tree_runtime_dynamic_tree_selects_request_local_subtree():
+    device = torch.device(DEVICE_TYPE)
+    batch_size = 2
+    seq_lens = [5, 3]
+    total_tokens = sum(seq_lens)
+    vocab_size = 100
+    spec_token_tree = [(0,), (1,), (0, 0), (0, 1), (1, 0), (1, 1)]
+    proposer = _create_proposer(
+        "eagle",
+        len(spec_token_tree),
+        attention_backend="TREE_ATTN",
+        speculative_token_tree=spec_token_tree,
+        enable_dynamic_draft_tree=True,
+        dynamic_draft_tree_max_draft_tokens=3,
+    )
+    hidden_size = proposer.hidden_size
+
+    model_mock = mock.MagicMock()
+    model_mock.side_effect = [
+        (
+            torch.zeros(total_tokens, hidden_size, device=device),
+            torch.zeros(total_tokens, hidden_size, device=device),
+        ),
+        (
+            torch.zeros(batch_size * 2, hidden_size, device=device),
+            torch.zeros(batch_size * 2, hidden_size, device=device),
+        ),
+    ]
+
+    root_logits = torch.full((batch_size, vocab_size), -100.0, device=device)
+    root_logits[0, 10] = 10.0
+    root_logits[0, 20] = 9.0
+    root_logits[1, 30] = 8.0
+    root_logits[1, 40] = 10.0
+    child_logits = torch.full((batch_size * 2, vocab_size), -100.0, device=device)
+    # Request 0 strongly prefers the child under root branch 0.
+    child_logits[0, 11] = 10.0
+    child_logits[0, 12] = 9.0
+    child_logits[1, 21] = 1.0
+    child_logits[1, 22] = 0.5
+    # Request 1 strongly prefers the child under root branch 1.
+    child_logits[2, 31] = 1.0
+    child_logits[2, 32] = 0.5
+    child_logits[3, 41] = 10.0
+    child_logits[3, 42] = 9.0
+    model_mock.compute_logits.side_effect = [root_logits, child_logits]
+    proposer.model = model_mock
+    proposer._draft_attn_layer_names = {"layer.0"}
+
+    attn_metadata_builder_cls, _ = try_get_attention_backend(
+        AttentionBackendEnum.TREE_ATTN
+    )
+    attn_metadata_builder = attn_metadata_builder_cls(
+        kv_cache_spec=create_standard_kv_cache_spec(proposer.vllm_config),
+        layer_names=proposer._draft_attn_layer_names,
+        vllm_config=proposer.vllm_config,
+        device=device,
+    )
+    mock_attn_group = mock.MagicMock()
+    mock_attn_group.get_metadata_builder.return_value = attn_metadata_builder
+    mock_attn_group.layer_names = list(proposer._draft_attn_layer_names)
+    mock_attn_group.kv_cache_spec = attn_metadata_builder.kv_cache_spec
+    proposer.draft_attn_groups = [mock_attn_group]
+
+    batch_spec = BatchSpec(seq_lens=seq_lens, query_lens=seq_lens)
+    common_attn_metadata = create_common_attn_metadata(
+        batch_spec,
+        block_size=BLOCK_SIZE,
+        device=device,
+    )
+    result = proposer.propose(
+        target_token_ids=torch.randint(0, vocab_size, (total_tokens,), device=device),
+        target_positions=torch.cat(
+            [
+                torch.arange(seq_lens[0], device=device),
+                torch.arange(seq_lens[1], device=device),
+            ]
+        ),
+        target_hidden_states=torch.randn(total_tokens, hidden_size, device=device),
+        next_token_ids=torch.randint(
+            0, vocab_size, (batch_size,), dtype=torch.int32, device=device
+        ),
+        token_indices_to_sample=None,
+        common_attn_metadata=common_attn_metadata,
+        sampling_metadata=mock.MagicMock(),
+    )
+
+    assert result.shape == (batch_size, len(spec_token_tree))
+    metadata = proposer._dynamic_tree_last_metadata
+    assert metadata is not None
+    assert metadata[0] is not None
+    assert metadata[1] is not None
+    # Both requests keep the highest-scoring root child connected.  The
+    # request-local dynamic part is the selected descendant branch.
+    assert metadata[0]["retrieve_next_token"][0] == 1
+    assert metadata[0]["retrieve_next_token"][1] != -1
+    assert metadata[0]["retrieve_next_token"][2] == -1
+    assert metadata[1] != metadata[0]
 
 
 def test_set_inputs_first_pass_dflash():

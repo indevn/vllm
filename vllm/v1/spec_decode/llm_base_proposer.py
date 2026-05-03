@@ -304,6 +304,12 @@ class SpecDecodeBaseProposer:
         self.tree_retrieve_metadata = build_static_tree_retrieve_metadata(
             self.tree_choices
         )
+        self._dynamic_tree_max_draft_tokens = (
+            self.speculative_config.dynamic_draft_tree_max_draft_tokens
+        )
+        self._dynamic_tree_last_metadata: (
+            list[dict[str, list[int] | int | bool] | None] | None
+        ) = None
 
     def _raise_if_padded_drafter_batch_disabled(self):
         if self.speculative_config.disable_padded_drafter_batch:
@@ -1003,6 +1009,12 @@ class SpecDecodeBaseProposer:
     ) -> list[torch.Tensor]:
         tree_attn_metadata_builder = self.draft_attn_groups[0].get_metadata_builder()
         assert isinstance(tree_attn_metadata_builder, TreeAttentionMetadataBuilder)
+        dynamic_tree_enabled = self.speculative_config.enable_dynamic_draft_tree
+        root_candidates_per_req: torch.Tensor | None = None
+        root_scores_per_req: torch.Tensor | None = None
+        selected_child_offsets_by_level: list[torch.Tensor] = []
+        all_tokens_by_level: list[torch.Tensor] = []
+        all_scores_by_level: list[torch.Tensor] = []
 
         total_num_drafts = self.cu_drafts_per_level[0]
         level_num_drafts = total_num_drafts
@@ -1010,9 +1022,32 @@ class SpecDecodeBaseProposer:
         num_children = self.child_drafts_per_level[0]
         if num_children == 1:
             draft_token_ids = logits.argmax(dim=-1).view(batch_size, -1)
+            if dynamic_tree_enabled:
+                root_candidates_per_req = draft_token_ids
+                root_scores_per_req = torch.softmax(
+                    logits.to(torch.float32), dim=-1
+                ).gather(dim=-1, index=draft_token_ids.to(torch.long))
         else:
-            draft_token_ids = torch.topk(logits, num_children, dim=-1).indices.view(
-                batch_size, -1
+            if dynamic_tree_enabled:
+                root_scores_per_req, root_candidates_per_req = torch.topk(
+                    torch.softmax(logits.to(torch.float32), dim=-1),
+                    num_children,
+                    dim=-1,
+                )
+                draft_token_ids = root_candidates_per_req.view(batch_size, -1)
+            else:
+                draft_token_ids = torch.topk(logits, num_children, dim=-1).indices.view(
+                    batch_size, -1
+                )
+        if dynamic_tree_enabled:
+            assert root_candidates_per_req is not None
+            assert root_scores_per_req is not None
+            all_tokens_by_level.append(root_candidates_per_req.to(torch.int64))
+            all_scores_by_level.append(root_scores_per_req.to(torch.float32))
+            selected_child_offsets_by_level.append(
+                torch.arange(
+                    num_children, dtype=torch.int64, device=self.device
+                ).expand(batch_size, -1)
             )
         draft_token_ids_list = [draft_token_ids]
         draft_hidden_states = hidden_states.view(batch_size, 1, -1)
@@ -1148,16 +1183,197 @@ class SpecDecodeBaseProposer:
             num_children = self.child_drafts_per_level[level + 1]
             if num_children == 1:
                 draft_token_ids = logits.argmax(dim=-1).view(batch_size, -1)
+                if dynamic_tree_enabled:
+                    child_scores = torch.softmax(logits.to(torch.float32), dim=-1)
+                    child_scores = child_scores.gather(
+                        dim=-1, index=draft_token_ids.reshape(-1, 1).to(torch.long)
+                    ).view(batch_size, level_num_drafts)
+                    parent_offsets = torch.arange(
+                        level_num_drafts, dtype=torch.int64, device=self.device
+                    ).expand(batch_size, -1)
             else:
-                draft_token_ids = torch.topk(logits, num_children, dim=-1).indices.view(
-                    batch_size, -1
-                )
+                if dynamic_tree_enabled:
+                    child_scores, child_tokens = torch.topk(
+                        torch.softmax(logits.to(torch.float32), dim=-1),
+                        num_children,
+                        dim=-1,
+                    )
+                    draft_token_ids = child_tokens.view(batch_size, -1)
+                    child_scores = child_scores.view(batch_size, -1)
+                    parent_offsets = (
+                        torch.arange(
+                            level_num_drafts, dtype=torch.int64, device=self.device
+                        )
+                        .repeat_interleave(num_children)
+                        .expand(batch_size, -1)
+                    )
+                else:
+                    draft_token_ids = torch.topk(
+                        logits, num_children, dim=-1
+                    ).indices.view(batch_size, -1)
+            if dynamic_tree_enabled:
+                all_tokens_by_level.append(draft_token_ids.to(torch.int64))
+                all_scores_by_level.append(child_scores.to(torch.float32))
+                selected_child_offsets_by_level.append(parent_offsets)
             draft_token_ids_list.append(draft_token_ids)
 
             # Update the # drafts counters for the next tree level.
             level_num_drafts = self.cu_drafts_per_level[level + 1] - total_num_drafts
             total_num_drafts = self.cu_drafts_per_level[level + 1]
+        if dynamic_tree_enabled:
+            build_metadata = self._build_runtime_dynamic_tree_metadata
+            self._dynamic_tree_last_metadata = build_metadata(
+                batch_size=batch_size,
+                all_tokens_by_level=all_tokens_by_level,
+                all_scores_by_level=all_scores_by_level,
+                selected_child_offsets_by_level=selected_child_offsets_by_level,
+            )
         return draft_token_ids_list
+
+    def _build_runtime_dynamic_tree_metadata(
+        self,
+        *,
+        batch_size: int,
+        all_tokens_by_level: list[torch.Tensor],
+        all_scores_by_level: list[torch.Tensor],
+        selected_child_offsets_by_level: list[torch.Tensor],
+    ) -> list[dict[str, list[int] | int | bool]]:
+        """Select a request-local DDT verify subtree from live draft scores.
+
+        vLLM's current TREE_ATTN backend still computes the full configured
+        static tree.  This metadata only changes which nodes the verifier can
+        traverse, which is the first runtime DDT step before per-request dynamic
+        target masks reduce target-side work.
+        """
+
+        max_selected = (
+            self._dynamic_tree_max_draft_tokens
+            if self._dynamic_tree_max_draft_tokens is not None
+            else len(self.tree_choices)
+        )
+        max_selected = min(max_selected, len(self.tree_choices))
+        if max_selected <= 0:
+            raise ValueError("dynamic_draft_tree_max_draft_tokens must be positive")
+
+        metadata_by_req: list[dict[str, list[int] | int | bool]] = []
+        full_num_nodes = len(self.tree_choices) + 1
+        tree_depth = len(self.cu_drafts_per_level)
+
+        for req_idx in range(batch_size):
+            static_local_tokens: dict[int, int] = {}
+            static_scores: dict[int, float] = {}
+            parent_for_static: dict[int, int] = {}
+            parent_list = torch.full(
+                (1, max(self.child_drafts_per_level[0] * (tree_depth - 1) + 1, 1)),
+                -1,
+                dtype=torch.int64,
+                device=self.device,
+            )
+
+            level_static_indices: list[list[int]] = []
+            first_level_tokens = all_tokens_by_level[0][req_idx]
+            first_level_scores = all_scores_by_level[0][req_idx]
+            first_level_static: list[int] = []
+            for child_idx in range(first_level_tokens.shape[0]):
+                static_idx = child_idx + 1
+                static_local_tokens[static_idx] = int(first_level_tokens[child_idx])
+                static_scores[static_idx] = float(first_level_scores[child_idx])
+                parent_for_static[static_idx] = 0
+                first_level_static.append(static_idx)
+            level_static_indices.append(first_level_static)
+
+            prev_level_static = first_level_static
+            for level in range(1, tree_depth):
+                tokens = all_tokens_by_level[level][req_idx]
+                scores = all_scores_by_level[level][req_idx]
+                parent_offsets = selected_child_offsets_by_level[level][req_idx]
+                level_start = self.cu_drafts_per_level[level - 1]
+                level_static: list[int] = []
+                for flat_idx in range(tokens.shape[0]):
+                    static_idx = level_start + flat_idx + 1
+                    parent_offset = int(parent_offsets[flat_idx])
+                    # Static tree choices are breadth-first sorted, so the
+                    # parent of a node at this level is the previous-level node
+                    # addressed by the flattened child group.  The live top-k
+                    # tensors keep the same shape/order; selected_child_offsets
+                    # is only needed if a future proposer prunes level parents.
+                    parent_offset = flat_idx // self.child_drafts_per_level[level]
+                    if parent_offset >= len(prev_level_static):
+                        parent_static_idx = 0
+                    else:
+                        parent_static_idx = prev_level_static[parent_offset]
+                    parent_for_static[static_idx] = parent_static_idx
+                    static_local_tokens[static_idx] = int(tokens[flat_idx])
+                    static_scores[static_idx] = static_scores.get(
+                        parent_static_idx, 1.0
+                    ) * float(scores[flat_idx])
+                    level_static.append(static_idx)
+                    parent_table_idx = level_start // self.child_drafts_per_level[0]
+                    parent_table_idx += flat_idx // self.child_drafts_per_level[level]
+                    if 0 <= parent_table_idx < parent_list.shape[1]:
+                        parent_list[0, parent_table_idx] = parent_static_idx - 1
+                level_static_indices.append(level_static)
+                prev_level_static = level_static
+
+            selected_static_nodes = sorted(
+                static_scores,
+                key=lambda idx: (-static_scores[idx], idx),
+            )[:max_selected]
+            selected_set = set(selected_static_nodes)
+            # Keep the tree connected.  Adding ancestors may exceed the soft cap
+            # by a small amount, which is preferable to selecting unreachable
+            # high-score descendants.
+            for static_idx in list(selected_static_nodes):
+                parent_idx = parent_for_static.get(static_idx, 0)
+                while parent_idx > 0:
+                    selected_set.add(parent_idx)
+                    parent_idx = parent_for_static.get(parent_idx, 0)
+            selected_static_nodes = sorted(selected_set)
+
+            if not selected_static_nodes:
+                metadata_by_req.append(
+                    {
+                        "retrieve_index": list(range(full_num_nodes)),
+                        "retrieve_next_token": [-1] * full_num_nodes,
+                        "retrieve_next_sibling": [-1] * full_num_nodes,
+                        "num_spec_steps": 1,
+                        "tree_valid": False,
+                    }
+                )
+                continue
+            retrieve_index = list(range(full_num_nodes))
+            retrieve_next_token = [-1] * full_num_nodes
+            retrieve_next_sibling = [-1] * full_num_nodes
+            selected_set = set(selected_static_nodes)
+            children_by_parent: dict[int, list[int]] = {}
+            for static_idx in selected_static_nodes:
+                parent_idx = parent_for_static.get(static_idx, 0)
+                if parent_idx == 0 or parent_idx in selected_set:
+                    children_by_parent.setdefault(parent_idx, []).append(static_idx)
+            for parent_idx, child_indices in children_by_parent.items():
+                first_child = -1
+                for child_idx in sorted(child_indices, reverse=True):
+                    retrieve_next_sibling[child_idx] = first_child
+                    first_child = child_idx
+                retrieve_next_token[parent_idx] = first_child
+
+            max_depth = max(
+                (
+                    len(self.tree_choices[static_idx - 1])
+                    for static_idx in selected_static_nodes
+                ),
+                default=0,
+            )
+            metadata_by_req.append(
+                {
+                    "retrieve_index": retrieve_index,
+                    "retrieve_next_token": retrieve_next_token,
+                    "retrieve_next_sibling": retrieve_next_sibling,
+                    "num_spec_steps": max_depth + 1,
+                    "tree_valid": True,
+                }
+            )
+        return metadata_by_req
 
     def prepare_inputs(
         self,

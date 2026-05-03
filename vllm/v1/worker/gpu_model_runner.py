@@ -127,6 +127,7 @@ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import (
     NULL_BLOCK_ID,
+    PAD_SLOT_ID,
     create_fast_prefill_custom_backend,
     get_dcp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
@@ -594,6 +595,7 @@ class GPUModelRunner(
             self.speculative_config is not None
             and self.speculative_config.enable_dynamic_draft_tree
         )
+        self.enable_dynamic_tree_kv_relocation = False
         self.use_async_spec_decode = (
             self.use_async_scheduling and self.num_spec_tokens > 0
         )
@@ -2775,7 +2777,201 @@ class GPUModelRunner(
         metadata.tree_retrieve_next_sibling = tree_retrieve_next_sibling
         metadata.tree_num_spec_steps = tree_num_spec_steps
         metadata.tree_valid = tree_valid
-        metadata.tree_linear_kv_safe = True
+        metadata.tree_linear_kv_safe = not self.enable_dynamic_tree_kv_relocation
+
+    def _refresh_dynamic_tree_kv_relocation_support(self) -> None:
+        if not self.enable_dynamic_draft_tree:
+            self.enable_dynamic_tree_kv_relocation = False
+            return
+        if self.model_config.is_hybrid:
+            self.enable_dynamic_tree_kv_relocation = False
+            return
+        if not getattr(self, "kv_cache_config", None):
+            self.enable_dynamic_tree_kv_relocation = False
+            return
+        if len(self.kv_cache_config.kv_cache_groups) == 0:
+            self.enable_dynamic_tree_kv_relocation = False
+            return
+
+        for group in self._kv_cache_spec_attn_group_iterator():
+            if not isinstance(group.kv_cache_spec, AttentionSpec):
+                self.enable_dynamic_tree_kv_relocation = False
+                return
+            for layer_name in group.layer_names:
+                kv_cache = self.compilation_config.static_forward_context[
+                    layer_name
+                ].kv_cache
+                if not isinstance(kv_cache, torch.Tensor) or kv_cache.ndim < 4:
+                    self.enable_dynamic_tree_kv_relocation = False
+                    return
+        self.enable_dynamic_tree_kv_relocation = True
+
+    def _maybe_relocate_dynamic_tree_kv(
+        self,
+        sampler_output: SamplerOutput,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> None:
+        if (
+            spec_decode_metadata is None
+            or not spec_decode_metadata.has_tree_metadata
+            or spec_decode_metadata.tree_linear_kv_safe
+            or not self.enable_dynamic_tree_kv_relocation
+        ):
+            return
+        accept_indices = sampler_output.spec_decode_accept_indices
+        if accept_indices is None or accept_indices.shape[-1] <= 1:
+            return
+
+        num_reqs = min(self.input_batch.num_reqs, accept_indices.shape[0])
+        if num_reqs == 0:
+            return
+        query_start_loc = self.query_start_loc.gpu
+
+        for group in self._kv_cache_spec_attn_group_iterator():
+            if not isinstance(group.kv_cache_spec, AttentionSpec):
+                continue
+            group_id = group.kv_cache_group_id
+            block_table = self.input_batch.block_table[group_id]
+            block_size = block_table.block_size
+            slot_mapping = block_table.slot_mapping.gpu
+
+            src_slots: list[torch.Tensor] = []
+            dst_slots: list[torch.Tensor] = []
+            for req_idx in range(num_reqs):
+                row_start = int(query_start_loc[req_idx].item())
+                row_end = int(query_start_loc[req_idx + 1].item())
+                row_width = row_end - row_start
+                if row_width <= 1:
+                    continue
+                max_outputs = min(accept_indices.shape[1], row_width)
+                for out_pos in range(1, max_outputs):
+                    src_local = int(accept_indices[req_idx, out_pos].item())
+                    if src_local < 0 or src_local >= row_width:
+                        continue
+                    dst_local = out_pos
+                    if src_local == dst_local:
+                        continue
+                    src_slot = slot_mapping[row_start + src_local]
+                    dst_slot = slot_mapping[row_start + dst_local]
+                    if (
+                        int(src_slot.item()) == PAD_SLOT_ID
+                        or int(dst_slot.item()) == PAD_SLOT_ID
+                    ):
+                        continue
+                    src_slots.append(src_slot)
+                    dst_slots.append(dst_slot)
+            if not src_slots:
+                continue
+
+            src_slot_ids = torch.stack(src_slots).to(torch.long)
+            dst_slot_ids = torch.stack(dst_slots).to(torch.long)
+            src_blocks = torch.div(src_slot_ids, block_size, rounding_mode="floor")
+            src_offsets = src_slot_ids % block_size
+            dst_blocks = torch.div(dst_slot_ids, block_size, rounding_mode="floor")
+            dst_offsets = dst_slot_ids % block_size
+
+            self._relocate_dynamic_tree_kv_group(
+                group,
+                block_size,
+                src_blocks,
+                src_offsets,
+                dst_blocks,
+                dst_offsets,
+            )
+
+    def _maybe_relocate_dynamic_tree_hidden_states(
+        self,
+        sampler_output: SamplerOutput,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+        hidden_states: torch.Tensor,
+        sample_hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+    ) -> None:
+        tensors: list[torch.Tensor] = [hidden_states, sample_hidden_states]
+        if aux_hidden_states is not None:
+            tensors.extend(aux_hidden_states)
+        self._maybe_relocate_dynamic_tree_tensors(
+            sampler_output, spec_decode_metadata, tensors
+        )
+
+    def _maybe_relocate_dynamic_tree_tensors(
+        self,
+        sampler_output: SamplerOutput,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+        tensors: Sequence[torch.Tensor],
+    ) -> None:
+        if (
+            spec_decode_metadata is None
+            or not spec_decode_metadata.has_tree_metadata
+            or spec_decode_metadata.tree_linear_kv_safe
+            or not tensors
+        ):
+            return
+        accept_indices = sampler_output.spec_decode_accept_indices
+        if accept_indices is None or accept_indices.shape[-1] <= 1:
+            return
+
+        num_reqs = min(self.input_batch.num_reqs, accept_indices.shape[0])
+        query_start_loc = self.query_start_loc.gpu
+        src_indices: list[int] = []
+        dst_indices: list[int] = []
+        for req_idx in range(num_reqs):
+            row_start = int(query_start_loc[req_idx].item())
+            row_end = int(query_start_loc[req_idx + 1].item())
+            row_width = row_end - row_start
+            max_outputs = min(accept_indices.shape[1], row_width)
+            for out_pos in range(1, max_outputs):
+                src_local = int(accept_indices[req_idx, out_pos].item())
+                if src_local < 0 or src_local >= row_width or src_local == out_pos:
+                    continue
+                src_indices.append(row_start + src_local)
+                dst_indices.append(row_start + out_pos)
+        if not src_indices:
+            return
+
+        src = torch.tensor(src_indices, dtype=torch.long, device=self.device)
+        dst = torch.tensor(dst_indices, dtype=torch.long, device=self.device)
+        for tensor in tensors:
+            if tensor.shape[0] <= int(max(max(src_indices), max(dst_indices))):
+                continue
+            tensor[dst] = tensor[src].clone()
+
+    def _relocate_dynamic_tree_kv_group(
+        self,
+        group: AttentionGroup,
+        block_size: int,
+        src_blocks: torch.Tensor,
+        src_offsets: torch.Tensor,
+        dst_blocks: torch.Tensor,
+        dst_offsets: torch.Tensor,
+    ) -> None:
+        kv_cache_spec = group.kv_cache_spec
+        assert isinstance(kv_cache_spec, AttentionSpec)
+        block_dim = group.backend.get_kv_cache_block_dim(
+            block_size,
+            kv_cache_spec.num_kv_heads,
+            kv_cache_spec.head_size,
+            cache_dtype_str=self.cache_config.cache_dtype,
+        )
+        seen_cache_ptrs: set[int] = set()
+        for layer_name in group.layer_names:
+            kv_cache = self.compilation_config.static_forward_context[
+                layer_name
+            ].kv_cache
+            if not isinstance(kv_cache, torch.Tensor):
+                continue
+            data_ptr = kv_cache.untyped_storage().data_ptr()
+            if data_ptr in seen_cache_ptrs:
+                continue
+            seen_cache_ptrs.add(data_ptr)
+            if block_dim == 0:
+                source = kv_cache[src_blocks, :, src_offsets, ...].clone()
+                kv_cache[dst_blocks, :, dst_offsets, ...] = source
+            elif block_dim == 1:
+                source = kv_cache[:, src_blocks, src_offsets, ...].clone()
+                kv_cache[:, dst_blocks, dst_offsets, ...] = source
+            else:
+                raise AssertionError(f"Unsupported KV cache block_dim={block_dim}")
 
     def _prepare_kv_sharing_fast_prefill(
         self,
@@ -4325,6 +4521,14 @@ class GPUModelRunner(
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
+        self._maybe_relocate_dynamic_tree_hidden_states(
+            sampler_output,
+            spec_decode_metadata,
+            hidden_states,
+            sample_hidden_states,
+            aux_hidden_states,
+        )
+        self._maybe_relocate_dynamic_tree_kv(sampler_output, spec_decode_metadata)
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
         )
@@ -4578,6 +4782,15 @@ class GPUModelRunner(
             return None
         if not isinstance(self.drafter, EagleProposer):
             return None
+        dynamic_tree_metadata = getattr(
+            self.drafter, "_dynamic_tree_last_metadata", None
+        )
+        if dynamic_tree_metadata is not None:
+            metadata_by_req: dict[str, dict[str, list[int] | int | bool]] = {}
+            for req_id, tree_metadata in zip(req_ids, dynamic_tree_metadata):
+                if tree_metadata is not None:
+                    metadata_by_req[req_id] = tree_metadata.copy()
+            return metadata_by_req
         tree_metadata = getattr(self.drafter, "tree_retrieve_metadata", None)
         if tree_metadata is None:
             return None
@@ -6953,6 +7166,7 @@ class GPUModelRunner(
             self.kv_caches,
             num_attn_module,
         )
+        self._refresh_dynamic_tree_kv_relocation_support()
         return kv_caches
 
     def maybe_add_kv_sharing_layers_to_kv_cache_groups(

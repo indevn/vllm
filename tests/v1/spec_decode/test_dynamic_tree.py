@@ -148,11 +148,18 @@ def test_build_dynamic_tree_reference_branching():
             ]
         ],
         dtype=torch.int32,
+        device="cpu",
     )
-    expected_positions = torch.tensor([[0, 1, 1, 2, 3]], dtype=torch.int32)
-    expected_retrieve = torch.tensor([[0, 1, 2, 3, 4]], dtype=torch.int32)
-    expected_next_token = torch.tensor([[1, 3, -1, 4, -1]], dtype=torch.int32)
-    expected_next_sibling = torch.tensor([[-1, 2, -1, -1, -1]], dtype=torch.int32)
+    expected_positions = torch.tensor(
+        [[0, 1, 1, 2, 3]], dtype=torch.int32, device="cpu"
+    )
+    expected_retrieve = torch.tensor([[0, 1, 2, 3, 4]], dtype=torch.int32, device="cpu")
+    expected_next_token = torch.tensor(
+        [[1, 3, -1, 4, -1]], dtype=torch.int32, device="cpu"
+    )
+    expected_next_sibling = torch.tensor(
+        [[-1, 2, -1, -1, -1]], dtype=torch.int32, device="cpu"
+    )
 
     assert torch.equal(output.tree_mask.cpu(), expected_mask)
     assert torch.equal(output.positions.cpu(), expected_positions)
@@ -381,7 +388,7 @@ def test_dynamic_draft_tree_manager_matches_functional_api():
     ],
 )
 def test_dynamic_tree_matches_independent_oracle_for_random_valid_trees(device):
-    generator = torch.Generator().manual_seed(0)
+    generator = torch.Generator(device=device).manual_seed(0)
     top_k = 3
     depth = 4
     batch_size = 4
@@ -430,11 +437,19 @@ def test_dynamic_tree_matches_independent_oracle_for_random_valid_trees(device):
     assert build.retrieve_next_sibling.cpu().tolist() == expected_next_sibling
 
     candidates = torch.randint(
-        10, 1000, (batch_size, num_selected + 1), generator=generator
-    ).to(device)
+        10,
+        1000,
+        (batch_size, num_selected + 1),
+        generator=generator,
+        device=device,
+    )
     target_predict = torch.randint(
-        10, 1000, (batch_size, num_selected + 1), generator=generator
-    ).to(device)
+        10,
+        1000,
+        (batch_size, num_selected + 1),
+        generator=generator,
+        device=device,
+    )
     tree_valid = torch.tensor([True, True, False, True], device=device)
 
     # Force several deterministic accepted paths, including sibling fallback.

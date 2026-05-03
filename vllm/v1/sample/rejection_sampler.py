@@ -151,7 +151,7 @@ class RejectionSampler(nn.Module):
                     "Dynamic Draft Tree verification does not support "
                     "sampling constraints or logits processors yet."
                 )
-            output_token_ids = tree_rejection_greedy_sample(
+            output_token_ids, accept_indices = tree_rejection_greedy_sample(
                 metadata,
                 logits,
                 sampling_metadata,
@@ -159,6 +159,7 @@ class RejectionSampler(nn.Module):
             return SamplerOutput(
                 sampled_token_ids=output_token_ids,
                 logprobs_tensors=None,
+                spec_decode_accept_indices=accept_indices,
             )
 
         bonus_logits_indices = metadata.bonus_logits_indices
@@ -552,7 +553,7 @@ def tree_rejection_greedy_sample(
     # [num_model_logits, vocab_size]
     logits: torch.Tensor,
     sampling_metadata: SamplingMetadata,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Greedy tree-aware verification for Dynamic Draft Tree metadata.
 
     This path is intentionally narrow: it consumes root-inclusive tree logits
@@ -628,6 +629,7 @@ def tree_rejection_greedy_sample(
         dtype=torch.int32,
         device=logits.device,
     )
+    accept_indices = torch.full_like(output_token_ids, PLACEHOLDER_TOKEN_ID)
     fallback_rows = torch.tensor(
         [num_draft_tokens == 0 for num_draft_tokens in metadata.num_draft_tokens],
         dtype=torch.bool,
@@ -642,6 +644,7 @@ def tree_rejection_greedy_sample(
         output_token_ids[fallback_rows, 0] = bonus_token_ids[fallback_rows].to(
             torch.int32
         )
+        accept_indices[fallback_rows, 0] = 0
 
     valid_steps = (verify.accept_token_num + 1).clamp(max=tree_num_spec_steps)
     offsets = torch.arange(tree_num_spec_steps, device=logits.device)
@@ -650,7 +653,10 @@ def tree_rejection_greedy_sample(
     output_token_ids[:, :tree_num_spec_steps][valid_mask] = verify.accept_token.to(
         torch.int32
     )[valid_mask]
-    return output_token_ids
+    accept_indices[:, :tree_num_spec_steps][valid_mask] = verify.accept_index.to(
+        torch.int32
+    )[valid_mask]
+    return output_token_ids, accept_indices
 
 
 def _padded_tree_candidates(

@@ -122,6 +122,10 @@ class SamplerOutput:
     # PLACEHOLDER_TOKEN_ID (-1 by default) is used for padding.
     sampled_token_ids: torch.Tensor
     logprobs_tensors: LogprobsTensors | None
+    # Optional per-output local tree node indices for tree speculative
+    # decoding. Position 0 is the root/bonus target token; positions >0 map to
+    # draft tree local indices used for KV relocation.
+    spec_decode_accept_indices: torch.Tensor | None = None
 
 
 @dataclass
