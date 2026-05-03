@@ -378,6 +378,9 @@ class Scheduler(SchedulerInterface):
         encoder_compute_budget = self.max_num_encoder_input_tokens
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
+        scheduled_spec_decode_tree_metadata: dict[
+            str, dict[str, list[int] | int | bool]
+        ] = {}
 
         # For logging.
         scheduled_timestamp = time.monotonic()
@@ -488,6 +491,9 @@ class Scheduler(SchedulerInterface):
                             token_budget += num_scheduled_tokens.pop(preempted_req_id)
                             req_to_new_blocks.pop(preempted_req_id)
                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
+                            scheduled_spec_decode_tree_metadata.pop(
+                                preempted_req_id, None
+                            )
                             preempted_encoder_inputs = scheduled_encoder_inputs.pop(
                                 preempted_req_id, None
                             )
@@ -534,10 +540,15 @@ class Scheduler(SchedulerInterface):
                     if len(spec_token_ids) > num_scheduled_spec_tokens:
                         spec_token_ids = spec_token_ids[:num_scheduled_spec_tokens]
                     scheduled_spec_decode_tokens[request.request_id] = spec_token_ids
+                    if request.spec_token_tree_metadata is not None:
+                        scheduled_spec_decode_tree_metadata[request.request_id] = (
+                            request.spec_token_tree_metadata
+                        )
 
                 # New spec tokens will be set in `update_draft_token_ids` before the
                 # next step when applicable.
                 request.spec_token_ids = []
+                request.spec_token_tree_metadata = None
 
             # Encoder-related.
             if encoder_inputs_to_schedule:
@@ -913,6 +924,7 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens=num_scheduled_tokens,
             total_num_scheduled_tokens=total_num_scheduled_tokens,
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            scheduled_spec_decode_tree_metadata=scheduled_spec_decode_tree_metadata,
             scheduled_encoder_inputs=scheduled_encoder_inputs,
             num_common_prefix_blocks=num_common_prefix_blocks,
             preempted_req_ids={req.request_id for req in preempted_reqs},
@@ -1662,6 +1674,7 @@ class Scheduler(SchedulerInterface):
                 self.encoder_cache_manager.free_encoder_input(request, input_id)
 
     def update_draft_token_ids(self, draft_token_ids: DraftTokenIds) -> None:
+        tree_metadata = draft_token_ids.tree_metadata or {}
         for req_id, spec_token_ids in zip(
             draft_token_ids.req_ids,
             draft_token_ids.draft_token_ids,
@@ -1675,12 +1688,16 @@ class Scheduler(SchedulerInterface):
                 # Ignore draft tokens for prefill chunks.
                 if request.spec_token_ids:
                     request.spec_token_ids = []
+                request.spec_token_tree_metadata = None
                 continue
 
             # Add newly generated spec token ids to the request.
             if self.structured_output_manager.should_advance(request):
                 metadata = request.structured_output_request
                 spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)  # type: ignore[union-attr]
+                request.spec_token_tree_metadata = None
+            else:
+                request.spec_token_tree_metadata = tree_metadata.get(req_id)
             request.spec_token_ids = spec_token_ids
 
     def update_draft_token_ids_in_output(
@@ -1711,6 +1728,10 @@ class Scheduler(SchedulerInterface):
                 metadata = request.structured_output_request
                 assert metadata is not None and metadata.grammar is not None
                 spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)
+                if scheduler_output.scheduled_spec_decode_tree_metadata:
+                    scheduler_output.scheduled_spec_decode_tree_metadata.pop(
+                        req_id, None
+                    )
             # Pad to original number of spec tokens.
             num_invalid_tokens = orig_num_spec_tokens - len(spec_token_ids)
             if num_invalid_tokens:

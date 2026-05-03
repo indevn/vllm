@@ -291,6 +291,42 @@ def _prepare_tree_attn_bias(
     return tree_attn_mask
 
 
+def build_static_tree_retrieve_metadata(
+    sorted_tree_choices: list[tuple[int, ...]],
+) -> dict[str, list[int] | int | bool]:
+    """Build verifier retrieve metadata for a static speculative token tree.
+
+    The metadata is root-inclusive. Draft nodes are addressed by their
+    breadth-first position in ``sorted_tree_choices`` plus one, which matches
+    the flattened draft token order returned by ``EagleProposer.propose_tree``.
+    """
+
+    num_nodes = len(sorted_tree_choices) + 1
+    retrieve_index = list(range(num_nodes))
+    retrieve_next_token = [-1] * num_nodes
+    retrieve_next_sibling = [-1] * num_nodes
+
+    choice_to_local_idx = {
+        choice: local_idx + 1 for local_idx, choice in enumerate(sorted_tree_choices)
+    }
+    for local_idx in range(num_nodes - 1, 0, -1):
+        choice = sorted_tree_choices[local_idx - 1]
+        parent_idx = 0 if len(choice) == 1 else choice_to_local_idx[choice[:-1]]
+        old_first_child = retrieve_next_token[parent_idx]
+        retrieve_next_token[parent_idx] = local_idx
+        if old_first_child != -1:
+            retrieve_next_sibling[local_idx] = old_first_child
+
+    max_depth = max((len(choice) for choice in sorted_tree_choices), default=0)
+    return {
+        "retrieve_index": retrieve_index,
+        "retrieve_next_token": retrieve_next_token,
+        "retrieve_next_sibling": retrieve_next_sibling,
+        "num_spec_steps": max_depth + 1,
+        "tree_valid": True,
+    }
+
+
 class TreeAttentionImpl(AttentionImpl):
     def __init__(
         self,

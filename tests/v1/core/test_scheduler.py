@@ -885,6 +885,43 @@ def test_schedule_spec_decoding_stats(spec_tokens, output_tokens, expected):
         assert stats.num_accepted_tokens_per_pos == expected[3]
 
 
+def test_spec_decode_tree_metadata_scheduled_with_draft_tokens():
+    scheduler = create_scheduler(num_speculative_tokens=4)
+    request = create_requests(num_requests=1, num_tokens=1)[0]
+    req_id = request.request_id
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    model_runner_output = ModelRunnerOutput(
+        req_ids=[req_id],
+        req_id_to_index={req_id: 0},
+        sampled_token_ids=[[0]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+    scheduler.update_from_output(output, model_runner_output)
+
+    tree_metadata = {
+        req_id: {
+            "retrieve_index": [0, 1, 2, 3, 4],
+            "retrieve_next_token": [1, 3, -1, 4, -1],
+            "retrieve_next_sibling": [-1, 2, -1, -1, -1],
+            "num_spec_steps": 4,
+            "tree_valid": True,
+        }
+    }
+    scheduler.update_draft_token_ids(
+        DraftTokenIds([req_id], [[11, 12, 13, 14]], tree_metadata=tree_metadata)
+    )
+
+    output = scheduler.schedule()
+
+    assert output.scheduled_spec_decode_tokens[req_id] == [11, 12, 13, 14]
+    assert output.scheduled_spec_decode_tree_metadata is not None
+    assert output.scheduled_spec_decode_tree_metadata[req_id] == tree_metadata[req_id]
+
+
 def test_spec_decoding_stats_empty_output():
     """Test that spec decoding stats handle empty output tokens gracefully.
 

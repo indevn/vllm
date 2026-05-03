@@ -221,6 +221,10 @@ class DraftTokenIds:
     req_ids: list[str]
     # num_reqs x num_draft_tokens
     draft_token_ids: list[list[int]]
+    # Optional request-local dynamic/tree verification metadata.
+    # The scheduler keeps this with the draft tokens until the next target
+    # verification step.
+    tree_metadata: dict[str, dict[str, list[int] | int | bool]] | None = None
 
 
 def make_empty_encoder_model_runner_output(

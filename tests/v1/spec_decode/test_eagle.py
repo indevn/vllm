@@ -1156,6 +1156,15 @@ def test_propose_tree(spec_token_tree):
     # Verify that the draft tokens match our expectations.
     assert torch.equal(result, expected_tokens)
 
+    if spec_token_tree is not None:
+        tree_metadata = proposer.tree_retrieve_metadata
+        assert len(tree_metadata["retrieve_index"]) == num_speculative_tokens + 1
+        assert len(tree_metadata["retrieve_next_token"]) == num_speculative_tokens + 1
+        assert len(tree_metadata["retrieve_next_sibling"]) == (
+            num_speculative_tokens + 1
+        )
+        assert tree_metadata["num_spec_steps"] == len(spec_token_tree[-1]) + 1
+
 
 def test_set_inputs_first_pass_dflash():
     """

@@ -142,7 +142,10 @@ class RejectionSampler(nn.Module):
                 not sampling_metadata.no_penalties
                 or sampling_metadata.allowed_token_ids_mask is not None
                 or sampling_metadata.bad_words_token_ids
-                or sampling_metadata.logitsprocs.non_argmax_invariant
+                or any(
+                    not isinstance(processor, MinTokensLogitsProcessor)
+                    for processor in sampling_metadata.logitsprocs.non_argmax_invariant
+                )
             ):
                 raise NotImplementedError(
                     "Dynamic Draft Tree verification does not support "
@@ -616,6 +619,7 @@ def tree_rejection_greedy_sample(
         target_predict,
         num_spec_steps=tree_num_spec_steps,
         tree_valid=tree_valid,
+        linear_kv_safe=metadata.tree_linear_kv_safe,
     )
 
     output_token_ids = torch.full(
@@ -624,9 +628,25 @@ def tree_rejection_greedy_sample(
         dtype=torch.int32,
         device=logits.device,
     )
+    fallback_rows = torch.tensor(
+        [num_draft_tokens == 0 for num_draft_tokens in metadata.num_draft_tokens],
+        dtype=torch.bool,
+        device=logits.device,
+    )
+    if tree_valid is not None:
+        fallback_rows |= ~tree_valid
+    if bool(fallback_rows.any().item()):
+        bonus_token_ids = logits[metadata.bonus_logits_indices.to(torch.long)].argmax(
+            dim=-1
+        )
+        output_token_ids[fallback_rows, 0] = bonus_token_ids[fallback_rows].to(
+            torch.int32
+        )
+
     valid_steps = (verify.accept_token_num + 1).clamp(max=tree_num_spec_steps)
     offsets = torch.arange(tree_num_spec_steps, device=logits.device)
     valid_mask = offsets.unsqueeze(0) < valid_steps.unsqueeze(1)
+    valid_mask &= ~fallback_rows.unsqueeze(1)
     output_token_ids[:, :tree_num_spec_steps][valid_mask] = verify.accept_token.to(
         torch.int32
     )[valid_mask]

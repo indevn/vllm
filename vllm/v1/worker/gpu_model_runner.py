@@ -131,7 +131,7 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
 )
-from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -590,6 +590,10 @@ class GPUModelRunner(
                 self.effective_drafter_max_model_len = draft_config.max_model_len
             else:
                 self.effective_drafter_max_model_len = self.max_model_len
+        self.enable_dynamic_draft_tree = (
+            self.speculative_config is not None
+            and self.speculative_config.enable_dynamic_draft_tree
+        )
         self.use_async_spec_decode = (
             self.use_async_scheduling and self.num_spec_tokens > 0
         )
@@ -2071,7 +2075,7 @@ class GPUModelRunner(
                 ):
                     num_decode_draft_tokens[req_idx] = draft_len
             spec_decode_metadata = self._calc_spec_decode_metadata(
-                num_draft_tokens, cu_num_tokens
+                num_draft_tokens, cu_num_tokens, scheduler_output
             )
             logits_indices = spec_decode_metadata.logits_indices
             num_sampled_tokens = num_draft_tokens + 1
@@ -2597,6 +2601,7 @@ class GPUModelRunner(
         self,
         num_draft_tokens: np.ndarray,
         cu_num_scheduled_tokens: np.ndarray,
+        scheduler_output: SchedulerOutput | None = None,
     ) -> SpecDecodeMetadata:
         # Inputs:
         # cu_num_scheduled_tokens:  [  4, 104, 107, 207, 209]
@@ -2663,7 +2668,7 @@ class GPUModelRunner(
         draft_token_ids = self.input_ids.gpu[logits_indices]
         draft_token_ids = draft_token_ids[target_logits_indices + 1]
 
-        return SpecDecodeMetadata(
+        metadata = SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,
             num_draft_tokens=num_draft_tokens.tolist(),
             cu_num_draft_tokens=cu_num_draft_tokens,
@@ -2672,6 +2677,105 @@ class GPUModelRunner(
             bonus_logits_indices=bonus_logits_indices,
             logits_indices=logits_indices,
         )
+        if (
+            self.enable_dynamic_draft_tree
+            and scheduler_output is not None
+            and scheduler_output.scheduled_spec_decode_tree_metadata
+        ):
+            self._attach_tree_spec_decode_metadata(
+                metadata,
+                scheduler_output,
+                cu_num_sampled_tokens,
+                num_draft_tokens,
+            )
+        return metadata
+
+    def _attach_tree_spec_decode_metadata(
+        self,
+        metadata: SpecDecodeMetadata,
+        scheduler_output: SchedulerOutput,
+        cu_num_sampled_tokens: np.ndarray,
+        num_draft_tokens: np.ndarray,
+    ) -> None:
+        tree_metadata_by_req = scheduler_output.scheduled_spec_decode_tree_metadata
+        if not tree_metadata_by_req:
+            return
+
+        batch_size = len(metadata.num_draft_tokens)
+        req_ids = self.input_batch.req_ids[:batch_size]
+        max_tree_nodes = int(num_draft_tokens.max(initial=0)) + 1
+        if max_tree_nodes <= 1:
+            return
+
+        tree_target_logits_indices = torch.zeros(
+            (batch_size, max_tree_nodes), dtype=torch.int32, device=self.device
+        )
+        tree_retrieve_index = torch.zeros(
+            (batch_size, max_tree_nodes), dtype=torch.int32, device=self.device
+        )
+        tree_retrieve_next_token = torch.full(
+            (batch_size, max_tree_nodes), -1, dtype=torch.int32, device=self.device
+        )
+        tree_retrieve_next_sibling = torch.full(
+            (batch_size, max_tree_nodes), -1, dtype=torch.int32, device=self.device
+        )
+        tree_valid = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
+        tree_num_spec_steps = 0
+
+        for req_idx, req_id in enumerate(req_ids):
+            num_nodes = int(num_draft_tokens[req_idx]) + 1
+            if num_nodes <= 1:
+                continue
+            tree_metadata = tree_metadata_by_req.get(req_id)
+            if tree_metadata is None:
+                continue
+            retrieve_index = tree_metadata["retrieve_index"]
+            retrieve_next_token = tree_metadata["retrieve_next_token"]
+            retrieve_next_sibling = tree_metadata["retrieve_next_sibling"]
+            num_spec_steps = int(tree_metadata["num_spec_steps"])
+            if (
+                not isinstance(retrieve_index, list)
+                or not isinstance(retrieve_next_token, list)
+                or not isinstance(retrieve_next_sibling, list)
+                or len(retrieve_index) < num_nodes
+                or len(retrieve_next_token) < num_nodes
+                or len(retrieve_next_sibling) < num_nodes
+            ):
+                continue
+
+            row_start = 0 if req_idx == 0 else int(cu_num_sampled_tokens[req_idx - 1])
+            row_indices = torch.arange(
+                row_start,
+                row_start + num_nodes,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            tree_target_logits_indices[req_idx, :num_nodes] = row_indices
+            tree_retrieve_index[req_idx, :num_nodes] = torch.tensor(
+                retrieve_index[:num_nodes], dtype=torch.int32, device=self.device
+            )
+            tree_retrieve_next_token[req_idx, :num_nodes] = torch.tensor(
+                retrieve_next_token[:num_nodes],
+                dtype=torch.int32,
+                device=self.device,
+            )
+            tree_retrieve_next_sibling[req_idx, :num_nodes] = torch.tensor(
+                retrieve_next_sibling[:num_nodes],
+                dtype=torch.int32,
+                device=self.device,
+            )
+            tree_valid[req_idx] = bool(tree_metadata.get("tree_valid", True))
+            tree_num_spec_steps = max(tree_num_spec_steps, num_spec_steps)
+
+        if tree_num_spec_steps == 0:
+            return
+        metadata.tree_target_logits_indices = tree_target_logits_indices
+        metadata.tree_retrieve_index = tree_retrieve_index
+        metadata.tree_retrieve_next_token = tree_retrieve_next_token
+        metadata.tree_retrieve_next_sibling = tree_retrieve_next_sibling
+        metadata.tree_num_spec_steps = tree_num_spec_steps
+        metadata.tree_valid = tree_valid
+        metadata.tree_linear_kv_safe = True
 
     def _prepare_kv_sharing_fast_prefill(
         self,
@@ -4461,7 +4565,23 @@ class GPUModelRunner(
         if not self.num_spec_tokens or not self._draft_token_req_ids:
             return None
         draft_token_ids, req_ids = self._get_draft_token_ids_cpu()
-        return DraftTokenIds(req_ids, draft_token_ids)
+        return DraftTokenIds(
+            req_ids,
+            draft_token_ids,
+            tree_metadata=self._get_draft_tree_metadata(req_ids),
+        )
+
+    def _get_draft_tree_metadata(
+        self, req_ids: list[str]
+    ) -> dict[str, dict[str, list[int] | int | bool]] | None:
+        if not self.enable_dynamic_draft_tree:
+            return None
+        if not isinstance(self.drafter, EagleProposer):
+            return None
+        tree_metadata = getattr(self.drafter, "tree_retrieve_metadata", None)
+        if tree_metadata is None:
+            return None
+        return {req_id: tree_metadata.copy() for req_id in req_ids}
 
     def _copy_draft_token_ids_to_cpu(
         self, scheduler_output: "SchedulerOutput", zeros_only: bool = False

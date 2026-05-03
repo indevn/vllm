@@ -147,6 +147,14 @@ class SpeculativeConfig:
     speculative_token_tree: str | None = None
     """Specifies the tree structure for speculative token generation.
     """
+    enable_dynamic_draft_tree: bool = False
+    """Enable experimental tree-aware speculative verification.
+
+    This is an opt-in runtime path for Dynamic Draft Tree development. The
+    current implementation is greedy-only and uses tree metadata generated from
+    the configured speculative token tree. Target and draft attention must both
+    use TREE_ATTN so target verification logits have tree semantics.
+    """
     parallel_drafting: bool = False
     """Enable parallel drafting, where all speculative tokens are generated
     in parallel rather than sequentially. This can improve performance but
@@ -962,6 +970,23 @@ class SpeculativeConfig:
                 "synthetic_acceptance_rates / synthetic_acceptance_length "
                 "are only valid with rejection_sample_method='synthetic'."
             )
+
+        if self.enable_dynamic_draft_tree:
+            if not self.use_eagle():
+                raise ValueError(
+                    "enable_dynamic_draft_tree currently requires an EAGLE-style "
+                    "speculative method."
+                )
+            if self.speculative_token_tree is None:
+                raise ValueError(
+                    "enable_dynamic_draft_tree currently requires an explicit "
+                    "speculative_token_tree."
+                )
+            if self.rejection_sample_method != "standard":
+                raise ValueError(
+                    "enable_dynamic_draft_tree currently supports only standard "
+                    "greedy rejection sampling."
+                )
 
         if self.draft_model_config:
             self.draft_model_config.verify_with_parallel_config(

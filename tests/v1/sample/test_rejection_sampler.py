@@ -402,6 +402,64 @@ def test_tree_rejection_greedy_sample_scans_siblings_and_stops_on_miss():
     assert torch.equal(output, expected)
 
 
+def test_tree_rejection_greedy_sample_linear_kv_safe_rejects_branch_slot():
+    metadata, logits = create_tree_spec_decode_metadata(
+        draft_token_ids=[[11, 12, 13, 14]],
+        target_token_ids=[[11, 13, 99, 14, 42]],
+    )
+    metadata.tree_linear_kv_safe = True
+    sampling_metadata = create_sampling_metadata(all_greedy=True)
+
+    output = tree_rejection_greedy_sample(metadata, logits, sampling_metadata)
+
+    expected = torch.tensor(
+        [[11, 13, PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID]],
+        dtype=torch.int32,
+        device=DEVICE_TYPE,
+    )
+    assert torch.equal(output, expected)
+
+
+def test_tree_rejection_greedy_sample_uses_bonus_for_rows_without_draft():
+    metadata, logits = create_tree_spec_decode_metadata(
+        draft_token_ids=[[11, 12, 13, 14], [], []],
+        target_token_ids=[
+            [11, 13, 99, 14, 42],
+            [98, 98, 98, 98, 55],
+            [98, 98, 98, 98, 66],
+        ],
+    )
+    metadata.bonus_logits_indices = torch.tensor(
+        [4, 9, 14], dtype=torch.int32, device=logits.device
+    )
+    sampling_metadata = create_sampling_metadata(all_greedy=True)
+
+    output = tree_rejection_greedy_sample(metadata, logits, sampling_metadata)
+
+    expected = torch.tensor(
+        [
+            [11, 13, 14, 42, PLACEHOLDER_TOKEN_ID],
+            [
+                55,
+                PLACEHOLDER_TOKEN_ID,
+                PLACEHOLDER_TOKEN_ID,
+                PLACEHOLDER_TOKEN_ID,
+                PLACEHOLDER_TOKEN_ID,
+            ],
+            [
+                66,
+                PLACEHOLDER_TOKEN_ID,
+                PLACEHOLDER_TOKEN_ID,
+                PLACEHOLDER_TOKEN_ID,
+                PLACEHOLDER_TOKEN_ID,
+            ],
+        ],
+        dtype=torch.int32,
+        device=DEVICE_TYPE,
+    )
+    assert torch.equal(output, expected)
+
+
 def test_rejection_sampler_routes_tree_metadata_to_tree_verifier(rejection_sampler):
     metadata, logits = create_tree_spec_decode_metadata(
         draft_token_ids=[[11, 12, 13, 14], [21, 22, 23, 24]],

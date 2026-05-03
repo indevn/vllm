@@ -32,6 +32,7 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.backends.tree_attn import (
     TreeAttentionMetadata,
     TreeAttentionMetadataBuilder,
+    build_static_tree_retrieve_metadata,
 )
 from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
@@ -300,6 +301,9 @@ class SpecDecodeBaseProposer:
         self.tree_draft_pos_offsets = torch.arange(
             1, len(self.tree_choices) + 1, device=device, dtype=torch.int32
         ).repeat(self.max_batch_size, 1)
+        self.tree_retrieve_metadata = build_static_tree_retrieve_metadata(
+            self.tree_choices
+        )
 
     def _raise_if_padded_drafter_batch_disabled(self):
         if self.speculative_config.disable_padded_drafter_batch:

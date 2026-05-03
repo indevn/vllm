@@ -770,6 +770,23 @@ class VllmConfig:
         executor_backend = self.parallel_config.distributed_executor_backend
         executor_class = Executor.get_class(self)
         executor_supports_async_sched = executor_class.supports_async_scheduling()
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.enable_dynamic_draft_tree
+            and (
+                self.attention_config.backend is None
+                or self.attention_config.backend.name != "TREE_ATTN"
+                or self.speculative_config.attention_backend is None
+                or self.speculative_config.attention_backend.name != "TREE_ATTN"
+            )
+        ):
+            raise ValueError(
+                "enable_dynamic_draft_tree=True currently requires TREE_ATTN "
+                "for both target attention_config.backend and "
+                "speculative_config.attention_backend. The tree verifier "
+                "consumes target logits whose rows must be produced with tree "
+                "attention semantics."
+            )
 
         if self.scheduler_config.async_scheduling:
             # Async scheduling explicitly enabled, hard fail any incompatibilities.
@@ -790,6 +807,11 @@ class VllmConfig:
                     raise ValueError(
                         "Async scheduling is not compatible with "
                         "disable_padded_drafter_batch=True."
+                    )
+                if self.speculative_config.enable_dynamic_draft_tree:
+                    raise ValueError(
+                        "Async scheduling is not compatible with "
+                        "enable_dynamic_draft_tree=True."
                     )
             if not executor_supports_async_sched:
                 raise ValueError(
@@ -825,6 +847,15 @@ class VllmConfig:
                 logger.warning_once(
                     "Async scheduling is not compatible with "
                     "disable_padded_drafter_batch=True and will be disabled.",
+                )
+                self.scheduler_config.async_scheduling = False
+            elif (
+                self.speculative_config is not None
+                and self.speculative_config.enable_dynamic_draft_tree
+            ):
+                logger.warning_once(
+                    "Async scheduling is not supported with "
+                    "enable_dynamic_draft_tree=True and will be disabled.",
                 )
                 self.scheduler_config.async_scheduling = False
             elif not executor_supports_async_sched:

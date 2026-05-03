@@ -424,6 +424,7 @@ def verify_dynamic_tree_greedy(
     *,
     num_spec_steps: int,
     tree_valid: torch.Tensor | None = None,
+    linear_kv_safe: bool = False,
 ) -> DynamicTreeVerifyOutput:
     """Verify a dynamic draft tree using greedy target predictions.
 
@@ -432,6 +433,12 @@ def verify_dynamic_tree_greedy(
     prediction at the last accepted local index is accepted and traversal moves
     to that child.  If no child matches, verification stops and the target
     prediction at the last accepted local index becomes the bonus token.
+
+    When ``linear_kv_safe`` is set, verification additionally requires the
+    accepted tree node to be the next contiguous node in the flattened draft
+    order.  This is the safe runtime bridge before paged KV relocation exists:
+    branching candidates can still be inspected, but accepting a non-prefix
+    tree slot would leave the target KV cache in the wrong linear layout.
     """
 
     if candidates.ndim != 2:
@@ -492,8 +499,15 @@ def verify_dynamic_tree_greedy(
                 draft_local_idx = int(retrieve_index[batch_idx, cur_index].item())
                 draft_token_id = candidates[batch_idx, cur_index]
                 target_token_id = target_predict[batch_idx, last_accepted_local_idx]
+                next_linear_local_idx = num_accepted_tokens + 1
+                kv_slot_is_linear_prefix = (
+                    draft_local_idx == next_linear_local_idx
+                    and cur_index == next_linear_local_idx
+                )
 
-                if bool((draft_token_id == target_token_id).item()):
+                if bool((draft_token_id == target_token_id).item()) and (
+                    not linear_kv_safe or kv_slot_is_linear_prefix
+                ):
                     predicts[batch_idx, last_accepted_local_idx] = target_token_id
                     num_accepted_tokens += 1
                     accept_index[batch_idx, num_accepted_tokens] = draft_local_idx

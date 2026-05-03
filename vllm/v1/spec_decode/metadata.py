@@ -37,6 +37,11 @@ class SpecDecodeMetadata:
     tree_num_spec_steps: int | None = None
     # [batch_size]
     tree_valid: torch.Tensor | None = None
+    # Runtime bridge safety switch. When enabled, tree verification only accepts
+    # draft nodes that are already a linear prefix in the scheduled KV layout.
+    # Full branching acceptance requires KV relocation and leaves this disabled
+    # for pure semantic/unit tests.
+    tree_linear_kv_safe: bool = False
 
     def __post_init__(self):
         self.max_spec_len = max(self.num_draft_tokens)
