@@ -17,6 +17,7 @@ import json
 import os
 import time
 from collections.abc import Sequence
+from typing import Any
 
 from vllm import LLM, SamplingParams
 
@@ -41,6 +42,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--model", default="eagle618/deepseek-v3-random")
     parser.add_argument("--draft-model", default="eagle618/eagle-deepseek-v3-random")
+    parser.add_argument(
+        "--method",
+        default="eagle",
+        choices=["eagle", "eagle3"],
+        help="Speculative decoding method for TREE_ATTN cases.",
+    )
     parser.add_argument("--max-tokens", type=int, default=16)
     parser.add_argument("--warmup-iters", type=int, default=1)
     parser.add_argument("--iters", type=int, default=3)
@@ -94,6 +101,7 @@ def build_llm(args: argparse.Namespace) -> LLM:
         max_num_batched_tokens=args.max_num_batched_tokens,
         enable_chunked_prefill=False,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        disable_log_stats=False,
     )
     target_attn_backend = args.target_attn_backend
     if target_attn_backend is None and args.case == "ddt_bridge":
@@ -106,7 +114,7 @@ def build_llm(args: argparse.Namespace) -> LLM:
         return LLM(**kwargs)
 
     spec_config = {
-        "method": "eagle",
+        "method": args.method,
         "model": args.draft_model,
         "num_speculative_tokens": len(ast.literal_eval(args.tree)),
         "speculative_token_tree": args.tree,
@@ -131,15 +139,87 @@ def generated_texts(outputs) -> list[str]:
     return [output.outputs[0].text for output in outputs]
 
 
+def metric_counter(metrics: Sequence[Any], name: str) -> int:
+    total = 0
+    for metric in metrics:
+        if metric.name == name and hasattr(metric, "value"):
+            total += int(metric.value)
+    return total
+
+
+def metric_vector(metrics: Sequence[Any], name: str) -> list[int]:
+    total: list[int] = []
+    for metric in metrics:
+        if metric.name != name or not hasattr(metric, "values"):
+            continue
+        values = [int(value) for value in metric.values]
+        if not total:
+            total = [0] * len(values)
+        for i, value in enumerate(values):
+            total[i] += value
+    return total
+
+
+def spec_decode_metrics(
+    before: Sequence[Any],
+    after: Sequence[Any],
+) -> dict[str, float | int | list[float] | None]:
+    num_drafts = metric_counter(after, "vllm:spec_decode_num_drafts") - metric_counter(
+        before, "vllm:spec_decode_num_drafts"
+    )
+    num_draft_tokens = metric_counter(
+        after, "vllm:spec_decode_num_draft_tokens"
+    ) - metric_counter(before, "vllm:spec_decode_num_draft_tokens")
+    num_accepted_tokens = metric_counter(
+        after, "vllm:spec_decode_num_accepted_tokens"
+    ) - metric_counter(before, "vllm:spec_decode_num_accepted_tokens")
+
+    before_per_pos = metric_vector(
+        before, "vllm:spec_decode_num_accepted_tokens_per_pos"
+    )
+    after_per_pos = metric_vector(after, "vllm:spec_decode_num_accepted_tokens_per_pos")
+    per_pos_acceptance_rates: list[float] = []
+    if after_per_pos and num_drafts > 0:
+        if not before_per_pos:
+            before_per_pos = [0] * len(after_per_pos)
+        per_pos_acceptance_rates = [
+            (after_value - before_value) / num_drafts
+            for before_value, after_value in zip(before_per_pos, after_per_pos)
+        ]
+
+    acceptance_rate = (
+        num_accepted_tokens / num_draft_tokens if num_draft_tokens > 0 else None
+    )
+    acceptance_length = (
+        1 + (num_accepted_tokens / num_drafts) if num_drafts > 0 else None
+    )
+
+    return {
+        "num_drafts": num_drafts,
+        "num_draft_tokens": num_draft_tokens,
+        "num_accepted_tokens": num_accepted_tokens,
+        "acceptance_rate": acceptance_rate,
+        "acceptance_length": acceptance_length,
+        "per_position_acceptance_rates": per_pos_acceptance_rates or None,
+    }
+
+
 def run_once(
     llm: LLM,
     prompts: Sequence[str],
     sampling_params: SamplingParams,
-) -> tuple[float, int, list[str]]:
+) -> tuple[float, int, list[str], dict[str, float | int | list[float] | None]]:
+    metrics_before = llm.get_metrics()
     start = time.perf_counter()
     outputs = llm.generate(list(prompts), sampling_params, use_tqdm=False)
     elapsed = time.perf_counter() - start
-    return elapsed, generated_token_count(outputs), generated_texts(outputs)
+    metrics_after = llm.get_metrics()
+    return (
+        elapsed,
+        generated_token_count(outputs),
+        generated_texts(outputs),
+        spec_decode_metrics(metrics_before, metrics_after),
+    )
 
 
 def main() -> None:
@@ -156,7 +236,9 @@ def main() -> None:
 
     runs = []
     for _ in range(args.iters):
-        elapsed, output_tokens, texts = run_once(llm, args.prompts, sampling_params)
+        elapsed, output_tokens, texts, spec_metrics = run_once(
+            llm, args.prompts, sampling_params
+        )
         runs.append(
             {
                 "elapsed_s": elapsed,
@@ -165,6 +247,7 @@ def main() -> None:
                 if output_tokens
                 else None,
                 "throughput_tok_s": (output_tokens / elapsed) if elapsed else None,
+                "spec_decode": spec_metrics,
                 "texts": texts,
             }
         )
@@ -176,6 +259,7 @@ def main() -> None:
                 "case": args.case,
                 "model": args.model,
                 "draft_model": None if args.case == "vanilla" else args.draft_model,
+                "method": None if args.case == "vanilla" else args.method,
                 "tree": None if args.case == "vanilla" else args.tree,
                 "num_prompts": len(args.prompts),
                 "max_tokens": args.max_tokens,
