@@ -579,6 +579,7 @@ def tree_rejection_greedy_sample(
     retrieve_index = metadata.tree_retrieve_index
     retrieve_next_token = metadata.tree_retrieve_next_token
     retrieve_next_sibling = metadata.tree_retrieve_next_sibling
+    tree_target_mask = metadata.tree_target_mask
     tree_num_spec_steps = metadata.tree_num_spec_steps
     tree_valid = metadata.tree_valid
 
@@ -603,6 +604,14 @@ def tree_rejection_greedy_sample(
                 f"{name} must have shape ({batch_size}, {max_tree_nodes}), "
                 f"got {tensor.shape}"
             )
+    if tree_target_mask is not None and tree_target_mask.shape != (
+        batch_size,
+        max_tree_nodes,
+    ):
+        raise ValueError(
+            f"tree_target_mask must have shape ({batch_size}, {max_tree_nodes}), "
+            f"got {tree_target_mask.shape}"
+        )
     if tree_num_spec_steps <= 0 or tree_num_spec_steps > metadata.max_spec_len + 1:
         raise ValueError(
             "tree_num_spec_steps must fit the sampler output width, got "
@@ -621,6 +630,7 @@ def tree_rejection_greedy_sample(
         num_spec_steps=tree_num_spec_steps,
         tree_valid=tree_valid,
         linear_kv_safe=metadata.tree_linear_kv_safe,
+        target_mask=tree_target_mask,
     )
 
     output_token_ids = torch.full(

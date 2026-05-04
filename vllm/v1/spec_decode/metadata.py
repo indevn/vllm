@@ -32,6 +32,8 @@ class SpecDecodeMetadata:
     tree_retrieve_next_token: torch.Tensor | None = None
     # [batch_size, max_tree_nodes]
     tree_retrieve_next_sibling: torch.Tensor | None = None
+    # [batch_size, max_tree_nodes]
+    tree_target_mask: torch.Tensor | None = None
     # Number of output slots to verify: accepted draft path plus final target
     # recovery/bonus token.  This is usually tree depth + 1.
     tree_num_spec_steps: int | None = None

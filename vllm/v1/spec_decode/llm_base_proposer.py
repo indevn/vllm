@@ -307,6 +307,9 @@ class SpecDecodeBaseProposer:
         self._dynamic_tree_max_draft_tokens = (
             self.speculative_config.dynamic_draft_tree_max_draft_tokens
         )
+        self._enable_dynamic_tree_target_mask = (
+            self.speculative_config.enable_dynamic_tree_target_mask
+        )
         self._dynamic_tree_last_metadata: (
             list[dict[str, list[int] | int | bool] | None] | None
         ) = None
@@ -1241,9 +1244,8 @@ class SpecDecodeBaseProposer:
         """Select a request-local DDT verify subtree from live draft scores.
 
         vLLM's current TREE_ATTN backend still computes the full configured
-        static tree.  This metadata only changes which nodes the verifier can
-        traverse, which is the first runtime DDT step before per-request dynamic
-        target masks reduce target-side work.
+        static tree.  This metadata changes the verifier traversal set and, when
+        enabled, also emits a per-request target mask for unselected nodes.
         """
 
         max_selected = (
@@ -1336,6 +1338,7 @@ class SpecDecodeBaseProposer:
                         "retrieve_index": list(range(full_num_nodes)),
                         "retrieve_next_token": [-1] * full_num_nodes,
                         "retrieve_next_sibling": [-1] * full_num_nodes,
+                        "target_mask": [0] * full_num_nodes,
                         "num_spec_steps": 1,
                         "tree_valid": False,
                     }
@@ -1364,11 +1367,15 @@ class SpecDecodeBaseProposer:
                 ),
                 default=0,
             )
+            target_mask = [0] * full_num_nodes
+            for static_idx in selected_static_nodes:
+                target_mask[static_idx] = 1
             metadata_by_req.append(
                 {
                     "retrieve_index": retrieve_index,
                     "retrieve_next_token": retrieve_next_token,
                     "retrieve_next_sibling": retrieve_next_sibling,
+                    "target_mask": target_mask,
                     "num_spec_steps": max_depth + 1,
                     "tree_valid": True,
                 }

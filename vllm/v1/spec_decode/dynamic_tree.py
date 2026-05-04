@@ -425,6 +425,7 @@ def verify_dynamic_tree_greedy(
     num_spec_steps: int,
     tree_valid: torch.Tensor | None = None,
     linear_kv_safe: bool = False,
+    target_mask: torch.Tensor | None = None,
 ) -> DynamicTreeVerifyOutput:
     """Verify a dynamic draft tree using greedy target predictions.
 
@@ -469,6 +470,11 @@ def verify_dynamic_tree_greedy(
         raise ValueError(
             f"tree_valid must have shape ({batch_size},), got {tree_valid.shape}"
         )
+    if target_mask is not None and target_mask.shape != (batch_size, num_draft_tokens):
+        raise ValueError(
+            f"target_mask must have shape ({batch_size}, {num_draft_tokens}), "
+            f"got {target_mask.shape}"
+        )
 
     predicts = torch.zeros_like(target_predict)
     accept_index = torch.zeros(
@@ -504,9 +510,16 @@ def verify_dynamic_tree_greedy(
                     draft_local_idx == next_linear_local_idx
                     and cur_index == next_linear_local_idx
                 )
+                allowed_by_mask = True
+                if target_mask is not None:
+                    allowed_by_mask = bool(target_mask[batch_idx, cur_index].item())
 
-                if bool((draft_token_id == target_token_id).item()) and (
+                if (
+                    bool((draft_token_id == target_token_id).item())
+                    and allowed_by_mask
+                    and (
                     not linear_kv_safe or kv_slot_is_linear_prefix
+                    )
                 ):
                     predicts[batch_idx, last_accepted_local_idx] = target_token_id
                     num_accepted_tokens += 1

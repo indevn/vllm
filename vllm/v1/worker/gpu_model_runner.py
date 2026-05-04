@@ -2680,8 +2680,7 @@ class GPUModelRunner(
             logits_indices=logits_indices,
         )
         if (
-            self.enable_dynamic_draft_tree
-            and scheduler_output is not None
+            scheduler_output is not None
             and scheduler_output.scheduled_spec_decode_tree_metadata
         ):
             self._attach_tree_spec_decode_metadata(
@@ -2721,6 +2720,9 @@ class GPUModelRunner(
         tree_retrieve_next_sibling = torch.full(
             (batch_size, max_tree_nodes), -1, dtype=torch.int32, device=self.device
         )
+        tree_target_mask = torch.zeros(
+            (batch_size, max_tree_nodes), dtype=torch.int32, device=self.device
+        )
         tree_valid = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
         tree_num_spec_steps = 0
 
@@ -2734,6 +2736,7 @@ class GPUModelRunner(
             retrieve_index = tree_metadata["retrieve_index"]
             retrieve_next_token = tree_metadata["retrieve_next_token"]
             retrieve_next_sibling = tree_metadata["retrieve_next_sibling"]
+            target_mask = tree_metadata.get("target_mask")
             num_spec_steps = int(tree_metadata["num_spec_steps"])
             if (
                 not isinstance(retrieve_index, list)
@@ -2742,6 +2745,10 @@ class GPUModelRunner(
                 or len(retrieve_index) < num_nodes
                 or len(retrieve_next_token) < num_nodes
                 or len(retrieve_next_sibling) < num_nodes
+            ):
+                continue
+            if target_mask is not None and (
+                not isinstance(target_mask, list) or len(target_mask) < num_nodes
             ):
                 continue
 
@@ -2766,6 +2773,12 @@ class GPUModelRunner(
                 dtype=torch.int32,
                 device=self.device,
             )
+            if target_mask is not None:
+                tree_target_mask[req_idx, :num_nodes] = torch.tensor(
+                    target_mask[:num_nodes], dtype=torch.int32, device=self.device
+                )
+            else:
+                tree_target_mask[req_idx, :num_nodes] = 1
             tree_valid[req_idx] = bool(tree_metadata.get("tree_valid", True))
             tree_num_spec_steps = max(tree_num_spec_steps, num_spec_steps)
 
@@ -2775,6 +2788,7 @@ class GPUModelRunner(
         metadata.tree_retrieve_index = tree_retrieve_index
         metadata.tree_retrieve_next_token = tree_retrieve_next_token
         metadata.tree_retrieve_next_sibling = tree_retrieve_next_sibling
+        metadata.tree_target_mask = tree_target_mask
         metadata.tree_num_spec_steps = tree_num_spec_steps
         metadata.tree_valid = tree_valid
         metadata.tree_linear_kv_safe = not self.enable_dynamic_tree_kv_relocation
@@ -4778,14 +4792,12 @@ class GPUModelRunner(
     def _get_draft_tree_metadata(
         self, req_ids: list[str]
     ) -> dict[str, dict[str, list[int] | int | bool]] | None:
-        if not self.enable_dynamic_draft_tree:
-            return None
         if not isinstance(self.drafter, EagleProposer):
             return None
         dynamic_tree_metadata = getattr(
             self.drafter, "_dynamic_tree_last_metadata", None
         )
-        if dynamic_tree_metadata is not None:
+        if self.enable_dynamic_draft_tree and dynamic_tree_metadata is not None:
             metadata_by_req: dict[str, dict[str, list[int] | int | bool]] = {}
             for req_id, tree_metadata in zip(req_ids, dynamic_tree_metadata):
                 if tree_metadata is not None:

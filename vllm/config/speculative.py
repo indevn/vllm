@@ -156,6 +156,12 @@ class SpeculativeConfig:
     Target and draft attention must both use TREE_ATTN so target verification
     logits have tree semantics.
     """
+    enable_dynamic_tree_target_mask: bool = False
+    """Enable an experimental per-request target-mask path for tree speculation.
+
+    This keeps the tree-aware verifier enabled but allows the runtime to carry a
+    request-local mask for unselected tree nodes. It is still greedy-only.
+    """
     dynamic_draft_tree_max_draft_tokens: int | None = Field(default=None, gt=0)
     """Maximum number of draft nodes selected into the runtime DDT verify
     subtree. If unset, all nodes from ``speculative_token_tree`` remain
@@ -992,6 +998,17 @@ class SpeculativeConfig:
                 raise ValueError(
                     "enable_dynamic_draft_tree currently supports only standard "
                     "greedy rejection sampling."
+                )
+        if self.enable_dynamic_tree_target_mask:
+            if not self.enable_dynamic_draft_tree:
+                raise ValueError(
+                    "enable_dynamic_tree_target_mask currently requires "
+                    "enable_dynamic_draft_tree=True."
+                )
+            if self.rejection_sample_method != "standard":
+                raise ValueError(
+                    "enable_dynamic_tree_target_mask currently supports only "
+                    "standard greedy rejection sampling."
                 )
 
         if self.draft_model_config:

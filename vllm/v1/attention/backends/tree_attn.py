@@ -322,6 +322,7 @@ def build_static_tree_retrieve_metadata(
         "retrieve_index": retrieve_index,
         "retrieve_next_token": retrieve_next_token,
         "retrieve_next_sibling": retrieve_next_sibling,
+        "target_mask": [1] * num_nodes,
         "num_spec_steps": max_depth + 1,
         "tree_valid": True,
     }

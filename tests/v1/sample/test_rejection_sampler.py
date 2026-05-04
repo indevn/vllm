@@ -568,6 +568,26 @@ def test_rejection_sampler_closes_logits_built_dynamic_tree_loop(
     assert torch.equal(output.sampled_token_ids, expected)
 
 
+def test_tree_rejection_greedy_sample_accepts_static_target_mask():
+    metadata, logits = create_tree_spec_decode_metadata(
+        draft_token_ids=[[11, 12, 13, 14]],
+        target_token_ids=[[11, 13, 99, 14, 42]],
+    )
+    metadata.tree_target_mask = torch.tensor(
+        [[1, 1, 1, 1, 1]], dtype=torch.int32, device=logits.device
+    )
+    sampling_metadata = create_sampling_metadata(all_greedy=True)
+
+    output, accept_indices = tree_rejection_greedy_sample(
+        metadata,
+        logits,
+        sampling_metadata,
+    )
+
+    assert output.shape == accept_indices.shape
+    assert torch.equal(output[:, 0], torch.tensor([11], device=logits.device))
+
+
 ########################### Tests for Random Sampling ###################
 @pytest.mark.parametrize("k", [1, 3, 5])
 @pytest.mark.parametrize("vocab_size", [1000])

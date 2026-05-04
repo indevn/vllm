@@ -33,7 +33,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--case",
-        choices=["vanilla", "tree_static", "ddt_bridge"],
+        choices=[
+            "vanilla",
+            "tree_static",
+            "ddt_bridge",
+            "ddt_target_mask",
+        ],
         required=True,
         help=(
             "Benchmark case to run. Run this script once per case to release "
@@ -116,7 +121,10 @@ def build_llm(args: argparse.Namespace) -> LLM:
         disable_log_stats=False,
     )
     target_attn_backend = args.target_attn_backend
-    if target_attn_backend is None and args.case == "ddt_bridge":
+    if target_attn_backend is None and args.case in {
+        "ddt_bridge",
+        "ddt_target_mask",
+    }:
         target_attn_backend = "TREE_ATTN"
     if target_attn_backend:
         kwargs["attention_config"] = {"backend": target_attn_backend}
@@ -137,12 +145,14 @@ def build_llm(args: argparse.Namespace) -> LLM:
         spec_config["speculative_token_tree"] = args.tree
     if args.draft_attn_backend != "auto":
         spec_config["attention_backend"] = args.draft_attn_backend
-    if args.case == "ddt_bridge":
+    if args.case in {"ddt_bridge", "ddt_target_mask"}:
         spec_config["enable_dynamic_draft_tree"] = True
         if args.ddt_max_draft_tokens is not None:
             spec_config["dynamic_draft_tree_max_draft_tokens"] = (
                 args.ddt_max_draft_tokens
             )
+    if args.case == "ddt_target_mask":
+        spec_config["enable_dynamic_tree_target_mask"] = True
 
     return LLM(**kwargs, speculative_config=spec_config)
 
