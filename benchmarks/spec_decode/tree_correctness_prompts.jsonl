@@ -1,0 +1,8 @@
+{"id":"software_short","prompt":"This is a short test prompt about software engineering:"}
+{"id":"cs_history","prompt":"In 1970s computer science, the most important idea was"}
+{"id":"mixed_input","prompt":"The input you have provided seems"}
+{"id":"python_return","prompt":"def example_function(x):\n    # return"}
+{"id":"spec_decode_consistency","prompt":"Qwen model behavior with speculative decoding should be"}
+{"id":"math_explain","prompt":"Explain why matrix multiplication is useful in one paragraph:"}
+{"id":"shell_script","prompt":"#!/usr/bin/env bash\nset -e\n# print"}
+{"id":"json_reasoning","prompt":"Given the JSON object {\"name\":\"Ada\",\"role\":\"engineer\"}, write"}

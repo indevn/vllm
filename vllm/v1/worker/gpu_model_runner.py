@@ -4,6 +4,8 @@
 import functools
 import gc
 import itertools
+import json
+import os
 import threading
 import time
 from collections import defaultdict
@@ -595,7 +597,12 @@ class GPUModelRunner(
             self.speculative_config is not None
             and self.speculative_config.enable_dynamic_draft_tree
         )
+        self.enable_tree_spec_decode_kv_relocation = (
+            self.speculative_config is not None
+            and self.speculative_config.enable_tree_spec_decode_kv_relocation
+        )
         self.enable_dynamic_tree_kv_relocation = False
+        self.tree_spec_trace_path = os.environ.get("VLLM_TREE_SPEC_TRACE_PATH")
         self.use_async_spec_decode = (
             self.use_async_scheduling and self.num_spec_tokens > 0
         )
@@ -2794,7 +2801,7 @@ class GPUModelRunner(
         metadata.tree_linear_kv_safe = not self.enable_dynamic_tree_kv_relocation
 
     def _refresh_dynamic_tree_kv_relocation_support(self) -> None:
-        if not self.enable_dynamic_draft_tree:
+        if not self.enable_tree_spec_decode_kv_relocation:
             self.enable_dynamic_tree_kv_relocation = False
             return
         if self.model_config.is_hybrid:
@@ -2819,6 +2826,34 @@ class GPUModelRunner(
                     self.enable_dynamic_tree_kv_relocation = False
                     return
         self.enable_dynamic_tree_kv_relocation = True
+
+    def _maybe_dump_tree_spec_trace(
+        self,
+        sampler_output: SamplerOutput,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> None:
+        if (
+            not self.tree_spec_trace_path
+            or spec_decode_metadata is None
+            or not spec_decode_metadata.has_tree_metadata
+            or sampler_output.spec_decode_accept_trace is None
+        ):
+            return
+
+        traces = sampler_output.spec_decode_accept_trace
+        req_ids = self.input_batch.req_ids[: len(traces)]
+        output_token_ids = sampler_output.sampled_token_ids.detach().cpu().tolist()
+        records: list[dict[str, object]] = []
+        for req_id, trace, token_ids in zip(req_ids, traces, output_token_ids):
+            valid_token_ids = [int(token_id) for token_id in token_ids if token_id >= 0]
+            record = dict(trace)
+            record["request_id"] = req_id
+            record["output_token_ids"] = valid_token_ids
+            records.append(record)
+
+        with open(self.tree_spec_trace_path, "a", encoding="utf-8") as f:
+            for record in records:
+                f.write(json.dumps(record, sort_keys=True) + "\n")
 
     def _maybe_relocate_dynamic_tree_kv(
         self,
@@ -4535,6 +4570,7 @@ class GPUModelRunner(
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
+        self._maybe_dump_tree_spec_trace(sampler_output, spec_decode_metadata)
         self._maybe_relocate_dynamic_tree_hidden_states(
             sampler_output,
             spec_decode_metadata,

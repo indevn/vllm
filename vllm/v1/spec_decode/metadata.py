@@ -44,6 +44,9 @@ class SpecDecodeMetadata:
     # Full branching acceptance requires KV relocation and leaves this disabled
     # for pure semantic/unit tests.
     tree_linear_kv_safe: bool = False
+    # Optional debug trace emitted by the tree verifier when
+    # VLLM_TREE_SPEC_TRACE_PATH is set.
+    tree_accept_trace: list[dict] | None = None
 
     def __post_init__(self):
         self.max_spec_len = max(self.num_draft_tokens)

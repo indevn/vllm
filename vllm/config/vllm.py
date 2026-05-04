@@ -813,6 +813,12 @@ class VllmConfig:
                         "Async scheduling is not compatible with "
                         "enable_dynamic_draft_tree=True."
                     )
+                if self.speculative_config.speculative_token_tree is not None:
+                    raise ValueError(
+                        "Async scheduling is not compatible with "
+                        "speculative_token_tree because tree verifier metadata "
+                        "is carried through the scheduler."
+                    )
             if not executor_supports_async_sched:
                 raise ValueError(
                     f"`{executor_backend}` does not support async scheduling yet."
@@ -856,6 +862,15 @@ class VllmConfig:
                 logger.warning_once(
                     "Async scheduling is not supported with "
                     "enable_dynamic_draft_tree=True and will be disabled.",
+                )
+                self.scheduler_config.async_scheduling = False
+            elif (
+                self.speculative_config is not None
+                and self.speculative_config.speculative_token_tree is not None
+            ):
+                logger.warning_once(
+                    "Async scheduling is not supported with "
+                    "speculative_token_tree and will be disabled.",
                 )
                 self.scheduler_config.async_scheduling = False
             elif not executor_supports_async_sched:

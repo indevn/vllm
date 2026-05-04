@@ -167,6 +167,14 @@ class SpeculativeConfig:
     subtree. If unset, all nodes from ``speculative_token_tree`` remain
     reachable, matching the static tree behavior.
     """
+    enable_tree_spec_decode_kv_relocation: bool = False
+    """Enable experimental KV/state relocation for tree speculative decoding.
+
+    The default tree verifier is prefix-only: it accepts only tree nodes that
+    already match the scheduled linear KV layout.  This flag allows accepting
+    non-prefix branching paths and relocates KV/state slots into the accepted
+    output order. It is greedy-only and intended for correctness experiments.
+    """
     parallel_drafting: bool = False
     """Enable parallel drafting, where all speculative tokens are generated
     in parallel rather than sequentially. This can improve performance but
@@ -1009,6 +1017,17 @@ class SpeculativeConfig:
                 raise ValueError(
                     "enable_dynamic_tree_target_mask currently supports only "
                     "standard greedy rejection sampling."
+                )
+        if self.enable_tree_spec_decode_kv_relocation:
+            if self.speculative_token_tree is None:
+                raise ValueError(
+                    "enable_tree_spec_decode_kv_relocation requires "
+                    "speculative_token_tree."
+                )
+            if self.rejection_sample_method != "standard":
+                raise ValueError(
+                    "enable_tree_spec_decode_kv_relocation currently supports "
+                    "only standard greedy rejection sampling."
                 )
 
         if self.draft_model_config:

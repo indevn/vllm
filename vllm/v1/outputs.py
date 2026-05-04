@@ -126,6 +126,8 @@ class SamplerOutput:
     # decoding. Position 0 is the root/bonus target token; positions >0 map to
     # draft tree local indices used for KV relocation.
     spec_decode_accept_indices: torch.Tensor | None = None
+    # Optional CPU-side tree verification trace for debugging correctness.
+    spec_decode_accept_trace: list[dict] | None = None
 
 
 @dataclass

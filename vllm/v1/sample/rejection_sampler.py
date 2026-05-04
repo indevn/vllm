@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING
@@ -160,6 +161,7 @@ class RejectionSampler(nn.Module):
                 sampled_token_ids=output_token_ids,
                 logprobs_tensors=None,
                 spec_decode_accept_indices=accept_indices,
+                spec_decode_accept_trace=metadata.tree_accept_trace,
             )
 
         bonus_logits_indices = metadata.bonus_logits_indices
@@ -632,6 +634,16 @@ def tree_rejection_greedy_sample(
         linear_kv_safe=metadata.tree_linear_kv_safe,
         target_mask=tree_target_mask,
     )
+    if os.environ.get("VLLM_TREE_SPEC_TRACE_PATH"):
+        metadata.tree_accept_trace = _build_tree_accept_trace(
+            metadata,
+            candidates,
+            target_predict,
+            verify.accept_index,
+            verify.accept_token_num,
+            tree_valid,
+            tree_target_mask,
+        )
 
     output_token_ids = torch.full(
         (batch_size, metadata.max_spec_len + 1),
@@ -667,6 +679,84 @@ def tree_rejection_greedy_sample(
         torch.int32
     )[valid_mask]
     return output_token_ids, accept_indices
+
+
+def _build_tree_accept_trace(
+    metadata: SpecDecodeMetadata,
+    candidates: torch.Tensor,
+    target_predict: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    tree_valid: torch.Tensor | None,
+    tree_target_mask: torch.Tensor | None,
+) -> list[dict]:
+    """Build a CPU-side debug trace for tree speculative verification."""
+
+    batch_size = candidates.shape[0]
+    accept_index_cpu = accept_index.detach().cpu().tolist()
+    accept_token_num_cpu = accept_token_num.detach().cpu().tolist()
+    candidates_cpu = candidates.detach().cpu().tolist()
+    target_predict_cpu = target_predict.detach().cpu().tolist()
+    target_mask_cpu = (
+        tree_target_mask.detach().cpu().tolist()
+        if tree_target_mask is not None
+        else None
+    )
+    tree_valid_cpu = (
+        tree_valid.detach().cpu().tolist() if tree_valid is not None else None
+    )
+
+    traces: list[dict] = []
+    for req_idx in range(batch_size):
+        steps: list[dict] = []
+        num_accepted = int(accept_token_num_cpu[req_idx])
+        for step_idx in range(num_accepted + 1):
+            local_idx = int(accept_index_cpu[req_idx][step_idx])
+            if local_idx < 0 or local_idx >= len(candidates_cpu[req_idx]):
+                continue
+            is_linear_prefix = local_idx == step_idx
+            steps.append(
+                {
+                    "step": step_idx,
+                    "accepted_local_idx": local_idx,
+                    "is_linear_prefix": is_linear_prefix,
+                    "candidate_token_id": int(candidates_cpu[req_idx][local_idx]),
+                    "target_token_id": int(target_predict_cpu[req_idx][local_idx]),
+                    "target_mask": None
+                    if target_mask_cpu is None
+                    else int(target_mask_cpu[req_idx][local_idx]),
+                }
+            )
+        traces.append(
+            {
+                "request_index": req_idx,
+                "num_draft_tokens": int(metadata.num_draft_tokens[req_idx]),
+                "accept_indices": [
+                    int(local_idx) for local_idx in accept_index_cpu[req_idx]
+                ],
+                "accept_token_num": num_accepted,
+                "accepted_local_indices": [
+                    step["accepted_local_idx"] for step in steps
+                ],
+                "accepted_local_tree_nodes": [
+                    {
+                        "step": step["step"],
+                        "local_idx": step["accepted_local_idx"],
+                        "candidate_token_id": step["candidate_token_id"],
+                    }
+                    for step in steps
+                ],
+                "all_accepted_linear_prefix": all(
+                    step["is_linear_prefix"] for step in steps
+                ),
+                "tree_linear_kv_safe": metadata.tree_linear_kv_safe,
+                "tree_valid": None
+                if tree_valid_cpu is None
+                else bool(tree_valid_cpu[req_idx]),
+                "steps": steps,
+            }
+        )
+    return traces
 
 
 def _padded_tree_candidates(
