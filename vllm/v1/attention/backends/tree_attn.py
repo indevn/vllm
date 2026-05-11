@@ -3,6 +3,7 @@
 """Attention layer with TreeAttention."""
 
 import ast
+import os
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -220,8 +221,13 @@ class TreeAttentionMetadataBuilder(AttentionMetadataBuilder[TreeAttentionMetadat
             device=device,
         )
 
+        enable_linear_chain_verify = (
+            os.environ.get("VLLM_TREE_ATTN_ENABLE_LINEAR_CHAIN_VERIFY") == "1"
+        )
         self.decode_threshold = (
-            1 if self.is_linear_chain else self.tree_attn_bias.shape[0]
+            1
+            if self.is_linear_chain and not enable_linear_chain_verify
+            else self.tree_attn_bias.shape[0]
         )
         self.reorder_batch_threshold = self.decode_threshold
         self.use_tree_decode_bias = not self.is_linear_chain

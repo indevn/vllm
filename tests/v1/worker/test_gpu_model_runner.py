@@ -528,6 +528,7 @@ def test_linear_tree_attn_take_draft_tokens_suppresses_chain_scheduler_input():
     )
     runner.enable_dynamic_draft_tree = False
     runner.enable_dynamic_tree_kv_relocation = False
+    runner.enable_tree_attn_linear_chain_verify = False
 
     draft_token_ids = runner.take_draft_token_ids()
 
@@ -535,6 +536,68 @@ def test_linear_tree_attn_take_draft_tokens_suppresses_chain_scheduler_input():
     assert draft_token_ids.req_ids == ["req_0", "req_1"]
     assert draft_token_ids.draft_token_ids == [[], []]
     assert draft_token_ids.tree_metadata is None
+
+
+def test_linear_tree_attn_diagnostic_take_draft_tokens_keeps_chain_metadata(
+    monkeypatch,
+):
+    runner = object.__new__(GPUModelRunner)
+    runner.num_spec_tokens = 4
+    runner._draft_token_req_ids = ["req_0", "req_1"]
+    runner.drafter = object.__new__(EagleProposer)
+    tree_metadata = {
+        "is_linear_chain": True,
+        "retrieve_index": [0, 1],
+        "retrieve_next_token": [1, -1],
+        "retrieve_next_sibling": [-1, -1],
+        "num_spec_steps": 2,
+        "tree_valid": True,
+    }
+    runner.drafter.tree_retrieve_metadata = tree_metadata
+    runner.drafter._dynamic_tree_last_metadata = None
+    runner.vllm_config = SimpleNamespace(
+        attention_config=SimpleNamespace(backend=SimpleNamespace(name="TREE_ATTN"))
+    )
+    runner.enable_dynamic_draft_tree = False
+    runner.enable_dynamic_tree_kv_relocation = False
+    runner.enable_tree_attn_linear_chain_verify = True
+    monkeypatch.setattr(
+        runner, "_get_draft_token_ids_cpu", lambda: ([[11], [21]], ["req_0", "req_1"])
+    )
+
+    draft_token_ids = runner.take_draft_token_ids()
+
+    assert draft_token_ids is not None
+    assert draft_token_ids.req_ids == ["req_0", "req_1"]
+    assert draft_token_ids.draft_token_ids == [[11], [21]]
+    assert draft_token_ids.tree_metadata == {
+        "req_0": tree_metadata,
+        "req_1": tree_metadata,
+    }
+
+
+def test_linear_tree_attn_force_rejects_without_diagnostic_verify():
+    runner = object.__new__(GPUModelRunner)
+    runner.drafter = object.__new__(EagleProposer)
+    runner.drafter.tree_retrieve_metadata = {"is_linear_chain": True}
+    runner.vllm_config = SimpleNamespace(
+        attention_config=SimpleNamespace(backend=SimpleNamespace(name="TREE_ATTN"))
+    )
+    runner.enable_tree_attn_linear_chain_verify = False
+
+    assert runner._should_force_linear_tree_attn_reject()
+
+
+def test_linear_tree_attn_diagnostic_verify_keeps_multi_token_path():
+    runner = object.__new__(GPUModelRunner)
+    runner.drafter = object.__new__(EagleProposer)
+    runner.drafter.tree_retrieve_metadata = {"is_linear_chain": True}
+    runner.vllm_config = SimpleNamespace(
+        attention_config=SimpleNamespace(backend=SimpleNamespace(name="TREE_ATTN"))
+    )
+    runner.enable_tree_attn_linear_chain_verify = True
+
+    assert not runner._should_force_linear_tree_attn_reject()
 
 
 def test_static_branch_tree_attn_suppresses_drafts_until_kv_relocation():

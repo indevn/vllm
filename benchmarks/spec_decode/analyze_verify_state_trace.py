@@ -17,6 +17,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--case", required=True)
     parser.add_argument("--trace", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument(
+        "--token-source",
+        choices=("baseline", "case"),
+        default="case",
+        help=(
+            "Which side of the harness comparison the trace belongs to. Use "
+            "'baseline' when analyzing the baseline server trace."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -46,18 +55,71 @@ def best_trace_offset(case_tokens: list[int], trace_outputs: list[int]) -> int:
     return best_offset
 
 
+def trace_match_score(case_tokens: list[int], traces: list[dict[str, Any]]) -> int:
+    trace_outputs: list[int] = []
+    for record in traces:
+        trace_outputs.extend(int(token_id) for token_id in record["output_token_ids"])
+    offset = best_trace_offset(case_tokens, trace_outputs)
+    matched = 0
+    while (
+        offset + matched < len(case_tokens)
+        and matched < len(trace_outputs)
+        and case_tokens[offset + matched] == trace_outputs[matched]
+    ):
+        matched += 1
+    return matched
+
+
+def group_traces_by_request(
+    traces: list[dict[str, Any]],
+) -> list[tuple[str | None, list[dict[str, Any]]]]:
+    trace_groups: dict[str | None, list[dict[str, Any]]] = {}
+    for record in traces:
+        trace_groups.setdefault(record.get("request_id"), []).append(record)
+    return list(trace_groups.items())
+
+
+def match_trace_groups_to_prompts(
+    comparison_diffs: list[dict[str, Any]],
+    trace_groups: list[tuple[str | None, list[dict[str, Any]]]],
+    token_source: str,
+) -> dict[str, tuple[str | None, list[dict[str, Any]]]]:
+    unmatched = set(range(len(trace_groups)))
+    trace_by_prompt: dict[str, tuple[str | None, list[dict[str, Any]]]] = {}
+    for diff in comparison_diffs:
+        prompt_id = diff["id"]
+        token_key = f"{token_source}_token_ids"
+        case_tokens = [int(token_id) for token_id in diff[token_key]]
+        best_idx = None
+        best_score = -1
+        for group_idx in unmatched:
+            _, group_records = trace_groups[group_idx]
+            score = trace_match_score(case_tokens, group_records)
+            if score > best_score:
+                best_score = score
+                best_idx = group_idx
+        if best_idx is None:
+            trace_by_prompt[prompt_id] = (None, [])
+            continue
+        unmatched.remove(best_idx)
+        trace_by_prompt[prompt_id] = trace_groups[best_idx]
+    return trace_by_prompt
+
+
 def summarize_prompt(
     *,
     prompt_id: str,
+    request_id: str | None,
     baseline_tokens: list[int],
     case_tokens: list[int],
+    trace_tokens: list[int],
     first_token_diff: int | None,
     traces: list[dict[str, Any]],
 ) -> dict[str, Any]:
     trace_outputs: list[int] = []
     for record in traces:
         trace_outputs.extend(int(token_id) for token_id in record["output_token_ids"])
-    trace_offset = best_trace_offset(case_tokens, trace_outputs)
+    trace_offset = best_trace_offset(trace_tokens, trace_outputs)
 
     rows = []
     emitted = 0
@@ -67,10 +129,25 @@ def summarize_prompt(
         row_start = trace_offset + emitted
         row_end = row_start + len(row_output)
         emitted += len(row_output)
+        query_start = record.get("query_start")
+        local_logits_idx = (
+            int(query_start)
+            if query_start is not None
+            and record.get("logits_argmax_token_ids") is not None
+            else None
+        )
+        logits_argmax = record.get("logits_argmax_token_ids")
+        logits_top_token_ids = record.get("logits_top_token_ids")
+        logits_top_values = record.get("logits_top_values")
+        logits_top_margins = record.get("logits_top_margins")
         row_summary = {
             "row": row_idx,
             "row_span": [row_start, row_end],
             "output_token_ids": row_output,
+            "scheduled_tokens": record.get("scheduled_tokens"),
+            "forward_tokens": record.get("forward_tokens"),
+            "forward_root_only": record.get("forward_root_only"),
+            "has_tree_metadata": record.get("has_tree_metadata"),
             "input_ids": record.get("input_ids"),
             "positions": record.get("positions"),
             "slot_mapping": record.get("slot_mapping"),
@@ -83,14 +160,36 @@ def summarize_prompt(
             "query_end": record.get("query_end"),
             "block_table": record.get("block_table"),
             "logits_indices": record.get("logits_indices"),
-            "logits_argmax_token_ids": record.get("logits_argmax_token_ids"),
-            "logits_top_token_ids": record.get("logits_top_token_ids"),
-            "logits_top_values": record.get("logits_top_values"),
-            "logits_top_margins": record.get("logits_top_margins"),
+            "logits_argmax_token_ids": logits_argmax,
+            "logits_top_token_ids": logits_top_token_ids,
+            "logits_top_values": logits_top_values,
+            "logits_top_margins": logits_top_margins,
+            "local_logits_index": local_logits_idx,
+            "local_logits_argmax_token_id": logits_argmax[local_logits_idx]
+            if local_logits_idx is not None and local_logits_idx < len(logits_argmax)
+            else None,
+            "local_logits_top_token_ids": logits_top_token_ids[local_logits_idx]
+            if local_logits_idx is not None
+            and logits_top_token_ids is not None
+            and local_logits_idx < len(logits_top_token_ids)
+            else None,
+            "local_logits_top_values": logits_top_values[local_logits_idx]
+            if local_logits_idx is not None
+            and logits_top_values is not None
+            and local_logits_idx < len(logits_top_values)
+            else None,
+            "local_logits_top_margin": logits_top_margins[local_logits_idx]
+            if local_logits_idx is not None
+            and logits_top_margins is not None
+            and local_logits_idx < len(logits_top_margins)
+            else None,
             "scheduled_spec_decode_tokens": record.get(
                 "scheduled_spec_decode_tokens"
             ),
             "num_draft_tokens": record.get("num_draft_tokens"),
+            "force_reject_all": record.get("force_reject_all"),
+            "force_root_only_forward": record.get("force_root_only_forward"),
+            "tree_linear_kv_safe": record.get("tree_linear_kv_safe"),
             "accepted_prefix_len": record.get("accepted_prefix_len"),
             "first_reject_index": record.get("first_reject_index"),
             "draft_token_ids": record.get("draft_token_ids"),
@@ -118,6 +217,7 @@ def summarize_prompt(
 
     return {
         "id": prompt_id,
+        "request_id": request_id,
         "first_token_diff": first_token_diff,
         "baseline_token": None
         if first_token_diff is None
@@ -138,32 +238,25 @@ def main() -> None:
     traces = load_jsonl(args.trace)
     comparison = harness["comparisons"][args.case]
 
-    trace_groups: list[list[dict[str, Any]]] = []
-    for record in traces:
-        if not trace_groups or record.get("request_id") != trace_groups[-1][-1].get(
-            "request_id"
-        ):
-            trace_groups.append([record])
-        else:
-            trace_groups[-1].append(record)
-    trace_by_prompt: dict[str, list[dict[str, Any]]] = {}
-    for diff in comparison["diffs"]:
-        prompt_id = diff["id"]
-        trace_by_prompt[prompt_id] = (
-            trace_groups[len(trace_by_prompt)]
-            if len(trace_by_prompt) < len(trace_groups)
-            else []
-        )
+    trace_groups = group_traces_by_request(traces)
+    trace_by_prompt = match_trace_groups_to_prompts(
+        comparison["diffs"],
+        trace_groups,
+        args.token_source,
+    )
 
     summaries = []
     for diff in comparison["diffs"]:
+        request_id, prompt_traces = trace_by_prompt.get(diff["id"], (None, []))
         summaries.append(
             summarize_prompt(
                 prompt_id=diff["id"],
+                request_id=request_id,
                 baseline_tokens=diff["baseline_token_ids"],
                 case_tokens=diff["case_token_ids"],
+                trace_tokens=diff[f"{args.token_source}_token_ids"],
                 first_token_diff=diff["first_token_diff"],
-                traces=trace_by_prompt.get(diff["id"], []),
+                traces=prompt_traces,
             )
         )
 

@@ -607,6 +607,15 @@ class GPUModelRunner(
         self.spec_verify_state_trace_path = os.environ.get(
             "VLLM_SPEC_VERIFY_STATE_TRACE_PATH"
         )
+        self.enable_tree_attn_linear_chain_verify = (
+            os.environ.get("VLLM_TREE_ATTN_ENABLE_LINEAR_CHAIN_VERIFY") == "1"
+        )
+        if (
+            self.speculative_config is not None
+            and hasattr(self, "drafter")
+            and self._should_suppress_tree_attn_draft_tokens()
+        ):
+            self.use_aux_hidden_state_outputs = False
         self._tree_spec_recovery_req_ids: set[str] = set()
         self.use_async_spec_decode = (
             self.use_async_scheduling and self.num_spec_tokens > 0
@@ -2730,6 +2739,7 @@ class GPUModelRunner(
         tree_metadata = getattr(self.drafter, "tree_retrieve_metadata", None)
         return bool(
             self._uses_tree_attn_eagle_proposer()
+            and not getattr(self, "enable_tree_attn_linear_chain_verify", False)
             and tree_metadata is not None
             and tree_metadata.get("is_linear_chain", False)
         )
@@ -2756,7 +2766,7 @@ class GPUModelRunner(
             return False
 
         if tree_metadata.get("is_linear_chain", False):
-            return True
+            return not getattr(self, "enable_tree_attn_linear_chain_verify", False)
 
         dynamic_tree_metadata = getattr(
             self.drafter, "_dynamic_tree_last_metadata", None
@@ -5639,8 +5649,6 @@ class GPUModelRunner(
             return metadata_by_req
         tree_metadata = getattr(self.drafter, "tree_retrieve_metadata", None)
         if tree_metadata is None:
-            return None
-        if tree_metadata.get("is_linear_chain", False):
             return None
         return {req_id: tree_metadata.copy() for req_id in req_ids}
 
