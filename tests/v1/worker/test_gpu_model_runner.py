@@ -27,7 +27,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.system_utils import update_environment_variables
 from vllm.utils.torch_utils import set_random_seed
-from vllm.v1.attention.backend import MultipleOf
+from vllm.v1.attention.backend import CommonAttentionMetadata, MultipleOf
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.core.kv_cache_utils import estimate_max_model_len, get_kv_cache_configs
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
@@ -596,8 +596,240 @@ def test_linear_tree_attn_diagnostic_verify_keeps_multi_token_path():
         attention_config=SimpleNamespace(backend=SimpleNamespace(name="TREE_ATTN"))
     )
     runner.enable_tree_attn_linear_chain_verify = True
+    runner.force_tree_attn_linear_chain_root_only = False
 
     assert not runner._should_force_linear_tree_attn_reject()
+
+
+def test_linear_tree_attn_verify_defaults_to_root_only_reject():
+    runner = object.__new__(GPUModelRunner)
+    runner.drafter = object.__new__(EagleProposer)
+    runner.drafter.tree_retrieve_metadata = {"is_linear_chain": True}
+    runner.vllm_config = SimpleNamespace(
+        attention_config=SimpleNamespace(backend=SimpleNamespace(name="TREE_ATTN"))
+    )
+    runner.enable_tree_attn_linear_chain_verify = True
+    runner.force_tree_attn_linear_chain_root_only = True
+
+    assert runner._should_force_linear_tree_attn_root_only()
+    assert not runner._should_force_linear_tree_attn_reject()
+
+
+def test_linear_tree_attn_diagnostic_logits_can_run_single_row():
+    runner = object.__new__(GPUModelRunner)
+    calls = []
+
+    class FakeModel:
+        def compute_logits(self, hidden_states):
+            calls.append(tuple(hidden_states.shape))
+            return hidden_states.sum(dim=-1, keepdim=True)
+
+    runner.model = FakeModel()
+    metadata = SimpleNamespace(tree_force_single_row_logits=True)
+    hidden_states = torch.arange(12, dtype=torch.float32).view(3, 4)
+
+    logits = runner._compute_sample_logits(hidden_states, metadata)
+
+    assert calls == [(1, 4), (1, 4), (1, 4)]
+    assert torch.equal(logits, hidden_states.sum(dim=-1, keepdim=True))
+
+
+def test_attach_linear_chain_metadata_enables_serial_q1_forward():
+    runner = object.__new__(GPUModelRunner)
+    runner.device = torch.device("cpu")
+    runner.enable_dynamic_tree_kv_relocation = False
+    runner.enable_tree_attn_linear_chain_verify = True
+    runner.force_tree_attn_linear_chain_root_only = False
+    runner.input_batch = SimpleNamespace(req_ids=["req_0"])
+    metadata = SimpleNamespace(
+        draft_token_ids=torch.tensor([11, 12], device=runner.device),
+        num_draft_tokens=[2],
+        cu_num_draft_tokens=torch.tensor([2], dtype=torch.int32, device=runner.device),
+        cu_num_sampled_tokens=torch.tensor(
+            [3], dtype=torch.int32, device=runner.device
+        ),
+        tree_target_logits_indices=None,
+        tree_retrieve_index=None,
+        tree_retrieve_next_token=None,
+        tree_retrieve_next_sibling=None,
+        tree_target_mask=None,
+        tree_attn_bias=None,
+        tree_position_offsets=None,
+        tree_num_spec_steps=None,
+        tree_valid=None,
+        tree_linear_kv_safe=False,
+        tree_force_single_row_logits=False,
+        tree_force_serial_q1_forward=False,
+    )
+    scheduler_output = SimpleNamespace(
+        scheduled_spec_decode_tree_metadata={
+            "req_0": {
+                "retrieve_index": [0, 1, 2],
+                "retrieve_next_token": [1, 2, -1],
+                "retrieve_next_sibling": [-1, -1, -1],
+                "target_mask": [1, 1, 1],
+                "position_offsets": [0, 1, 2],
+                "num_spec_steps": 3,
+                "tree_valid": True,
+                "is_linear_chain": True,
+            }
+        }
+    )
+
+    runner._attach_tree_spec_decode_metadata(
+        metadata,
+        scheduler_output,
+        np.array([3], dtype=np.int32),
+        np.array([2], dtype=np.int32),
+    )
+
+    assert metadata.tree_force_single_row_logits
+    assert metadata.tree_force_serial_q1_forward
+
+
+def test_attach_linear_chain_root_only_skips_serial_q1_forward():
+    runner = object.__new__(GPUModelRunner)
+    runner.device = torch.device("cpu")
+    runner.enable_dynamic_tree_kv_relocation = False
+    runner.enable_tree_attn_linear_chain_verify = True
+    runner.force_tree_attn_linear_chain_root_only = True
+    runner.input_batch = SimpleNamespace(req_ids=["req_0"])
+    metadata = SimpleNamespace(
+        draft_token_ids=torch.tensor([11, 12], device=runner.device),
+        num_draft_tokens=[2],
+        cu_num_draft_tokens=torch.tensor([2], dtype=torch.int32, device=runner.device),
+        cu_num_sampled_tokens=torch.tensor(
+            [3], dtype=torch.int32, device=runner.device
+        ),
+        tree_target_logits_indices=None,
+        tree_retrieve_index=None,
+        tree_retrieve_next_token=None,
+        tree_retrieve_next_sibling=None,
+        tree_target_mask=None,
+        tree_attn_bias=None,
+        tree_position_offsets=None,
+        tree_num_spec_steps=None,
+        tree_valid=None,
+        tree_linear_kv_safe=False,
+        tree_force_single_row_logits=False,
+        tree_force_serial_q1_forward=False,
+    )
+    scheduler_output = SimpleNamespace(
+        scheduled_spec_decode_tree_metadata={
+            "req_0": {
+                "retrieve_index": [0, 1, 2],
+                "retrieve_next_token": [1, 2, -1],
+                "retrieve_next_sibling": [-1, -1, -1],
+                "target_mask": [1, 1, 1],
+                "position_offsets": [0, 1, 2],
+                "num_spec_steps": 3,
+                "tree_valid": True,
+                "is_linear_chain": True,
+            }
+        }
+    )
+
+    runner._attach_tree_spec_decode_metadata(
+        metadata,
+        scheduler_output,
+        np.array([3], dtype=np.int32),
+        np.array([2], dtype=np.int32),
+    )
+
+    assert not metadata.tree_force_single_row_logits
+    assert not metadata.tree_force_serial_q1_forward
+
+
+def test_serial_q1_common_metadata_slices_multi_request_row():
+    runner = object.__new__(GPUModelRunner)
+    common_metadata = CommonAttentionMetadata(
+        query_start_loc=torch.tensor([0, 3, 5], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 3, 5], dtype=torch.int32),
+        seq_lens=torch.tensor([13, 22], dtype=torch.int32),
+        _seq_lens_cpu=torch.tensor([13, 22], dtype=torch.int32),
+        _num_computed_tokens_cpu=torch.tensor([10, 20], dtype=torch.int32),
+        seq_lens_cpu_upper_bound=torch.tensor([13, 22], dtype=torch.int32),
+        num_reqs=2,
+        num_actual_tokens=5,
+        max_query_len=3,
+        max_seq_len=22,
+        block_table_tensor=torch.tensor(
+            [[1, 2, 0], [5, 6, 0]],
+            dtype=torch.int32,
+        ),
+        slot_mapping=torch.tensor([10, 11, 12, 20, 21], dtype=torch.int64),
+        positions=torch.tensor([10, 11, 12, 20, 21], dtype=torch.int64),
+    )
+
+    serial_req1_first = runner._build_serial_q1_common_attn_metadata(
+        common_metadata,
+        req_idx=1,
+        local_token_idx=0,
+        global_token_idx=3,
+    )
+    serial_req0_last = runner._build_serial_q1_common_attn_metadata(
+        common_metadata,
+        req_idx=0,
+        local_token_idx=2,
+        global_token_idx=2,
+    )
+
+    assert serial_req1_first.num_reqs == 1
+    assert serial_req1_first.num_actual_tokens == 1
+    assert serial_req1_first.max_query_len == 1
+    assert torch.equal(
+        serial_req1_first.query_start_loc,
+        torch.tensor([0, 1], dtype=torch.int32),
+    )
+    assert torch.equal(
+        serial_req1_first.query_start_loc_cpu,
+        torch.tensor([0, 1], dtype=torch.int32),
+    )
+    assert torch.equal(serial_req1_first.seq_lens, torch.tensor([21]))
+    assert torch.equal(serial_req1_first._seq_lens_cpu, torch.tensor([21]))
+    assert torch.equal(
+        serial_req1_first.seq_lens_cpu_upper_bound,
+        torch.tensor([21]),
+    )
+    assert torch.equal(
+        serial_req1_first._num_computed_tokens_cpu,
+        torch.tensor([20]),
+    )
+    assert torch.equal(
+        serial_req1_first.block_table_tensor,
+        torch.tensor([[5, 6, 0]], dtype=torch.int32),
+    )
+    assert torch.equal(serial_req1_first.slot_mapping, torch.tensor([20]))
+    assert torch.equal(serial_req1_first.positions, torch.tensor([20]))
+
+    assert torch.equal(serial_req0_last.seq_lens, torch.tensor([13]))
+    assert torch.equal(serial_req0_last._num_computed_tokens_cpu, torch.tensor([12]))
+    assert torch.equal(
+        serial_req0_last.block_table_tensor,
+        torch.tensor([[1, 2, 0]], dtype=torch.int32),
+    )
+    assert torch.equal(serial_req0_last.slot_mapping, torch.tensor([12]))
+
+
+def test_serial_q1_forward_allows_multi_request_batches(monkeypatch):
+    runner = object.__new__(GPUModelRunner)
+    runner.broadcast_pp_output = False
+    runner.is_pooling_model = False
+    runner.enable_prompt_embeds = False
+    runner.supports_mm_inputs = False
+    runner.uses_mrope = False
+    runner.uses_xdrope_dim = 0
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu_model_runner.get_pp_group",
+        lambda: SimpleNamespace(is_last_rank=True),
+    )
+    spec_decode_metadata = SimpleNamespace(tree_force_serial_q1_forward=True)
+    common_metadata = SimpleNamespace(num_reqs=2, num_actual_tokens=6)
+
+    assert runner._should_use_tree_serial_q1_forward(
+        spec_decode_metadata,
+        common_metadata,
+    )
 
 
 def test_static_branch_tree_attn_suppresses_drafts_until_kv_relocation():

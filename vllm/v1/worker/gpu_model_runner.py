@@ -607,8 +607,20 @@ class GPUModelRunner(
         self.spec_verify_state_trace_path = os.environ.get(
             "VLLM_SPEC_VERIFY_STATE_TRACE_PATH"
         )
+        self.enable_tree_attn_linear_chain_multi_token_verify = (
+            os.environ.get("VLLM_TREE_ATTN_ENABLE_LINEAR_CHAIN_MULTI_TOKEN_VERIFY")
+            == "1"
+        )
         self.enable_tree_attn_linear_chain_verify = (
             os.environ.get("VLLM_TREE_ATTN_ENABLE_LINEAR_CHAIN_VERIFY") == "1"
+            or self.enable_tree_attn_linear_chain_multi_token_verify
+        )
+        self.force_tree_attn_linear_chain_root_only = (
+            os.environ.get("VLLM_TREE_ATTN_FORCE_LINEAR_CHAIN_ROOT_ONLY") == "1"
+            or (
+                self.enable_tree_attn_linear_chain_verify
+                and not self.enable_tree_attn_linear_chain_multi_token_verify
+            )
         )
         if (
             self.speculative_config is not None
@@ -2730,6 +2742,7 @@ class GPUModelRunner(
             )
         if (
             self._should_force_linear_tree_attn_reject()
+            or self._should_force_linear_tree_attn_root_only()
             or self._should_force_dynamic_tree_attn_root_only()
         ):
             metadata.force_reject_all = True
@@ -2740,6 +2753,15 @@ class GPUModelRunner(
         return bool(
             self._uses_tree_attn_eagle_proposer()
             and not getattr(self, "enable_tree_attn_linear_chain_verify", False)
+            and tree_metadata is not None
+            and tree_metadata.get("is_linear_chain", False)
+        )
+
+    def _should_force_linear_tree_attn_root_only(self) -> bool:
+        tree_metadata = getattr(self.drafter, "tree_retrieve_metadata", None)
+        return bool(
+            self._uses_tree_attn_eagle_proposer()
+            and getattr(self, "force_tree_attn_linear_chain_root_only", False)
             and tree_metadata is not None
             and tree_metadata.get("is_linear_chain", False)
         )
@@ -2814,6 +2836,7 @@ class GPUModelRunner(
         )
         tree_valid = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
         tree_num_spec_steps = 0
+        all_tree_rows_are_linear_chain = True
 
         for req_idx, req_id in enumerate(req_ids):
             num_nodes = int(num_draft_tokens[req_idx]) + 1
@@ -2822,6 +2845,10 @@ class GPUModelRunner(
             tree_metadata = tree_metadata_by_req.get(req_id)
             if tree_metadata is None:
                 continue
+            all_tree_rows_are_linear_chain = (
+                all_tree_rows_are_linear_chain
+                and bool(tree_metadata.get("is_linear_chain", False))
+            )
             retrieve_index = tree_metadata["retrieve_index"]
             retrieve_next_token = tree_metadata["retrieve_next_token"]
             retrieve_next_sibling = tree_metadata["retrieve_next_sibling"]
@@ -2927,6 +2954,13 @@ class GPUModelRunner(
         metadata.tree_num_spec_steps = tree_num_spec_steps
         metadata.tree_valid = tree_valid
         metadata.tree_linear_kv_safe = not self.enable_dynamic_tree_kv_relocation
+        if (
+            all_tree_rows_are_linear_chain
+            and getattr(self, "enable_tree_attn_linear_chain_verify", False)
+            and not getattr(self, "force_tree_attn_linear_chain_root_only", False)
+        ):
+            metadata.tree_force_single_row_logits = True
+            metadata.tree_force_serial_q1_forward = True
 
     def _maybe_apply_tree_position_offsets(
         self,
@@ -3285,13 +3319,19 @@ class GPUModelRunner(
         draft_token_ids = None
         target_logits_indices = None
         bonus_logits_indices = None
+        tree_target_logits_indices = None
         tree_target_mask = None
         tree_position_offsets = None
         tree_attn_bias_mask = None
         cu_num_draft_tokens = None
         cu_num_sampled_tokens = None
         num_draft_tokens = None
+        accept_indices = None
         target_argmax_by_req = None
+        tree_target_argmax_by_req = None
+        tree_logits_top_token_ids_by_req = None
+        tree_logits_top_values_by_req = None
+        tree_logits_top_margins_by_req = None
         draft_token_ids_by_req = None
         accepted_prefix_len_by_req = None
         first_reject_index_by_req = None
@@ -3305,6 +3345,12 @@ class GPUModelRunner(
             bonus_logits_indices = self._tensor_trace_list(
                 spec_decode_metadata.bonus_logits_indices
             )
+            if spec_decode_metadata.tree_target_logits_indices is not None:
+                tree_target_logits_indices = (
+                    spec_decode_metadata.tree_target_logits_indices.detach()
+                    .cpu()
+                    .tolist()
+                )
             if spec_decode_metadata.tree_target_mask is not None:
                 tree_target_mask = (
                     spec_decode_metadata.tree_target_mask.detach().cpu().tolist()
@@ -3331,6 +3377,53 @@ class GPUModelRunner(
                 int(num_tokens)
                 for num_tokens in spec_decode_metadata.num_draft_tokens
             ]
+            if sampler_output.spec_decode_accept_indices is not None:
+                accept_indices = (
+                    sampler_output.spec_decode_accept_indices.detach()
+                    .cpu()
+                    .tolist()
+                )
+            if spec_decode_metadata.tree_target_logits_indices is not None:
+                tree_logits = None
+                if spec_decode_metadata.force_root_only_forward:
+                    batch_size = len(spec_decode_metadata.num_draft_tokens)
+                    if logits.shape[0] >= batch_size:
+                        tree_logits = logits[:batch_size].unsqueeze(1)
+                else:
+                    tree_indices = spec_decode_metadata.tree_target_logits_indices.to(
+                        torch.long
+                    )
+                    if (
+                        tree_indices.numel() > 0
+                        and int(tree_indices.max().item()) < logits.shape[0]
+                    ):
+                        tree_logits = logits[tree_indices]
+                if tree_logits is not None:
+                    tree_target_argmax_by_req = [
+                        [int(token_id) for token_id in row]
+                        for row in tree_logits.argmax(dim=-1).detach().cpu().tolist()
+                    ]
+                    (
+                        flat_top_token_ids,
+                        flat_top_values,
+                        flat_top_margins,
+                    ) = self._logits_topk_trace(
+                        tree_logits.reshape(-1, tree_logits.shape[-1]),
+                        k=5,
+                    )
+                    tree_width = tree_logits.shape[1]
+                    tree_logits_top_token_ids_by_req = [
+                        flat_top_token_ids[start : start + tree_width]
+                        for start in range(0, len(flat_top_token_ids), tree_width)
+                    ]
+                    tree_logits_top_values_by_req = [
+                        flat_top_values[start : start + tree_width]
+                        for start in range(0, len(flat_top_values), tree_width)
+                    ]
+                    tree_logits_top_margins_by_req = [
+                        flat_top_margins[start : start + tree_width]
+                        for start in range(0, len(flat_top_margins), tree_width)
+                    ]
             target_argmax_by_req = []
             draft_token_ids_by_req = []
             accepted_prefix_len_by_req = []
@@ -3341,9 +3434,23 @@ class GPUModelRunner(
                 req_draft_token_ids = (
                     [] if draft_token_ids is None else draft_token_ids[start:end]
                 )
-                req_target_argmax = [
-                    int(token_id) for token_id in target_argmax[start:end]
-                ]
+                req_target_argmax = []
+                if int(draft_len) > 0:
+                    target_indices = spec_decode_metadata.target_logits_indices[
+                        start:end
+                    ].to(torch.long)
+                    if (
+                        target_indices.numel() > 0
+                        and int(target_indices.max().item()) < logits.shape[0]
+                    ):
+                        req_target_argmax = [
+                            int(token_id)
+                            for token_id in logits[target_indices]
+                            .argmax(dim=-1)
+                            .detach()
+                            .cpu()
+                            .tolist()
+                        ]
                 req_output = (
                     output_token_ids[req_idx]
                     if req_idx < len(output_token_ids)
@@ -3439,11 +3546,25 @@ class GPUModelRunner(
                             spec_decode_metadata.force_root_only_forward
                         ),
                         "tree_linear_kv_safe": spec_decode_metadata.tree_linear_kv_safe,
+                        "tree_force_single_row_logits": (
+                            spec_decode_metadata.tree_force_single_row_logits
+                        ),
+                        "tree_force_serial_q1_forward": (
+                            spec_decode_metadata.tree_force_serial_q1_forward
+                        ),
+                        "tree_serial_q1_forward_used": (
+                            spec_decode_metadata.tree_serial_q1_forward_used
+                        ),
                         "draft_token_ids_flat": draft_token_ids,
                         "draft_token_ids": draft_token_ids_by_req[req_idx]
                         if draft_token_ids_by_req is not None
                         else None,
                         "target_logits_indices": target_logits_indices,
+                        "tree_target_logits_indices": tree_target_logits_indices[
+                            req_idx
+                        ]
+                        if tree_target_logits_indices is not None
+                        else None,
                         "bonus_logits_indices": bonus_logits_indices,
                         "tree_target_mask": tree_target_mask[req_idx]
                         if tree_target_mask is not None
@@ -3456,8 +3577,31 @@ class GPUModelRunner(
                         else None,
                         "cu_num_draft_tokens": cu_num_draft_tokens,
                         "cu_num_sampled_tokens": cu_num_sampled_tokens,
+                        "accept_indices": accept_indices[req_idx]
+                        if accept_indices is not None
+                        else None,
                         "target_argmax_token_ids": target_argmax_by_req[req_idx]
                         if target_argmax_by_req is not None
+                        else None,
+                        "tree_target_argmax_token_ids": tree_target_argmax_by_req[
+                            req_idx
+                        ]
+                        if tree_target_argmax_by_req is not None
+                        else None,
+                        "tree_logits_top_token_ids": (
+                            tree_logits_top_token_ids_by_req[req_idx]
+                        )
+                        if tree_logits_top_token_ids_by_req is not None
+                        else None,
+                        "tree_logits_top_values": (
+                            tree_logits_top_values_by_req[req_idx]
+                        )
+                        if tree_logits_top_values_by_req is not None
+                        else None,
+                        "tree_logits_top_margins": (
+                            tree_logits_top_margins_by_req[req_idx]
+                        )
+                        if tree_logits_top_margins_by_req is not None
                         else None,
                         "accepted_prefix_len": accepted_prefix_len_by_req[req_idx]
                         if accepted_prefix_len_by_req is not None
@@ -5086,6 +5230,10 @@ class GPUModelRunner(
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
+        use_serial_q1_forward = self._should_use_tree_serial_q1_forward(
+            spec_decode_metadata,
+            spec_decode_common_attn_metadata,
+        )
         with (
             set_forward_context(
                 attn_metadata,
@@ -5104,13 +5252,32 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
-            )
+            if use_serial_q1_forward:
+                assert spec_decode_common_attn_metadata is not None
+                assert input_ids is not None
+                assert inputs_embeds is None
+                assert spec_decode_metadata is not None
+                spec_decode_metadata.tree_serial_q1_forward_used = True
+                model_output = self._serial_q1_target_forward(
+                    common_attn_metadata=spec_decode_common_attn_metadata,
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    model_kwargs=model_kwargs,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    batch_desc=batch_desc,
+                    slot_mappings=slot_mappings,
+                    slot_mappings_by_group=slot_mappings_by_group,
+                    has_encoder_input=has_encoder_input,
+                )
+            else:
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -5150,7 +5317,10 @@ class GPUModelRunner(
                     )
 
                 sample_hidden_states = hidden_states[logits_indices]
-                logits = self.model.compute_logits(sample_hidden_states)
+                logits = self._compute_sample_logits(
+                    sample_hidden_states,
+                    spec_decode_metadata,
+                )
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -5179,7 +5349,10 @@ class GPUModelRunner(
                     )
                     logits = None
                 else:
-                    logits = self.model.compute_logits(sample_hidden_states)
+                    logits = self._compute_sample_logits(
+                        sample_hidden_states,
+                        spec_decode_metadata,
+                    )
 
                 model_output_broadcast_data: dict[str, Any] = {}
                 if logits is not None:
@@ -5212,6 +5385,384 @@ class GPUModelRunner(
             deferred_state_corrections_fn()
 
         return None
+
+    def _compute_sample_logits(
+        self,
+        sample_hidden_states: torch.Tensor,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> torch.Tensor | None:
+        if not (
+            spec_decode_metadata is not None
+            and spec_decode_metadata.tree_force_single_row_logits
+            and not getattr(spec_decode_metadata, "force_root_only_forward", False)
+            and sample_hidden_states.shape[0] > 1
+        ):
+            return self.model.compute_logits(sample_hidden_states)
+
+        logits_rows: list[torch.Tensor] = []
+        for row_idx in range(sample_hidden_states.shape[0]):
+            row_logits = self.model.compute_logits(
+                sample_hidden_states[row_idx : row_idx + 1]
+            )
+            if row_logits is None:
+                return None
+            logits_rows.append(row_logits)
+        return torch.cat(logits_rows, dim=0)
+
+    def _should_use_tree_serial_q1_forward(
+        self,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+        spec_decode_common_attn_metadata: CommonAttentionMetadata | None,
+    ) -> bool:
+        return bool(
+            spec_decode_metadata is not None
+            and spec_decode_metadata.tree_force_serial_q1_forward
+            and not getattr(spec_decode_metadata, "force_root_only_forward", False)
+            and spec_decode_common_attn_metadata is not None
+            and spec_decode_common_attn_metadata.num_actual_tokens > 1
+            and not self.broadcast_pp_output
+            and get_pp_group().is_last_rank
+            and not self.is_pooling_model
+            and not self.enable_prompt_embeds
+            and not self.supports_mm_inputs
+            and not self.uses_mrope
+            and self.uses_xdrope_dim == 0
+        )
+
+    def _slice_slot_mappings_for_token(
+        self,
+        slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,
+        token_idx: int,
+    ) -> dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None:
+        if slot_mappings is None:
+            return None
+        return self._slice_slot_mappings_for_indices(
+            slot_mappings,
+            torch.tensor([token_idx], dtype=torch.long),
+        )
+
+    def _slice_slot_mappings_for_indices(
+        self,
+        slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,
+        token_indices: torch.Tensor,
+    ) -> dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None:
+        if slot_mappings is None:
+            return None
+        if isinstance(slot_mappings, list):
+            return [
+                {
+                    layer_name: mapping[token_indices.to(mapping.device)]
+                    for layer_name, mapping in ubatch_slot_mappings.items()
+                }
+                for ubatch_slot_mappings in slot_mappings
+            ]
+        return {
+            layer_name: mapping[token_indices.to(mapping.device)]
+            for layer_name, mapping in slot_mappings.items()
+        }
+
+    def _build_serial_q1_common_attn_metadata_for_rows(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        req_indices: Sequence[int],
+        local_token_idx: int,
+        global_token_indices: Sequence[int],
+    ) -> CommonAttentionMetadata:
+        req_indices_cpu = torch.tensor(req_indices, dtype=torch.long)
+        req_indices_device = req_indices_cpu.to(common_attn_metadata.seq_lens.device)
+        global_indices_cpu = torch.tensor(global_token_indices, dtype=torch.long)
+        global_indices_device = global_indices_cpu.to(
+            common_attn_metadata.slot_mapping.device
+        )
+        active_count = len(req_indices)
+        query_lens_cpu = (
+            common_attn_metadata.query_start_loc_cpu[req_indices_cpu + 1]
+            - common_attn_metadata.query_start_loc_cpu[req_indices_cpu]
+        )
+        tokens_after_cpu = query_lens_cpu - local_token_idx - 1
+        tokens_after_device = tokens_after_cpu.to(common_attn_metadata.seq_lens.device)
+        seq_len = (
+            common_attn_metadata.seq_lens[req_indices_device]
+            - tokens_after_device
+        )
+        query_start_loc_cpu = torch.arange(
+            active_count + 1,
+            dtype=common_attn_metadata.query_start_loc_cpu.dtype,
+            device=common_attn_metadata.query_start_loc_cpu.device,
+        )
+        query_start_loc = query_start_loc_cpu.to(
+            device=common_attn_metadata.query_start_loc.device,
+            dtype=common_attn_metadata.query_start_loc.dtype,
+        )
+        seq_lens_cpu_upper_bound = (
+            common_attn_metadata.seq_lens_cpu_upper_bound[req_indices_cpu]
+            if common_attn_metadata.seq_lens_cpu_upper_bound is not None
+            else None
+        )
+        if seq_lens_cpu_upper_bound is not None:
+            seq_lens_cpu_upper_bound = seq_lens_cpu_upper_bound - tokens_after_cpu
+        seq_lens_cpu = (
+            common_attn_metadata._seq_lens_cpu[req_indices_cpu]
+            if common_attn_metadata._seq_lens_cpu is not None
+            else None
+        )
+        if seq_lens_cpu is not None:
+            seq_lens_cpu = seq_lens_cpu - tokens_after_cpu
+        num_computed_tokens_cpu = (
+            common_attn_metadata._num_computed_tokens_cpu[req_indices_cpu]
+            if common_attn_metadata._num_computed_tokens_cpu is not None
+            else None
+        )
+        if num_computed_tokens_cpu is not None:
+            num_computed_tokens_cpu = num_computed_tokens_cpu + local_token_idx
+        positions = (
+            common_attn_metadata.positions[global_indices_device]
+            if common_attn_metadata.positions is not None
+            else None
+        )
+        return common_attn_metadata.replace(
+            query_start_loc=query_start_loc,
+            query_start_loc_cpu=query_start_loc_cpu,
+            seq_lens=seq_len,
+            num_reqs=active_count,
+            num_actual_tokens=active_count,
+            max_query_len=1,
+            max_seq_len=int(seq_len.max().item()),
+            block_table_tensor=common_attn_metadata.block_table_tensor[
+                req_indices_device
+            ],
+            slot_mapping=common_attn_metadata.slot_mapping[
+                global_indices_device
+            ],
+            positions=positions,
+            is_prefilling=common_attn_metadata.is_prefilling[
+                req_indices_cpu.to(common_attn_metadata.is_prefilling.device)
+            ]
+            if common_attn_metadata.is_prefilling is not None
+            else None,
+            seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+            _seq_lens_cpu=seq_lens_cpu,
+            _num_computed_tokens_cpu=num_computed_tokens_cpu,
+            tree_target_mask=None,
+            tree_attn_bias=None,
+            tree_root_only=False,
+            _num_computed_tokens_cache=None,
+        )
+
+    def _build_serial_q1_common_attn_metadata(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        req_idx: int,
+        local_token_idx: int,
+        global_token_idx: int,
+    ) -> CommonAttentionMetadata:
+        return self._build_serial_q1_common_attn_metadata_for_rows(
+            common_attn_metadata,
+            [req_idx],
+            local_token_idx,
+            [global_token_idx],
+        )
+
+    def _build_serial_q1_attn_metadata_for_rows(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        slot_mappings_by_group: dict[int, torch.Tensor] | None,
+        req_indices: Sequence[int],
+        local_token_idx: int,
+        global_token_indices: Sequence[int],
+    ) -> PerLayerAttnMetadata:
+        serial_common = self._build_serial_q1_common_attn_metadata_for_rows(
+            common_attn_metadata,
+            req_indices,
+            local_token_idx,
+            global_token_indices,
+        )
+        serial_attn_metadata: PerLayerAttnMetadata = {}
+        cached_attn_metadata: dict[
+            tuple[KVCacheSpec, type[AttentionMetadataBuilder]], AttentionMetadata
+        ] = {}
+        kv_cache_groups = self.kv_cache_config.kv_cache_groups
+        req_indices_tensor = torch.tensor(
+            req_indices,
+            dtype=torch.long,
+            device=common_attn_metadata.block_table_tensor.device,
+        )
+        global_indices_tensor = torch.tensor(
+            global_token_indices,
+            dtype=torch.long,
+            device=common_attn_metadata.slot_mapping.device,
+        )
+        for kv_cache_gid, kv_cache_group in enumerate(kv_cache_groups):
+            cm = copy(serial_common)
+            if kv_cache_gid > 0 and slot_mappings_by_group is not None:
+                cm.block_table_tensor = self.input_batch.block_table[
+                    kv_cache_gid
+                ].get_device_tensor(common_attn_metadata.num_reqs)[
+                    req_indices_tensor
+                ]
+                cm.slot_mapping = slot_mappings_by_group[kv_cache_gid][
+                    global_indices_tensor.to(slot_mappings_by_group[kv_cache_gid].device)
+                ]
+            for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
+                attn_group = self.attn_groups[kv_cache_gid][attn_gid]
+                builder = attn_group.get_metadata_builder(0)
+                kv_cache_spec = kv_cache_group.kv_cache_spec
+                if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+                    kv_cache_spec = kv_cache_spec.kv_cache_specs[
+                        attn_group.layer_names[0]
+                    ]
+                cache_key = (kv_cache_spec, type(builder))
+                if (
+                    cache_key in cached_attn_metadata
+                    and builder.supports_update_block_table
+                ):
+                    attn_metadata_i = builder.update_block_table(
+                        cached_attn_metadata[cache_key],
+                        cm.block_table_tensor,
+                        cm.slot_mapping,
+                    )
+                else:
+                    attn_metadata_i = builder.build(
+                        common_prefix_len=0,
+                        common_attn_metadata=cm,
+                    )
+                    if builder.supports_update_block_table:
+                        cached_attn_metadata[cache_key] = attn_metadata_i
+                assert isinstance(serial_attn_metadata, dict)
+                for layer_name in attn_group.layer_names:
+                    serial_attn_metadata[layer_name] = attn_metadata_i
+        return serial_attn_metadata
+
+    def _build_serial_q1_attn_metadata(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        slot_mappings_by_group: dict[int, torch.Tensor] | None,
+        req_idx: int,
+        local_token_idx: int,
+        global_token_idx: int,
+    ) -> PerLayerAttnMetadata:
+        return self._build_serial_q1_attn_metadata_for_rows(
+            common_attn_metadata,
+            slot_mappings_by_group,
+            [req_idx],
+            local_token_idx,
+            [global_token_idx],
+        )
+
+    def _serial_q1_target_forward(
+        self,
+        *,
+        common_attn_metadata: CommonAttentionMetadata,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None,
+        model_kwargs: dict[str, Any],
+        num_tokens_across_dp: torch.Tensor | None,
+        batch_desc: BatchDescriptor,
+        slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,
+        slot_mappings_by_group: dict[int, torch.Tensor] | None,
+        has_encoder_input: bool,
+    ) -> Any:
+        hidden_rows: list[torch.Tensor | None] = [
+            None
+        ] * common_attn_metadata.num_actual_tokens
+        aux_rows: list[list[torch.Tensor | None]] | None = None
+        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+        query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+        max_query_len = int(
+            query_lens_cpu[: common_attn_metadata.num_reqs].max().item()
+        )
+        for local_token_idx in range(max_query_len):
+            req_indices: list[int] = []
+            global_token_indices: list[int] = []
+            for req_idx in range(common_attn_metadata.num_reqs):
+                query_start = int(query_start_loc_cpu[req_idx].item())
+                query_end = min(
+                    int(query_start_loc_cpu[req_idx + 1].item()),
+                    common_attn_metadata.num_actual_tokens,
+                )
+                if query_start + local_token_idx >= query_end:
+                    continue
+                req_indices.append(req_idx)
+                global_token_indices.append(query_start + local_token_idx)
+            if not global_token_indices:
+                continue
+
+            serial_attn_metadata = self._build_serial_q1_attn_metadata_for_rows(
+                common_attn_metadata,
+                slot_mappings_by_group,
+                req_indices,
+                local_token_idx,
+                global_token_indices,
+            )
+            token_indices = torch.tensor(
+                global_token_indices,
+                dtype=torch.long,
+                device=input_ids.device,
+            )
+            serial_slot_mappings = self._slice_slot_mappings_for_indices(
+                slot_mappings,
+                token_indices,
+            )
+            serial_batch_desc = replace(
+                batch_desc,
+                num_tokens=len(global_token_indices),
+                num_reqs=len(req_indices),
+                uniform=True,
+            )
+            with set_forward_context(
+                serial_attn_metadata,
+                self.vllm_config,
+                num_tokens=len(global_token_indices),
+                num_tokens_across_dp=None,
+                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                batch_descriptor=serial_batch_desc,
+                ubatch_slices=None,
+                slot_mapping=serial_slot_mappings,
+                skip_compiled=has_encoder_input,
+            ):
+                row_output = self._model_forward(
+                    input_ids=input_ids[token_indices],
+                    positions=positions[token_indices],
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=None,
+                    **model_kwargs,
+                )
+            if self.use_aux_hidden_state_outputs:
+                row_hidden, row_aux = row_output
+                for row_offset, global_token_idx in enumerate(global_token_indices):
+                    hidden_rows[global_token_idx] = row_hidden[
+                        row_offset : row_offset + 1
+                    ]
+                if aux_rows is None:
+                    aux_rows = [
+                        [None] * common_attn_metadata.num_actual_tokens
+                        for _ in range(len(row_aux))
+                    ]
+                for aux_idx, aux_hidden in enumerate(row_aux):
+                    for row_offset, global_token_idx in enumerate(global_token_indices):
+                        aux_rows[aux_idx][global_token_idx] = aux_hidden[
+                            row_offset : row_offset + 1
+                        ]
+            else:
+                for row_offset, global_token_idx in enumerate(global_token_indices):
+                    hidden_rows[global_token_idx] = row_output[
+                        row_offset : row_offset + 1
+                    ]
+        if any(row is None for row in hidden_rows):
+            raise RuntimeError("serial q1 target forward did not cover all rows")
+        hidden_states = torch.cat(cast(list[torch.Tensor], hidden_rows), dim=0)
+        if not self.use_aux_hidden_state_outputs:
+            return hidden_states
+        assert aux_rows is not None
+        aux_hidden_states: list[torch.Tensor] = []
+        for rows in aux_rows:
+            if any(row is None for row in rows):
+                raise RuntimeError(
+                    "serial q1 target forward did not cover all aux rows"
+                )
+            aux_hidden_states.append(torch.cat(cast(list[torch.Tensor], rows), dim=0))
+        return hidden_states, aux_hidden_states
 
     @torch.inference_mode
     def sample_tokens(

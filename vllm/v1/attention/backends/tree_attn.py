@@ -99,6 +99,7 @@ class TreeAttentionMetadata:
     tree_target_mask: torch.Tensor | None = None
     runtime_tree_attn_bias: torch.Tensor | None = None
     tree_root_only: bool = False
+    expand_linear_chain_decode_as_q1: bool = False
 
     # Cached Prefill/decode metadata.
     _cached_prefill_metadata: "TreeAttentionMetadata | None" = None
@@ -142,6 +143,43 @@ class TreeAttentionMetadata:
         q_start_loc = self.query_start_loc[: self.num_decodes + 1]
         q_seqlens = torch.diff(q_start_loc)
         kv_seqlens = self.seq_lens[: self.num_decodes]
+        if self.expand_linear_chain_decode_as_q1 and int(q_seqlens.max().item()) > 1:
+            token_offsets = torch.arange(
+                self.num_decode_tokens,
+                dtype=kv_seqlens.dtype,
+                device=kv_seqlens.device,
+            )
+            row_starts = torch.repeat_interleave(
+                q_start_loc[:-1],
+                q_seqlens.to(torch.long),
+            )
+            local_offsets = token_offsets - row_starts.to(kv_seqlens.dtype)
+            context_lens = kv_seqlens - q_seqlens.to(kv_seqlens.dtype)
+            expanded_seq_lens = torch.repeat_interleave(
+                context_lens,
+                q_seqlens.to(torch.long),
+            ) + local_offsets + 1
+            expanded_query_start_loc = torch.arange(
+                self.num_decode_tokens + 1,
+                dtype=q_start_loc.dtype,
+                device=q_start_loc.device,
+            )
+            self._cached_decode_metadata = TreeAttentionMetadata(
+                num_actual_tokens=self.num_decode_tokens,
+                max_query_len=1,
+                query_start_loc=expanded_query_start_loc,
+                max_seq_len=int(expanded_seq_lens.max().item()),
+                seq_lens=expanded_seq_lens,
+                block_table=torch.repeat_interleave(
+                    self.block_table[: self.num_decodes],
+                    q_seqlens.to(torch.long),
+                    dim=0,
+                ),
+                slot_mapping=self.slot_mapping[: self.num_decode_tokens],
+                num_decode_tokens=self.num_decode_tokens,
+                num_decodes=self.num_decode_tokens,
+            )
+            return self._cached_decode_metadata
         # Construct & cache decode-phase attention metadata structure
         self._cached_decode_metadata = TreeAttentionMetadata(
             num_actual_tokens=self.num_decode_tokens,
@@ -221,12 +259,12 @@ class TreeAttentionMetadataBuilder(AttentionMetadataBuilder[TreeAttentionMetadat
             device=device,
         )
 
-        enable_linear_chain_verify = (
+        self.enable_linear_chain_verify = (
             os.environ.get("VLLM_TREE_ATTN_ENABLE_LINEAR_CHAIN_VERIFY") == "1"
         )
         self.decode_threshold = (
             1
-            if self.is_linear_chain and not enable_linear_chain_verify
+            if self.is_linear_chain and not self.enable_linear_chain_verify
             else self.tree_attn_bias.shape[0]
         )
         self.reorder_batch_threshold = self.decode_threshold
@@ -271,6 +309,9 @@ class TreeAttentionMetadataBuilder(AttentionMetadataBuilder[TreeAttentionMetadat
             tree_target_mask=tree_target_mask,
             runtime_tree_attn_bias=runtime_tree_attn_bias,
             tree_root_only=common_attn_metadata.tree_root_only,
+            expand_linear_chain_decode_as_q1=(
+                self.is_linear_chain and self.enable_linear_chain_verify
+            ),
         )
 
     def build_for_drafting(

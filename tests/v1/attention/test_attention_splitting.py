@@ -59,6 +59,42 @@ def test_tree_attn_builder_splits_linear_chain_as_extend():
     assert not builder.use_tree_decode_bias
 
 
+def test_tree_attn_linear_chain_diagnostic_expands_verify_as_q1(monkeypatch):
+    monkeypatch.setenv("VLLM_TREE_ATTN_ENABLE_LINEAR_CHAIN_VERIFY", "1")
+    builder = create_tree_attn_builder(
+        speculative_token_tree="[(0,), (0, 0), (0, 0, 0), (0, 0, 0, 0)]"
+    )
+    common_metadata = create_common_attn_metadata(
+        BatchSpec(seq_lens=[20, 28], query_lens=[5, 5]),
+        block_size=16,
+        device=torch.device("cpu"),
+        arange_block_indices=True,
+    )
+
+    metadata = builder.build(0, common_metadata)
+    decode_metadata = metadata.decode_metadata
+
+    assert builder.decode_threshold == 5
+    assert decode_metadata is not None
+    assert decode_metadata.max_query_len == 1
+    assert decode_metadata.num_decodes == 10
+    assert decode_metadata.num_decode_tokens == 10
+    assert decode_metadata.tree_attn_bias is None
+    assert torch.equal(
+        decode_metadata.query_start_loc,
+        torch.arange(11, dtype=torch.int32),
+    )
+    assert torch.equal(
+        decode_metadata.seq_lens,
+        torch.tensor([16, 17, 18, 19, 20, 24, 25, 26, 27, 28]),
+    )
+    assert torch.equal(
+        decode_metadata.block_table,
+        common_metadata.block_table_tensor.repeat_interleave(5, dim=0),
+    )
+    assert torch.equal(decode_metadata.slot_mapping, common_metadata.slot_mapping)
+
+
 def test_tree_attn_builder_keeps_branching_tree_decode_bias():
     builder = create_tree_attn_builder(
         speculative_token_tree="[(0,), (1,), (0, 0), (0, 1)]"

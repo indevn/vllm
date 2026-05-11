@@ -62,6 +62,17 @@ class SpecDecodeMetadata:
     # logits shaped like a non-speculative decode step while scheduler metadata
     # still carries the original draft subtree for rollback/accounting.
     force_root_only_forward: bool = False
+    # TREE_ATTN linear-chain diagnostic compatibility knob. It makes the final
+    # target lm_head run one row at a time so the logits GEMM shape matches
+    # target-only greedy decode.
+    tree_force_single_row_logits: bool = False
+    # TREE_ATTN linear-chain diagnostic compatibility knob. It makes the target
+    # model run the verify rows one token at a time so all target-model GEMMs
+    # and attention kernels match target-only greedy decode shapes.
+    tree_force_serial_q1_forward: bool = False
+    # Trace-only marker set by the runner when the serial q1 target forward path
+    # actually executes for this batch.
+    tree_serial_q1_forward_used: bool = False
 
     def __post_init__(self):
         self.max_spec_len = max(self.num_draft_tokens)
