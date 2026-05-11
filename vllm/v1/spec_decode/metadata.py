@@ -34,6 +34,13 @@ class SpecDecodeMetadata:
     tree_retrieve_next_sibling: torch.Tensor | None = None
     # [batch_size, max_tree_nodes]
     tree_target_mask: torch.Tensor | None = None
+    # Optional per-request target attention bias for packed dynamic tree rows.
+    # [batch_size, max_tree_nodes, max_tree_nodes]
+    tree_attn_bias: torch.Tensor | None = None
+    # Root-inclusive logical position offsets for tree verify rows. Physical KV
+    # slots remain in scheduled order; these offsets drive RoPE/position inputs.
+    # [batch_size, max_tree_nodes]
+    tree_position_offsets: torch.Tensor | None = None
     # Number of output slots to verify: accepted draft path plus final target
     # recovery/bonus token.  This is usually tree depth + 1.
     tree_num_spec_steps: int | None = None
@@ -47,6 +54,14 @@ class SpecDecodeMetadata:
     # Optional debug trace emitted by the tree verifier when
     # VLLM_TREE_SPEC_TRACE_PATH is set.
     tree_accept_trace: list[dict] | None = None
+    # Correctness fallback for backends whose multi-token target verification
+    # KV is not yet greedy-equivalent to step-by-step target decode.
+    force_reject_all: bool = False
+    # When force_reject_all is used for tree metadata, the target runner may
+    # execute only the root row per request. In that mode the verifier consumes
+    # logits shaped like a non-speculative decode step while scheduler metadata
+    # still carries the original draft subtree for rollback/accounting.
+    force_root_only_forward: bool = False
 
     def __post_init__(self):
         self.max_spec_len = max(self.num_draft_tokens)

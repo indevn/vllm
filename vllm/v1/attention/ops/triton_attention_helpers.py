@@ -345,13 +345,14 @@ def load_qq_bias_tile(
     qq_bias_row_ptrs,
     seq_offset,
     context_len,
-    qq_bias_stride_0,
+    qq_bias_stride_1: tl.constexpr,
+    qq_bias_width: tl.constexpr,
 ):
     """Load the qq-bias slice for keys that correspond to query rows."""
     key_rel_pos = seq_offset - context_len
-    is_query_key = key_rel_pos >= 0 and key_rel_pos < qq_bias_stride_0
+    is_query_key = (key_rel_pos >= 0) & (key_rel_pos < qq_bias_width)
     return tl.load(
-        qq_bias_row_ptrs + key_rel_pos[None, :],
+        qq_bias_row_ptrs + key_rel_pos[None, :] * qq_bias_stride_1,
         mask=is_query_key[None, :],
         other=0.0,
     )

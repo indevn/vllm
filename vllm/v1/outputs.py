@@ -230,7 +230,9 @@ class DraftTokenIds:
     # Optional request-local dynamic/tree verification metadata.
     # The scheduler keeps this with the draft tokens until the next target
     # verification step.
-    tree_metadata: dict[str, dict[str, list[int] | int | bool]] | None = None
+    tree_metadata: (
+        dict[str, dict[str, list[int] | list[list[int]] | int | bool]] | None
+    ) = None
 
 
 def make_empty_encoder_model_runner_output(

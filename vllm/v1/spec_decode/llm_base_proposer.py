@@ -311,8 +311,9 @@ class SpecDecodeBaseProposer:
             self.speculative_config.enable_dynamic_tree_target_mask
         )
         self._dynamic_tree_last_metadata: (
-            list[dict[str, list[int] | int | bool] | None] | None
+            list[dict[str, list[int] | list[list[int]] | int | bool] | None] | None
         ) = None
+        self._dynamic_tree_last_draft_token_ids: list[list[int]] | None = None
 
     def _raise_if_padded_drafter_batch_disabled(self):
         if self.speculative_config.disable_padded_drafter_batch:
@@ -1231,6 +1232,23 @@ class SpecDecodeBaseProposer:
                 all_scores_by_level=all_scores_by_level,
                 selected_child_offsets_by_level=selected_child_offsets_by_level,
             )
+            draft_tokens_cpu = torch.cat(draft_token_ids_list, dim=1).detach().cpu()
+            self._dynamic_tree_last_draft_token_ids = []
+            for req_idx, tree_metadata in enumerate(self._dynamic_tree_last_metadata):
+                if tree_metadata is None or not tree_metadata.get("tree_valid", False):
+                    self._dynamic_tree_last_draft_token_ids.append([])
+                    continue
+                selected = tree_metadata.get("selected_static_nodes", [])
+                if not isinstance(selected, list):
+                    self._dynamic_tree_last_draft_token_ids.append([])
+                    continue
+                self._dynamic_tree_last_draft_token_ids.append(
+                    [
+                        int(draft_tokens_cpu[req_idx, static_idx - 1].item())
+                        for static_idx in selected
+                        if 0 < int(static_idx) <= draft_tokens_cpu.shape[1]
+                    ]
+                )
         return draft_token_ids_list
 
     def _build_runtime_dynamic_tree_metadata(
@@ -1240,7 +1258,7 @@ class SpecDecodeBaseProposer:
         all_tokens_by_level: list[torch.Tensor],
         all_scores_by_level: list[torch.Tensor],
         selected_child_offsets_by_level: list[torch.Tensor],
-    ) -> list[dict[str, list[int] | int | bool]]:
+    ) -> list[dict[str, list[int] | list[list[int]] | int | bool]]:
         """Select a request-local DDT verify subtree from live draft scores.
 
         vLLM's current TREE_ATTN backend still computes the full configured
@@ -1257,8 +1275,9 @@ class SpecDecodeBaseProposer:
         if max_selected <= 0:
             raise ValueError("dynamic_draft_tree_max_draft_tokens must be positive")
 
-        metadata_by_req: list[dict[str, list[int] | int | bool]] = []
-        full_num_nodes = len(self.tree_choices) + 1
+        metadata_by_req: list[
+            dict[str, list[int] | list[list[int]] | int | bool]
+        ] = []
         tree_depth = len(self.cu_drafts_per_level)
 
         for req_idx in range(batch_size):
@@ -1335,24 +1354,38 @@ class SpecDecodeBaseProposer:
             if not selected_static_nodes:
                 metadata_by_req.append(
                     {
-                        "retrieve_index": list(range(full_num_nodes)),
-                        "retrieve_next_token": [-1] * full_num_nodes,
-                        "retrieve_next_sibling": [-1] * full_num_nodes,
-                        "target_mask": [0] * full_num_nodes,
+                        "retrieve_index": [0],
+                        "retrieve_next_token": [-1],
+                        "retrieve_next_sibling": [-1],
+                        "target_mask": [1],
+                        "position_offsets": [0],
+                        "tree_attn_mask": [[1]],
+                        "selected_static_nodes": [],
+                        "target_mask_enabled": self._enable_dynamic_tree_target_mask,
                         "num_spec_steps": 1,
                         "tree_valid": False,
                     }
                 )
                 continue
-            retrieve_index = list(range(full_num_nodes))
-            retrieve_next_token = [-1] * full_num_nodes
-            retrieve_next_sibling = [-1] * full_num_nodes
+            packed_static_nodes = selected_static_nodes
+            static_to_packed = {
+                static_idx: packed_idx + 1
+                for packed_idx, static_idx in enumerate(packed_static_nodes)
+            }
+            num_nodes = len(packed_static_nodes) + 1
+            retrieve_index = list(range(num_nodes))
+            retrieve_next_token = [-1] * num_nodes
+            retrieve_next_sibling = [-1] * num_nodes
             selected_set = set(selected_static_nodes)
             children_by_parent: dict[int, list[int]] = {}
             for static_idx in selected_static_nodes:
                 parent_idx = parent_for_static.get(static_idx, 0)
                 if parent_idx == 0 or parent_idx in selected_set:
-                    children_by_parent.setdefault(parent_idx, []).append(static_idx)
+                    parent_packed_idx = static_to_packed.get(parent_idx, 0)
+                    child_packed_idx = static_to_packed[static_idx]
+                    children_by_parent.setdefault(parent_packed_idx, []).append(
+                        child_packed_idx
+                    )
             for parent_idx, child_indices in children_by_parent.items():
                 first_child = -1
                 for child_idx in sorted(child_indices, reverse=True):
@@ -1367,15 +1400,34 @@ class SpecDecodeBaseProposer:
                 ),
                 default=0,
             )
-            target_mask = [0] * full_num_nodes
-            for static_idx in selected_static_nodes:
-                target_mask[static_idx] = 1
+            target_mask = [1] * num_nodes
+            position_offsets = [0] + [
+                len(self.tree_choices[static_idx - 1])
+                for static_idx in packed_static_nodes
+            ]
+            tree_attn_mask = [[0] * num_nodes for _ in range(num_nodes)]
+            for local_idx in range(num_nodes):
+                tree_attn_mask[local_idx][0] = 1
+                tree_attn_mask[local_idx][local_idx] = 1
+            for static_idx in packed_static_nodes:
+                local_idx = static_to_packed[static_idx]
+                parent_idx = parent_for_static.get(static_idx, 0)
+                while parent_idx > 0:
+                    parent_local_idx = static_to_packed.get(parent_idx)
+                    if parent_local_idx is None:
+                        break
+                    tree_attn_mask[local_idx][parent_local_idx] = 1
+                    parent_idx = parent_for_static.get(parent_idx, 0)
             metadata_by_req.append(
                 {
                     "retrieve_index": retrieve_index,
                     "retrieve_next_token": retrieve_next_token,
                     "retrieve_next_sibling": retrieve_next_sibling,
                     "target_mask": target_mask,
+                    "position_offsets": position_offsets,
+                    "tree_attn_mask": tree_attn_mask,
+                    "selected_static_nodes": packed_static_nodes,
+                    "target_mask_enabled": self._enable_dynamic_tree_target_mask,
                     "num_spec_steps": max_depth + 1,
                     "tree_valid": True,
                 }

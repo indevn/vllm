@@ -211,6 +211,37 @@ class RejectionSampler(nn.Module):
             metadata.cu_num_draft_tokens,
             sampling_metadata,
         )
+        if (
+            metadata.force_reject_all
+            and sampling_metadata.all_greedy
+            and not self.synthetic_mode
+        ):
+            num_draft_tokens = torch.tensor(
+                metadata.num_draft_tokens,
+                dtype=torch.int64,
+                device=logits.device,
+            )
+            has_draft = num_draft_tokens > 0
+            bonus_token_ids_flat = bonus_token_ids.reshape(-1).to(torch.int32)
+            output_token_ids = torch.full(
+                (len(metadata.num_draft_tokens), metadata.max_spec_len + 1),
+                PLACEHOLDER_TOKEN_ID,
+                dtype=torch.int32,
+                device=logits.device,
+            )
+            output_token_ids[:, 0] = bonus_token_ids_flat
+            if bool(has_draft.any().item()):
+                target_start_indices = (
+                    metadata.cu_num_draft_tokens.to(torch.int64) - num_draft_tokens
+                )
+                target_token_ids = target_logits[
+                    target_start_indices[has_draft]
+                ].argmax(dim=-1)
+                output_token_ids[has_draft, 0] = target_token_ids.to(torch.int32)
+            return SamplerOutput(
+                sampled_token_ids=output_token_ids,
+                logprobs_tensors=None,
+            )
 
         output_token_ids = rejection_sample(
             metadata.draft_token_ids,
@@ -620,9 +651,50 @@ def tree_rejection_greedy_sample(
             f"{tree_num_spec_steps} for max_spec_len={metadata.max_spec_len}"
         )
 
-    tree_logits = logits[tree_logits_indices.to(torch.long)].to(torch.float32)
+    if metadata.force_reject_all and metadata.force_root_only_forward:
+        if logits.shape[0] != batch_size:
+            raise ValueError(
+                "root-only tree verification expects one target logit row per "
+                f"request, got {logits.shape[0]} rows for batch_size={batch_size}"
+            )
+        tree_logits = logits.to(torch.float32).new_zeros(
+            (batch_size, max_tree_nodes, logits.shape[-1])
+        )
+        tree_logits[:, 0, :] = logits.to(torch.float32)
+    else:
+        tree_logits = logits[tree_logits_indices.to(torch.long)].to(torch.float32)
     target_predict = tree_logits.argmax(dim=-1)
     candidates = _padded_tree_candidates(metadata.draft_token_ids, metadata)
+    if metadata.force_reject_all:
+        output_token_ids = torch.full(
+            (batch_size, metadata.max_spec_len + 1),
+            PLACEHOLDER_TOKEN_ID,
+            dtype=torch.int32,
+            device=logits.device,
+        )
+        accept_indices = torch.full_like(output_token_ids, PLACEHOLDER_TOKEN_ID)
+        output_token_ids[:, 0] = target_predict[:, 0].to(torch.int32)
+        accept_indices[:, 0] = 0
+        if os.environ.get("VLLM_TREE_SPEC_TRACE_PATH"):
+            root_accept_index = torch.zeros(
+                (batch_size, tree_num_spec_steps),
+                dtype=torch.int64,
+                device=logits.device,
+            )
+            root_accept_token_num = torch.zeros(
+                batch_size, dtype=torch.int64, device=logits.device
+            )
+            metadata.tree_accept_trace = _build_tree_accept_trace(
+                metadata,
+                candidates,
+                target_predict,
+                root_accept_index,
+                root_accept_token_num,
+                tree_valid,
+                tree_target_mask,
+            )
+        return output_token_ids, accept_indices
+
     verify = verify_dynamic_tree_greedy(
         candidates,
         retrieve_index,

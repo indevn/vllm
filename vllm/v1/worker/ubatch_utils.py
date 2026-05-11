@@ -193,6 +193,16 @@ def _make_metadata_with_slice(
         if attn_metadata._num_computed_tokens_cpu is not None
         else None
     )
+    tree_target_mask = (
+        attn_metadata.tree_target_mask[request_slice]
+        if attn_metadata.tree_target_mask is not None
+        else None
+    )
+    tree_attn_bias = (
+        attn_metadata.tree_attn_bias[request_slice]
+        if attn_metadata.tree_attn_bias is not None
+        else None
+    )
 
     if splits_last_request:
         # NOTE: We use start_locs (the original query_start_loc_cpu) to calculate
@@ -243,6 +253,9 @@ def _make_metadata_with_slice(
         seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
         _seq_lens_cpu=seq_lens_cpu,
         _num_computed_tokens_cpu=num_computed_tokens_cpu,
+        tree_target_mask=tree_target_mask,
+        tree_attn_bias=tree_attn_bias,
+        tree_root_only=attn_metadata.tree_root_only,
     )
 
 

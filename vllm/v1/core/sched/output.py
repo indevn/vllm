@@ -230,7 +230,7 @@ class SchedulerOutput:
     num_invalid_spec_tokens: dict[str, int] | None = None
     # req_id -> tree metadata for scheduled speculative tokens.
     scheduled_spec_decode_tree_metadata: (
-        dict[str, dict[str, list[int] | int | bool]] | None
+        dict[str, dict[str, list[int] | list[list[int]] | int | bool]] | None
     ) = None
 
     # KV Cache Connector metadata.

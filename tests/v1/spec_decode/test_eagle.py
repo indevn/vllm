@@ -52,6 +52,7 @@ def _create_proposer(
     speculative_token_tree: list[tuple[int, ...]] | None = None,
     parallel_drafting: bool = False,
     enable_dynamic_draft_tree: bool = False,
+    enable_dynamic_tree_target_mask: bool = False,
     dynamic_draft_tree_max_draft_tokens: int | None = None,
 ) -> EagleProposer:
     # Method-dependent setup
@@ -92,6 +93,7 @@ def _create_proposer(
         parallel_drafting=parallel_drafting,
         attention_backend=attention_backend,
         enable_dynamic_draft_tree=enable_dynamic_draft_tree,
+        enable_dynamic_tree_target_mask=enable_dynamic_tree_target_mask,
         dynamic_draft_tree_max_draft_tokens=dynamic_draft_tree_max_draft_tokens,
     )
     if parallel_drafting:
@@ -1269,6 +1271,42 @@ def test_propose_tree_runtime_dynamic_tree_selects_request_local_subtree():
     assert metadata[0]["retrieve_next_token"][1] != -1
     assert metadata[0]["retrieve_next_token"][2] == -1
     assert metadata[1] != metadata[0]
+    assert metadata[0]["target_mask_enabled"] is False
+    assert metadata[0]["selected_static_nodes"]
+    assert metadata[0]["tree_attn_mask"][0][0] == 1
+    assert proposer._dynamic_tree_last_draft_token_ids is not None
+    assert len(proposer._dynamic_tree_last_draft_token_ids[0]) == len(
+        metadata[0]["selected_static_nodes"]
+    )
+
+
+def test_propose_tree_runtime_dynamic_tree_marks_target_mask_enabled():
+    proposer = _create_proposer(
+        "eagle",
+        4,
+        attention_backend="TREE_ATTN",
+        speculative_token_tree=[(0,), (1,), (0, 0), (0, 1)],
+        enable_dynamic_draft_tree=True,
+        enable_dynamic_tree_target_mask=True,
+    )
+
+    metadata = proposer._build_runtime_dynamic_tree_metadata(
+        batch_size=1,
+        all_tokens_by_level=[
+            torch.tensor([[10, 20]], device=DEVICE_TYPE),
+            torch.tensor([[11, 12]], device=DEVICE_TYPE),
+        ],
+        all_scores_by_level=[
+            torch.tensor([[0.9, 0.1]], device=DEVICE_TYPE),
+            torch.tensor([[0.8, 0.7]], device=DEVICE_TYPE),
+        ],
+        selected_child_offsets_by_level=[
+            torch.tensor([[0, 1]], device=DEVICE_TYPE),
+            torch.tensor([[0, 0]], device=DEVICE_TYPE),
+        ],
+    )
+
+    assert metadata[0]["target_mask_enabled"] is True
 
 
 def test_set_inputs_first_pass_dflash():

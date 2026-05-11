@@ -20,6 +20,9 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
+from vllm.v1.attention.backends.fa_utils import (
+    flash_attn_varlen_func,
+)
 from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
@@ -91,6 +94,10 @@ class TreeAttentionMetadata:
     num_decodes: int = 0
 
     tree_attn_bias: torch.Tensor | None = None
+    use_tree_decode_bias: bool = False
+    tree_target_mask: torch.Tensor | None = None
+    runtime_tree_attn_bias: torch.Tensor | None = None
+    tree_root_only: bool = False
 
     # Cached Prefill/decode metadata.
     _cached_prefill_metadata: "TreeAttentionMetadata | None" = None
@@ -143,9 +150,45 @@ class TreeAttentionMetadata:
             seq_lens=kv_seqlens,
             block_table=self.block_table[: self.num_decodes],
             slot_mapping=self.slot_mapping[: self.num_decode_tokens],
-            tree_attn_bias=self.tree_attn_bias,
+            tree_attn_bias=self._decode_tree_attn_bias(q_seqlens),
+            use_tree_decode_bias=self.use_tree_decode_bias,
+            tree_target_mask=self.tree_target_mask[: self.num_decodes]
+            if self.tree_target_mask is not None
+            else None,
+            runtime_tree_attn_bias=self.runtime_tree_attn_bias[: self.num_decodes]
+            if self.runtime_tree_attn_bias is not None
+            else None,
+            tree_root_only=self.tree_root_only,
         )
         return self._cached_decode_metadata
+
+    def _decode_tree_attn_bias(self, q_seqlens: torch.Tensor) -> torch.Tensor | None:
+        if self.tree_root_only:
+            return None
+        if not self.use_tree_decode_bias or self.tree_attn_bias is None:
+            return None
+        if self.runtime_tree_attn_bias is not None:
+            tree_width = self.runtime_tree_attn_bias.shape[-1]
+            if self.runtime_tree_attn_bias.shape[-2:] != (tree_width, tree_width):
+                raise ValueError(
+                    "runtime tree attention bias must have shape "
+                    f"(*, {tree_width}, {tree_width}), got "
+                    f"{self.runtime_tree_attn_bias.shape}"
+                )
+            if int(q_seqlens.max().item()) != tree_width:
+                return None
+            if self.tree_target_mask is None:
+                return self.runtime_tree_attn_bias
+            return _apply_tree_target_mask(
+                self.runtime_tree_attn_bias,
+                self.tree_target_mask,
+            )
+        tree_width = self.tree_attn_bias.shape[0]
+        if int(q_seqlens.max().item()) != tree_width:
+            return None
+        if self.tree_target_mask is None:
+            return self.tree_attn_bias
+        return _apply_tree_target_mask(self.tree_attn_bias, self.tree_target_mask)
 
 
 class TreeAttentionMetadataBuilder(AttentionMetadataBuilder[TreeAttentionMetadata]):
@@ -167,6 +210,7 @@ class TreeAttentionMetadataBuilder(AttentionMetadataBuilder[TreeAttentionMetadat
         tree_choices: list[tuple[int, ...]] = (
             ast.literal_eval(spec_token_tree) if spec_token_tree is not None else [(0,)]
         )
+        self.is_linear_chain = _is_linear_chain(tree_choices)
         # Construct the tree attention bias.
         depth_counts = _get_depth_counts(tree_choices)
         self.tree_attn_bias = _prepare_tree_attn_bias(
@@ -176,7 +220,11 @@ class TreeAttentionMetadataBuilder(AttentionMetadataBuilder[TreeAttentionMetadat
             device=device,
         )
 
-        self.reorder_batch_threshold = self.tree_attn_bias.shape[0]
+        self.decode_threshold = (
+            1 if self.is_linear_chain else self.tree_attn_bias.shape[0]
+        )
+        self.reorder_batch_threshold = self.decode_threshold
+        self.use_tree_decode_bias = not self.is_linear_chain
 
     def build(
         self,
@@ -184,10 +232,9 @@ class TreeAttentionMetadataBuilder(AttentionMetadataBuilder[TreeAttentionMetadat
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> TreeAttentionMetadata:
-        decode_threshold = self.tree_attn_bias.shape[0]
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
             split_decodes_and_prefills(
-                common_attn_metadata, decode_threshold=decode_threshold
+                common_attn_metadata, decode_threshold=self.decode_threshold
             )
         )
 
@@ -198,6 +245,8 @@ class TreeAttentionMetadataBuilder(AttentionMetadataBuilder[TreeAttentionMetadat
         max_seq_len = common_attn_metadata.max_seq_len
         block_table = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
+        tree_target_mask = common_attn_metadata.tree_target_mask
+        runtime_tree_attn_bias = common_attn_metadata.tree_attn_bias
 
         return TreeAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
@@ -212,6 +261,10 @@ class TreeAttentionMetadataBuilder(AttentionMetadataBuilder[TreeAttentionMetadat
             block_table=block_table,
             slot_mapping=slot_mapping,
             tree_attn_bias=self.tree_attn_bias,
+            use_tree_decode_bias=self.use_tree_decode_bias,
+            tree_target_mask=tree_target_mask,
+            runtime_tree_attn_bias=runtime_tree_attn_bias,
+            tree_root_only=common_attn_metadata.tree_root_only,
         )
 
     def build_for_drafting(
@@ -250,6 +303,14 @@ def _get_depth_counts(sorted_tree_choices: list[tuple[int, ...]]) -> list[int]:
         depth_counts[depth - 1] += 1
         prev_depth = depth
     return depth_counts
+
+
+def _is_linear_chain(sorted_tree_choices: list[tuple[int, ...]]) -> bool:
+    if not sorted_tree_choices:
+        return True
+    return sorted_tree_choices == [
+        (0,) * depth for depth in range(1, len(sorted_tree_choices) + 1)
+    ]
 
 
 def _prepare_tree_attn_bias(
@@ -291,6 +352,40 @@ def _prepare_tree_attn_bias(
     return tree_attn_mask
 
 
+def _apply_tree_target_mask(
+    tree_attn_bias: torch.Tensor,
+    tree_target_mask: torch.Tensor,
+) -> torch.Tensor:
+    if tree_target_mask.ndim != 2:
+        raise ValueError(
+            f"tree_target_mask must be 2D, got {tree_target_mask.shape}"
+        )
+    if tree_target_mask.shape[-1] != tree_attn_bias.shape[-1]:
+        raise ValueError(
+            "tree_target_mask width must match tree attention bias width, got "
+            f"{tree_target_mask.shape[-1]} and {tree_attn_bias.shape[-1]}"
+        )
+    if tree_attn_bias.ndim == 2:
+        masked_bias = tree_attn_bias.unsqueeze(0).expand(
+            tree_target_mask.shape[0], -1, -1
+        ).clone()
+    elif tree_attn_bias.ndim == 3:
+        if tree_attn_bias.shape[0] != tree_target_mask.shape[0]:
+            raise ValueError(
+                "per-request tree attention bias batch size must match "
+                "tree_target_mask, got "
+                f"{tree_attn_bias.shape[0]} and {tree_target_mask.shape[0]}"
+            )
+        masked_bias = tree_attn_bias.clone()
+    else:
+        raise ValueError(f"tree_attn_bias must be 2D or 3D, got {tree_attn_bias.shape}")
+    disabled = tree_target_mask.to(torch.bool).logical_not()
+    # Root stays visible even if a malformed runtime mask clears it.
+    disabled[:, 0] = False
+    masked_bias.masked_fill_(disabled[:, None, :], -torch.inf)
+    return masked_bias.contiguous()
+
+
 def build_static_tree_retrieve_metadata(
     sorted_tree_choices: list[tuple[int, ...]],
 ) -> dict[str, list[int] | int | bool]:
@@ -323,8 +418,11 @@ def build_static_tree_retrieve_metadata(
         "retrieve_next_token": retrieve_next_token,
         "retrieve_next_sibling": retrieve_next_sibling,
         "target_mask": [1] * num_nodes,
+        "position_offsets": [0]
+        + [len(choice) for choice in sorted_tree_choices],
         "num_spec_steps": max_depth + 1,
         "tree_valid": True,
+        "is_linear_chain": _is_linear_chain(sorted_tree_choices),
     }
 
 
@@ -431,31 +529,43 @@ class TreeAttentionImpl(AttentionImpl):
 
         key_cache, value_cache = kv_cache.unbind(0)
 
-        num_actual_tokens = attn_metadata.num_actual_tokens
         num_decode_tokens = attn_metadata.num_decode_tokens
-        descale_shape = (attn_metadata.query_start_loc.shape[0] - 1, key.shape[1])
-        if prefill_meta := attn_metadata.prefill_metadata:
-            unified_attention(
-                q=query[num_decode_tokens:num_actual_tokens],
+
+        def run_flash_attn(
+            metadata: TreeAttentionMetadata,
+            start_idx: int,
+        ) -> None:
+            end_idx = start_idx + metadata.num_actual_tokens
+            descale_shape = (metadata.query_start_loc.shape[0] - 1, key.shape[1])
+            flash_attn_varlen_func(
+                q=query[start_idx:end_idx],
                 k=key_cache,
                 v=value_cache,
-                out=output[num_decode_tokens:num_actual_tokens],
-                cu_seqlens_q=prefill_meta.query_start_loc,
-                max_seqlen_q=prefill_meta.max_query_len,
-                seqused_k=prefill_meta.seq_lens,
-                max_seqlen_k=prefill_meta.max_seq_len,
+                out=output[start_idx:end_idx],
+                cu_seqlens_q=metadata.query_start_loc,
+                max_seqlen_q=metadata.max_query_len,
+                seqused_k=metadata.seq_lens,
+                max_seqlen_k=metadata.max_seq_len,
                 softmax_scale=self.scale,
                 causal=True,
                 alibi_slopes=self.alibi_slopes,
                 window_size=self.sliding_window,
-                block_table=prefill_meta.block_table,
+                block_table=metadata.block_table,
                 softcap=self.logits_soft_cap,
                 q_descale=None,  # Not supported
                 k_descale=layer._k_scale.expand(descale_shape),
                 v_descale=layer._v_scale.expand(descale_shape),
             )
 
+        if prefill_meta := attn_metadata.prefill_metadata:
+            run_flash_attn(prefill_meta, num_decode_tokens)
+
         if decode_meta := attn_metadata.decode_metadata:
+            if decode_meta.tree_attn_bias is None:
+                run_flash_attn(decode_meta, 0)
+                return output
+
+            descale_shape = (decode_meta.query_start_loc.shape[0] - 1, key.shape[1])
             unified_attention(
                 q=query[:num_decode_tokens],
                 k=key_cache,

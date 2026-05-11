@@ -16,6 +16,7 @@ import json
 import time
 import urllib.request
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +41,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tokens", type=int, default=8)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--timeout", type=float, default=180.0)
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="Number of prompts to send concurrently per case.",
+    )
     parser.add_argument("--trace", action="append", default=[])
     parser.add_argument("--output", required=True)
     return parser.parse_args()
@@ -120,6 +127,52 @@ def request_completion(
     }
 
 
+def request_case_outputs(
+    *,
+    prompts: list[dict[str, str]],
+    base_url: str,
+    model: str,
+    max_tokens: int,
+    temperature: float,
+    timeout: float,
+    concurrency: int,
+) -> list[dict[str, Any]]:
+    if concurrency <= 1:
+        return [
+            {
+                "id": prompt["id"],
+                **request_completion(
+                    base_url=base_url,
+                    model=model,
+                    prompt=prompt["prompt"],
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    timeout=timeout,
+                ),
+            }
+            for prompt in prompts
+        ]
+
+    max_workers = min(concurrency, len(prompts))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(
+                request_completion,
+                base_url=base_url,
+                model=model,
+                prompt=prompt["prompt"],
+                max_tokens=max_tokens,
+                temperature=temperature,
+                timeout=timeout,
+            )
+            for prompt in prompts
+        ]
+        outputs = []
+        for prompt, future in zip(prompts, futures):
+            outputs.append({"id": prompt["id"], **future.result()})
+        return outputs
+
+
 def first_token_diff(lhs: list[int], rhs: list[int]) -> int | None:
     limit = min(len(lhs), len(rhs))
     for idx in range(limit):
@@ -154,23 +207,22 @@ def main() -> None:
         "model": args.model,
         "max_tokens": args.max_tokens,
         "temperature": args.temperature,
+        "concurrency": args.concurrency,
         "prompts": prompts,
         "cases": {},
         "comparisons": {},
     }
 
     for case_name, base_url in cases.items():
-        case_outputs = []
-        for prompt in prompts:
-            output = request_completion(
-                base_url=base_url,
-                model=args.model,
-                prompt=prompt["prompt"],
-                max_tokens=args.max_tokens,
-                temperature=args.temperature,
-                timeout=args.timeout,
-            )
-            case_outputs.append({"id": prompt["id"], **output})
+        case_outputs = request_case_outputs(
+            prompts=prompts,
+            base_url=base_url,
+            model=args.model,
+            max_tokens=args.max_tokens,
+            temperature=args.temperature,
+            timeout=args.timeout,
+            concurrency=args.concurrency,
+        )
         results["cases"][case_name] = {
             "base_url": base_url,
             "outputs": case_outputs,

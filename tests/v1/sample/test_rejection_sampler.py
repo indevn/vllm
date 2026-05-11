@@ -190,6 +190,31 @@ def test_early_mismatch(rejection_sampler):
     assert torch.equal(output.sampled_token_ids, expected)
 
 
+def test_force_reject_all_returns_first_target_token(rejection_sampler):
+    spec_tokens = [[1, 2, 3]]
+    output_tokens = [[1, 2, 3, 4]]
+
+    metadata = create_sampling_metadata(all_greedy=True)
+    logits = create_logits_tensor(output_tokens)
+    bonus_token_tensor = torch.tensor([output_tokens[0][-1]], device=logits.device)
+    spec_decode_metadata = create_spec_decode_metadata(spec_tokens, logits)
+    spec_decode_metadata.force_reject_all = True
+
+    mock_sampler_output(rejection_sampler, bonus_token_tensor)
+    output = rejection_sampler(
+        spec_decode_metadata,
+        draft_probs=None,
+        logits=logits,
+        sampling_metadata=metadata,
+    )
+    expected = torch.tensor(
+        [[1, PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID]],
+        dtype=torch.int,
+        device=logits.device,
+    )
+    assert torch.equal(output.sampled_token_ids, expected)
+
+
 def test_multiple_sequences(rejection_sampler):
     """Test handling multiple sequences of speculated tokens"""
     spec_tokens = [[1, 2], [3]]
@@ -410,6 +435,34 @@ def test_tree_rejection_greedy_sample_scans_siblings_and_stops_on_miss():
     assert torch.equal(output, expected)
 
 
+def test_tree_rejection_greedy_sample_force_reject_all_uses_root_target():
+    metadata, logits = create_tree_spec_decode_metadata(
+        draft_token_ids=[[11, 12, 13, 14]],
+        target_token_ids=[[11, 13, 99, 14, 42]],
+    )
+    metadata.force_reject_all = True
+    sampling_metadata = create_sampling_metadata(all_greedy=True)
+
+    output, accept_indices = tree_rejection_greedy_sample(
+        metadata, logits, sampling_metadata
+    )
+
+    expected = torch.tensor(
+        [[11, PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID,
+          PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID]],
+        dtype=torch.int32,
+        device=DEVICE_TYPE,
+    )
+    assert torch.equal(output, expected)
+    expected_accept_indices = torch.tensor(
+        [[0, PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID,
+          PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID]],
+        dtype=torch.int32,
+        device=DEVICE_TYPE,
+    )
+    assert torch.equal(accept_indices, expected_accept_indices)
+
+
 def test_tree_rejection_greedy_sample_linear_kv_safe_rejects_branch_slot():
     metadata, logits = create_tree_spec_decode_metadata(
         draft_token_ids=[[11, 12, 13, 14]],
@@ -586,6 +639,32 @@ def test_tree_rejection_greedy_sample_accepts_static_target_mask():
 
     assert output.shape == accept_indices.shape
     assert torch.equal(output[:, 0], torch.tensor([11], device=logits.device))
+
+
+def test_tree_rejection_root_only_forward_consumes_root_logits_only():
+    metadata, _ = create_tree_spec_decode_metadata(
+        draft_token_ids=[[11, 12, 13, 14]],
+        target_token_ids=[[99, 98, 97, 96, 95]],
+    )
+    logits = create_argmax_logits([42])
+    metadata.force_reject_all = True
+    metadata.force_root_only_forward = True
+    sampling_metadata = create_sampling_metadata(all_greedy=True)
+
+    output, accept_indices = tree_rejection_greedy_sample(
+        metadata,
+        logits,
+        sampling_metadata,
+    )
+
+    expected = torch.tensor(
+        [[42, PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID,
+          PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID]],
+        dtype=torch.int32,
+        device=DEVICE_TYPE,
+    )
+    assert torch.equal(output, expected)
+    assert accept_indices[0, 0].item() == 0
 
 
 ########################### Tests for Random Sampling ###################

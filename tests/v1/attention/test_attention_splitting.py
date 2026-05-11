@@ -1,14 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from tests.v1.attention.test_attention_backends import BATCH_SPECS
 from tests.v1.attention.utils import BatchSpec, create_common_attn_metadata
+from vllm.v1.attention.backends.tree_attn import (
+    TreeAttentionMetadataBuilder,
+    build_static_tree_retrieve_metadata,
+)
 from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
+from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlice,
     _make_metadata_with_slice,
@@ -16,6 +23,140 @@ from vllm.v1.worker.ubatch_utils import (
     slice_query_start_locs,
     split_attn_metadata,
 )
+
+
+def create_tree_attn_builder(
+    *,
+    speculative_token_tree: str,
+) -> TreeAttentionMetadataBuilder:
+    vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            speculative_token_tree=speculative_token_tree
+        )
+    )
+    kv_cache_spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=16,
+        dtype=torch.float16,
+    )
+    return TreeAttentionMetadataBuilder(
+        kv_cache_spec=kv_cache_spec,
+        layer_names=[],
+        vllm_config=vllm_config,
+        device=torch.device("cpu"),
+    )
+
+
+def test_tree_attn_builder_splits_linear_chain_as_extend():
+    builder = create_tree_attn_builder(
+        speculative_token_tree="[(0,), (0, 0), (0, 0, 0), (0, 0, 0, 0)]"
+    )
+
+    assert builder.is_linear_chain
+    assert builder.decode_threshold == 1
+    assert builder.reorder_batch_threshold == 1
+    assert not builder.use_tree_decode_bias
+
+
+def test_tree_attn_builder_keeps_branching_tree_decode_bias():
+    builder = create_tree_attn_builder(
+        speculative_token_tree="[(0,), (1,), (0, 0), (0, 1)]"
+    )
+
+    assert not builder.is_linear_chain
+    assert builder.decode_threshold == 5
+    assert builder.reorder_batch_threshold == 5
+    assert builder.use_tree_decode_bias
+
+
+def test_branching_tree_attn_bias_only_applies_to_full_tree_decode():
+    builder = create_tree_attn_builder(
+        speculative_token_tree="[(0,), (1,), (0, 0), (0, 1)]"
+    )
+    ordinary_decode = create_common_attn_metadata(
+        BatchSpec(seq_lens=[16, 24], query_lens=[1, 1]),
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+    full_tree_decode = create_common_attn_metadata(
+        BatchSpec(seq_lens=[20, 28], query_lens=[5, 5]),
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+
+    ordinary_metadata = builder.build(0, ordinary_decode).decode_metadata
+    tree_metadata = builder.build(0, full_tree_decode).decode_metadata
+
+    assert ordinary_metadata is not None
+    assert ordinary_metadata.tree_attn_bias is None
+    assert tree_metadata is not None
+    assert tree_metadata.tree_attn_bias is not None
+
+
+def test_tree_attn_dynamic_target_mask_builds_per_request_bias():
+    builder = create_tree_attn_builder(
+        speculative_token_tree="[(0,), (1,), (0, 0), (0, 1)]"
+    )
+    full_tree_decode = create_common_attn_metadata(
+        BatchSpec(seq_lens=[20, 28], query_lens=[5, 5]),
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+    full_tree_decode.tree_target_mask = torch.tensor(
+        [
+            [1, 1, 0, 1, 1],
+            [1, 0, 1, 0, 1],
+        ],
+        dtype=torch.int32,
+    )
+
+    tree_metadata = builder.build(0, full_tree_decode).decode_metadata
+
+    assert tree_metadata is not None
+    assert tree_metadata.tree_attn_bias is not None
+    assert tree_metadata.tree_attn_bias.shape == (2, 5, 5)
+    assert torch.isneginf(tree_metadata.tree_attn_bias[0, :, 2]).all()
+    assert not torch.isneginf(tree_metadata.tree_attn_bias[0, :, 0]).any()
+    assert torch.isneginf(tree_metadata.tree_attn_bias[1, :, 1]).all()
+    assert torch.isneginf(tree_metadata.tree_attn_bias[1, :, 3]).all()
+
+
+def test_tree_attn_runtime_bias_applies_dynamic_target_mask():
+    builder = create_tree_attn_builder(
+        speculative_token_tree="[(0,), (1,), (0, 0), (0, 1)]"
+    )
+    full_tree_decode = create_common_attn_metadata(
+        BatchSpec(seq_lens=[20, 28], query_lens=[3, 3]),
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+    full_tree_decode.tree_attn_bias = torch.zeros((2, 3, 3), dtype=torch.float32)
+    full_tree_decode.tree_target_mask = torch.tensor(
+        [
+            [1, 1, 0],
+            [0, 1, 1],
+        ],
+        dtype=torch.int32,
+    )
+
+    tree_metadata = builder.build(0, full_tree_decode).decode_metadata
+
+    assert tree_metadata is not None
+    assert tree_metadata.tree_attn_bias is not None
+    assert tree_metadata.tree_attn_bias.shape == (2, 3, 3)
+    assert torch.isneginf(tree_metadata.tree_attn_bias[0, :, 2]).all()
+    assert not torch.isneginf(tree_metadata.tree_attn_bias[0, :, 0]).any()
+    assert not torch.isneginf(tree_metadata.tree_attn_bias[1, :, 0]).any()
+    assert not torch.isneginf(tree_metadata.tree_attn_bias[1, :, 2]).any()
+
+
+def test_static_tree_retrieve_metadata_marks_linear_chain():
+    chain = build_static_tree_retrieve_metadata([(0,), (0, 0)])
+    branching = build_static_tree_retrieve_metadata([(0,), (1,)])
+
+    assert chain["is_linear_chain"]
+    assert not branching["is_linear_chain"]
 
 
 @pytest.fixture

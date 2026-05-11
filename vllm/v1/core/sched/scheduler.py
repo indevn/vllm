@@ -379,7 +379,7 @@ class Scheduler(SchedulerInterface):
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
         scheduled_spec_decode_tree_metadata: dict[
-            str, dict[str, list[int] | int | bool]
+            str, dict[str, list[int] | list[list[int]] | int | bool]
         ] = {}
 
         # For logging.

@@ -384,6 +384,7 @@ class ExecuteModelState(NamedTuple):
 
     scheduler_output: "SchedulerOutput"
     logits: torch.Tensor
+    logits_indices: torch.Tensor
     spec_decode_metadata: SpecDecodeMetadata | None
     spec_decode_common_attn_metadata: CommonAttentionMetadata | None
     hidden_states: torch.Tensor
@@ -603,6 +604,10 @@ class GPUModelRunner(
         )
         self.enable_dynamic_tree_kv_relocation = False
         self.tree_spec_trace_path = os.environ.get("VLLM_TREE_SPEC_TRACE_PATH")
+        self.spec_verify_state_trace_path = os.environ.get(
+            "VLLM_SPEC_VERIFY_STATE_TRACE_PATH"
+        )
+        self._tree_spec_recovery_req_ids: set[str] = set()
         self.use_async_spec_decode = (
             self.use_async_scheduling and self.num_spec_tokens > 0
         )
@@ -2086,6 +2091,11 @@ class GPUModelRunner(
             spec_decode_metadata = self._calc_spec_decode_metadata(
                 num_draft_tokens, cu_num_tokens, scheduler_output
             )
+            self._maybe_apply_tree_position_offsets(
+                spec_decode_metadata,
+                req_indices_gpu,
+                total_num_scheduled_tokens,
+            )
             logits_indices = spec_decode_metadata.logits_indices
             num_sampled_tokens = num_draft_tokens + 1
             # For DECODE only cuda graph of some attention backends (e.g., GDN).
@@ -2117,6 +2127,7 @@ class GPUModelRunner(
         num_reqs_padded: int | None = None,
         ubatch_slices: UBatchSlices | None = None,
         logits_indices: torch.Tensor | None = None,
+        spec_decode_metadata: SpecDecodeMetadata | None = None,
         use_spec_decode: bool = False,
         for_cudagraph_capture: bool = False,
         num_scheduled_tokens: dict[str, int] | None = None,
@@ -2209,6 +2220,18 @@ class GPUModelRunner(
             causal=True,
             is_prefilling=is_prefilling,
             positions=self.positions[:num_tokens_padded],
+            tree_target_mask=spec_decode_metadata.tree_target_mask
+            if spec_decode_metadata is not None
+            and spec_decode_metadata.has_tree_metadata
+            else None,
+            tree_attn_bias=spec_decode_metadata.tree_attn_bias
+            if spec_decode_metadata is not None
+            and spec_decode_metadata.has_tree_metadata
+            else None,
+            tree_root_only=spec_decode_metadata.force_reject_all
+            if spec_decode_metadata is not None
+            and spec_decode_metadata.has_tree_metadata
+            else False,
         )
 
         if self.dcp_world_size > 1:
@@ -2696,7 +2719,52 @@ class GPUModelRunner(
                 cu_num_sampled_tokens,
                 num_draft_tokens,
             )
+        if (
+            self._should_force_linear_tree_attn_reject()
+            or self._should_force_dynamic_tree_attn_root_only()
+        ):
+            metadata.force_reject_all = True
         return metadata
+
+    def _should_force_linear_tree_attn_reject(self) -> bool:
+        tree_metadata = getattr(self.drafter, "tree_retrieve_metadata", None)
+        return bool(
+            self._uses_tree_attn_eagle_proposer()
+            and tree_metadata is not None
+            and tree_metadata.get("is_linear_chain", False)
+        )
+
+    def _uses_tree_attn_eagle_proposer(self) -> bool:
+        return bool(
+            isinstance(self.drafter, EagleProposer)
+            and self.vllm_config.attention_config.backend is not None
+            and self.vllm_config.attention_config.backend.name == "TREE_ATTN"
+        )
+
+    def _should_force_dynamic_tree_attn_root_only(self) -> bool:
+        return bool(
+            self._uses_tree_attn_eagle_proposer()
+            and self.enable_dynamic_draft_tree
+        )
+
+    def _should_suppress_tree_attn_draft_tokens(self) -> bool:
+        if not self._uses_tree_attn_eagle_proposer():
+            return False
+
+        tree_metadata = getattr(self.drafter, "tree_retrieve_metadata", None)
+        if tree_metadata is None:
+            return False
+
+        if tree_metadata.get("is_linear_chain", False):
+            return True
+
+        dynamic_tree_metadata = getattr(
+            self.drafter, "_dynamic_tree_last_metadata", None
+        )
+        has_tree_metadata = (
+            self.enable_dynamic_draft_tree and dynamic_tree_metadata is not None
+        ) or tree_metadata is not None
+        return bool(has_tree_metadata and not self.enable_dynamic_tree_kv_relocation)
 
     def _attach_tree_spec_decode_metadata(
         self,
@@ -2730,6 +2798,10 @@ class GPUModelRunner(
         tree_target_mask = torch.zeros(
             (batch_size, max_tree_nodes), dtype=torch.int32, device=self.device
         )
+        tree_attn_bias: torch.Tensor | None = None
+        tree_position_offsets = torch.zeros(
+            (batch_size, max_tree_nodes), dtype=torch.int64, device=self.device
+        )
         tree_valid = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
         tree_num_spec_steps = 0
 
@@ -2744,6 +2816,8 @@ class GPUModelRunner(
             retrieve_next_token = tree_metadata["retrieve_next_token"]
             retrieve_next_sibling = tree_metadata["retrieve_next_sibling"]
             target_mask = tree_metadata.get("target_mask")
+            tree_attn_mask = tree_metadata.get("tree_attn_mask")
+            position_offsets = tree_metadata.get("position_offsets")
             num_spec_steps = int(tree_metadata["num_spec_steps"])
             if (
                 not isinstance(retrieve_index, list)
@@ -2756,6 +2830,20 @@ class GPUModelRunner(
                 continue
             if target_mask is not None and (
                 not isinstance(target_mask, list) or len(target_mask) < num_nodes
+            ):
+                continue
+            if position_offsets is not None and (
+                not isinstance(position_offsets, list)
+                or len(position_offsets) < num_nodes
+            ):
+                continue
+            if tree_attn_mask is not None and (
+                not isinstance(tree_attn_mask, list)
+                or len(tree_attn_mask) < num_nodes
+                or any(
+                    not isinstance(row, list) or len(row) < num_nodes
+                    for row in tree_attn_mask[:num_nodes]
+                )
             ):
                 continue
 
@@ -2780,12 +2868,40 @@ class GPUModelRunner(
                 dtype=torch.int32,
                 device=self.device,
             )
-            if target_mask is not None:
+            if target_mask is not None and tree_metadata.get(
+                "target_mask_enabled", True
+            ):
                 tree_target_mask[req_idx, :num_nodes] = torch.tensor(
                     target_mask[:num_nodes], dtype=torch.int32, device=self.device
                 )
             else:
                 tree_target_mask[req_idx, :num_nodes] = 1
+            if tree_attn_mask is not None:
+                if tree_attn_bias is None:
+                    tree_attn_bias = torch.full(
+                        (batch_size, max_tree_nodes, max_tree_nodes),
+                        -torch.inf,
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
+                tree_attn_mask_tensor = torch.tensor(
+                    [row[:num_nodes] for row in tree_attn_mask[:num_nodes]],
+                    dtype=torch.bool,
+                    device=self.device,
+                )
+                tree_attn_bias[req_idx, :num_nodes, :num_nodes] = torch.where(
+                    tree_attn_mask_tensor,
+                    torch.zeros((), dtype=torch.float32, device=self.device),
+                    torch.full((), -torch.inf, dtype=torch.float32, device=self.device),
+                )
+            if position_offsets is not None:
+                tree_position_offsets[req_idx, :num_nodes] = torch.tensor(
+                    position_offsets[:num_nodes], dtype=torch.int64, device=self.device
+                )
+            else:
+                tree_position_offsets[req_idx, :num_nodes] = torch.arange(
+                    num_nodes, dtype=torch.int64, device=self.device
+                )
             tree_valid[req_idx] = bool(tree_metadata.get("tree_valid", True))
             tree_num_spec_steps = max(tree_num_spec_steps, num_spec_steps)
 
@@ -2796,9 +2912,183 @@ class GPUModelRunner(
         metadata.tree_retrieve_next_token = tree_retrieve_next_token
         metadata.tree_retrieve_next_sibling = tree_retrieve_next_sibling
         metadata.tree_target_mask = tree_target_mask
+        metadata.tree_attn_bias = tree_attn_bias
+        metadata.tree_position_offsets = tree_position_offsets
         metadata.tree_num_spec_steps = tree_num_spec_steps
         metadata.tree_valid = tree_valid
         metadata.tree_linear_kv_safe = not self.enable_dynamic_tree_kv_relocation
+
+    def _maybe_apply_tree_position_offsets(
+        self,
+        metadata: SpecDecodeMetadata,
+        req_indices_gpu: torch.Tensor,
+        total_num_scheduled_tokens: int,
+    ) -> None:
+        if metadata.tree_position_offsets is None:
+            return
+        offsets: list[torch.Tensor] = []
+        for req_idx, num_draft_tokens in enumerate(metadata.num_draft_tokens):
+            num_nodes = int(num_draft_tokens) + 1
+            offsets.append(metadata.tree_position_offsets[req_idx, :num_nodes])
+        if not offsets:
+            return
+        flattened_offsets = torch.cat(offsets).to(torch.int64)
+        if flattened_offsets.shape[0] != total_num_scheduled_tokens:
+            return
+        base_positions = self.num_computed_tokens[req_indices_gpu].to(torch.int64)
+        self.positions[:total_num_scheduled_tokens].copy_(
+            base_positions + flattened_offsets
+        )
+
+    def _should_use_tree_root_only_forward(
+        self, spec_decode_metadata: SpecDecodeMetadata | None
+    ) -> bool:
+        return bool(
+            spec_decode_metadata is not None
+            and spec_decode_metadata.has_tree_metadata
+            and spec_decode_metadata.force_reject_all
+        )
+
+    def _apply_tree_root_only_forward_view(
+        self,
+        num_reqs: int,
+        num_scheduled_tokens: np.ndarray,
+        spec_decode_metadata: SpecDecodeMetadata,
+    ) -> tuple[np.ndarray, int, int, torch.Tensor]:
+        """Compact a force-reject tree verify batch to one target row/request.
+
+        The scheduler still carries the original dynamic subtree and uses it for
+        rejection rollback. This view is only for target forward so the root
+        logits follow the same qlen=1 path as target-only greedy decoding.
+        """
+        original_start_np = np.zeros(num_reqs, dtype=np.int64)
+        if num_reqs > 1:
+            original_start_np[1:] = np.cumsum(
+                num_scheduled_tokens[:-1], dtype=np.int64
+            )
+        forward_num_scheduled_tokens = num_scheduled_tokens.copy()
+        selected_indices: list[int] = []
+        for req_idx, row_start in enumerate(original_start_np.tolist()):
+            row_width = int(num_scheduled_tokens[req_idx])
+            if int(spec_decode_metadata.num_draft_tokens[req_idx]) > 0:
+                forward_num_scheduled_tokens[req_idx] = 1
+                selected_indices.append(row_start)
+            else:
+                selected_indices.extend(range(row_start, row_start + row_width))
+
+        total_forward_tokens = int(forward_num_scheduled_tokens.sum())
+        selected_indices_tensor = torch.tensor(
+            selected_indices, dtype=torch.long, device=self.device
+        )
+        self.input_ids.gpu[:total_forward_tokens].copy_(
+            self.input_ids.gpu[selected_indices_tensor].clone(), non_blocking=True
+        )
+        if self.enable_prompt_embeds:
+            self.inputs_embeds.gpu[:total_forward_tokens].copy_(
+                self.inputs_embeds.gpu[selected_indices_tensor].clone(),
+                non_blocking=True,
+            )
+            self.is_token_ids.gpu[:total_forward_tokens].copy_(
+                self.is_token_ids.gpu[selected_indices_tensor].clone(),
+                non_blocking=True,
+            )
+
+        self.positions[:total_forward_tokens].copy_(
+            self.positions[selected_indices_tensor].clone(), non_blocking=True
+        )
+        if self.uses_mrope:
+            self.mrope_positions.gpu[:, :total_forward_tokens].copy_(
+                self.mrope_positions.gpu[:, selected_indices_tensor].clone(),
+                non_blocking=True,
+            )
+        elif self.uses_xdrope_dim > 0:
+            self.xdrope_positions.gpu[:, :total_forward_tokens].copy_(
+                self.xdrope_positions.gpu[:, selected_indices_tensor].clone(),
+                non_blocking=True,
+            )
+
+        root_num_scheduled_tokens = forward_num_scheduled_tokens.astype(np.int32)
+        cu_forward_tokens = np.cumsum(root_num_scheduled_tokens, dtype=np.int32)
+        self.query_start_loc.np[0] = 0
+        self.query_start_loc.np[1 : num_reqs + 1] = cu_forward_tokens
+        self.query_start_loc.np[num_reqs + 1 :].fill(total_forward_tokens)
+        self.query_start_loc.copy_to_gpu()
+
+        self.num_scheduled_tokens.np[:num_reqs] = root_num_scheduled_tokens
+        self.num_scheduled_tokens.copy_to_gpu(num_reqs)
+
+        forward_scheduled_cpu = torch.from_numpy(root_num_scheduled_tokens)
+        torch.add(
+            self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
+            forward_scheduled_cpu,
+            out=self.optimistic_seq_lens_cpu[:num_reqs],
+        )
+        self.optimistic_seq_lens_cpu[num_reqs:].fill_(0)
+        forward_scheduled_gpu = forward_scheduled_cpu.to(
+            self.device, non_blocking=True
+        )
+        self.seq_lens[:num_reqs].copy_(
+            self.num_computed_tokens[:num_reqs] + forward_scheduled_gpu,
+            non_blocking=True,
+        )
+        self.seq_lens[num_reqs:].fill_(0)
+
+        self.input_batch.block_table.compute_slot_mapping(
+            num_reqs,
+            self.query_start_loc.gpu[: num_reqs + 1],
+            self.positions[:total_forward_tokens],
+        )
+
+        logits_indices = torch.from_numpy(cu_forward_tokens - 1).to(
+            self.device, non_blocking=True
+        )
+        spec_decode_metadata.force_root_only_forward = True
+        return (
+            root_num_scheduled_tokens,
+            total_forward_tokens,
+            int(root_num_scheduled_tokens.max()),
+            logits_indices,
+        )
+
+    def _make_tree_root_only_drafter_scheduler_output(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> "SchedulerOutput":
+        req_ids = self.input_batch.req_ids[: self.input_batch.num_reqs]
+        num_scheduled_tokens = {}
+        for req_id in req_ids:
+            scheduled = scheduler_output.num_scheduled_tokens.get(req_id)
+            if scheduled is None:
+                continue
+            num_scheduled_tokens[req_id] = (
+                1
+                if req_id in scheduler_output.scheduled_spec_decode_tokens
+                else scheduled
+            )
+        scheduled_encoder_inputs = {
+            req_id: encoder_inputs
+            for req_id, encoder_inputs in (
+                scheduler_output.scheduled_encoder_inputs.items()
+            )
+            if req_id in num_scheduled_tokens
+        }
+        return replace(
+            scheduler_output,
+            num_scheduled_tokens=num_scheduled_tokens,
+            total_num_scheduled_tokens=sum(num_scheduled_tokens.values()),
+            scheduled_spec_decode_tokens={},
+            scheduled_spec_decode_tree_metadata=None,
+            scheduled_encoder_inputs=scheduled_encoder_inputs,
+        )
+
+    @staticmethod
+    def _clear_tree_metadata_for_drafter(
+        common_attn_metadata: CommonAttentionMetadata,
+    ) -> CommonAttentionMetadata:
+        return common_attn_metadata.replace(
+            tree_target_mask=None,
+            tree_attn_bias=None,
+            tree_root_only=False,
+        )
 
     def _refresh_dynamic_tree_kv_relocation_support(self) -> None:
         if not self.enable_tree_spec_decode_kv_relocation:
@@ -2852,6 +3142,326 @@ class GPUModelRunner(
             records.append(record)
 
         with open(self.tree_spec_trace_path, "a", encoding="utf-8") as f:
+            for record in records:
+                f.write(json.dumps(record, sort_keys=True) + "\n")
+
+    @staticmethod
+    def _tensor_trace_list(
+        tensor: torch.Tensor | None,
+        limit: int | None = None,
+    ) -> list[int] | None:
+        if tensor is None:
+            return None
+        if limit is not None:
+            tensor = tensor[:limit]
+        return [int(x) for x in tensor.detach().cpu().reshape(-1).tolist()]
+
+    @staticmethod
+    def _valid_token_ids(token_ids: torch.Tensor) -> list[list[int]]:
+        token_ids_cpu = token_ids.detach().cpu().tolist()
+        return [
+            [int(token_id) for token_id in row if int(token_id) >= 0]
+            for row in token_ids_cpu
+        ]
+
+    @staticmethod
+    def _logits_topk_trace(
+        logits: torch.Tensor,
+        *,
+        k: int = 5,
+    ) -> tuple[list[list[int]], list[list[float]], list[float | None]]:
+        if logits.numel() == 0 or k <= 0:
+            return [], [], []
+        k = min(k, logits.shape[-1])
+        top_values, top_indices = torch.topk(logits.to(torch.float32), k=k, dim=-1)
+        top_values_cpu = top_values.detach().cpu().tolist()
+        top_indices_cpu = top_indices.detach().cpu().tolist()
+        margins: list[float | None] = []
+        for values in top_values_cpu:
+            if len(values) < 2:
+                margins.append(None)
+            else:
+                margins.append(float(values[0] - values[1]))
+        return (
+            [[int(token_id) for token_id in row] for row in top_indices_cpu],
+            [[float(value) for value in row] for row in top_values_cpu],
+            margins,
+        )
+
+    def _maybe_dump_spec_verify_state_trace(
+        self,
+        *,
+        scheduler_output: SchedulerOutput,
+        sampler_output: SamplerOutput,
+        logits: torch.Tensor,
+        logits_indices: torch.Tensor,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+        spec_decode_common_attn_metadata: CommonAttentionMetadata | None,
+    ) -> None:
+        if not self.spec_verify_state_trace_path:
+            return
+
+        num_reqs = self.input_batch.num_reqs
+        req_ids = self.input_batch.req_ids[:num_reqs]
+        output_token_ids = self._valid_token_ids(sampler_output.sampled_token_ids)
+        target_argmax = logits.argmax(dim=-1).detach().cpu().tolist()
+        logits_top_token_ids, logits_top_values, logits_top_margins = (
+            self._logits_topk_trace(logits, k=5)
+        )
+        logits_indices_list = self._tensor_trace_list(logits_indices)
+        query_start_loc = self._tensor_trace_list(
+            self.query_start_loc.gpu[: num_reqs + 1]
+        )
+        trace_num_tokens = (
+            spec_decode_common_attn_metadata.num_actual_tokens
+            if spec_decode_common_attn_metadata is not None
+            else scheduler_output.total_num_scheduled_tokens
+        )
+        positions = self._tensor_trace_list(self.positions[:trace_num_tokens])
+        input_ids = self._tensor_trace_list(self.input_ids.gpu[:trace_num_tokens])
+        slot_mapping = None
+        block_table = None
+        seq_lens = self._tensor_trace_list(self.seq_lens[:num_reqs])
+        attn_num_actual_tokens = int(trace_num_tokens)
+        attn_max_query_len = (
+            max(
+                int(query_start_loc[i + 1]) - int(query_start_loc[i])
+                for i in range(num_reqs)
+            )
+            if query_start_loc and len(query_start_loc) > 1
+            else None
+        )
+        attn_max_seq_len = max(seq_lens) if seq_lens else None
+        if spec_decode_common_attn_metadata is not None:
+            slot_mapping = self._tensor_trace_list(
+                spec_decode_common_attn_metadata.slot_mapping,
+                trace_num_tokens,
+            )
+            seq_lens = self._tensor_trace_list(
+                spec_decode_common_attn_metadata.seq_lens[:num_reqs]
+            )
+            attn_num_actual_tokens = int(
+                spec_decode_common_attn_metadata.num_actual_tokens
+            )
+            attn_max_query_len = int(spec_decode_common_attn_metadata.max_query_len)
+            attn_max_seq_len = int(spec_decode_common_attn_metadata.max_seq_len)
+            block_table = (
+                spec_decode_common_attn_metadata.block_table_tensor[:num_reqs]
+                .detach()
+                .cpu()
+                .tolist()
+            )
+            block_table = [
+                [int(block_id) for block_id in row]
+                for row in block_table
+            ]
+        elif getattr(self, "kv_cache_config", None):
+            try:
+                block_table_tensor = self.input_batch.block_table[
+                    0
+                ].get_device_tensor(num_reqs)
+                slot_mapping = self._tensor_trace_list(
+                    self.input_batch.block_table[0].slot_mapping.gpu,
+                    trace_num_tokens,
+                )
+                block_table = [
+                    [int(block_id) for block_id in row]
+                    for row in block_table_tensor.detach().cpu().tolist()
+                ]
+            except Exception:
+                slot_mapping = None
+                block_table = None
+
+        draft_token_ids = None
+        target_logits_indices = None
+        bonus_logits_indices = None
+        tree_target_mask = None
+        tree_position_offsets = None
+        tree_attn_bias_mask = None
+        cu_num_draft_tokens = None
+        cu_num_sampled_tokens = None
+        num_draft_tokens = None
+        target_argmax_by_req = None
+        draft_token_ids_by_req = None
+        accepted_prefix_len_by_req = None
+        first_reject_index_by_req = None
+        if spec_decode_metadata is not None:
+            draft_token_ids = self._tensor_trace_list(
+                spec_decode_metadata.draft_token_ids
+            )
+            target_logits_indices = self._tensor_trace_list(
+                spec_decode_metadata.target_logits_indices
+            )
+            bonus_logits_indices = self._tensor_trace_list(
+                spec_decode_metadata.bonus_logits_indices
+            )
+            if spec_decode_metadata.tree_target_mask is not None:
+                tree_target_mask = (
+                    spec_decode_metadata.tree_target_mask.detach().cpu().tolist()
+                )
+            if spec_decode_metadata.tree_position_offsets is not None:
+                tree_position_offsets = (
+                    spec_decode_metadata.tree_position_offsets.detach().cpu().tolist()
+                )
+            if spec_decode_metadata.tree_attn_bias is not None:
+                tree_attn_bias_mask = (
+                    torch.isfinite(spec_decode_metadata.tree_attn_bias)
+                    .to(torch.int32)
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
+            cu_num_draft_tokens = self._tensor_trace_list(
+                spec_decode_metadata.cu_num_draft_tokens
+            )
+            cu_num_sampled_tokens = self._tensor_trace_list(
+                spec_decode_metadata.cu_num_sampled_tokens
+            )
+            num_draft_tokens = [
+                int(num_tokens)
+                for num_tokens in spec_decode_metadata.num_draft_tokens
+            ]
+            target_argmax_by_req = []
+            draft_token_ids_by_req = []
+            accepted_prefix_len_by_req = []
+            first_reject_index_by_req = []
+            start = 0
+            for req_idx, draft_len in enumerate(spec_decode_metadata.num_draft_tokens):
+                end = start + int(draft_len)
+                req_draft_token_ids = (
+                    [] if draft_token_ids is None else draft_token_ids[start:end]
+                )
+                req_target_argmax = [
+                    int(token_id) for token_id in target_argmax[start:end]
+                ]
+                req_output = (
+                    output_token_ids[req_idx]
+                    if req_idx < len(output_token_ids)
+                    else []
+                )
+                accept_prefix = max(0, min(len(req_output) - 1, int(draft_len)))
+                first_reject = (
+                    None if accept_prefix == int(draft_len) else accept_prefix
+                )
+                draft_token_ids_by_req.append(req_draft_token_ids)
+                target_argmax_by_req.append(req_target_argmax)
+                accepted_prefix_len_by_req.append(accept_prefix)
+                first_reject_index_by_req.append(first_reject)
+                start = end
+
+        records: list[dict[str, object]] = []
+        for req_idx, req_id in enumerate(req_ids):
+            query_start = query_start_loc[req_idx] if query_start_loc else 0
+            query_end = query_start_loc[req_idx + 1] if query_start_loc else 0
+            token_start = int(self.input_batch.num_prompt_tokens[req_idx])
+            token_end = int(self.input_batch.num_tokens_no_spec[req_idx])
+            record: dict[str, object] = {
+                "request_id": req_id,
+                "trace_kind": "spec_verify_state",
+                "is_spec_decode": spec_decode_metadata is not None,
+                "has_tree_metadata": bool(
+                    spec_decode_metadata is not None
+                    and spec_decode_metadata.has_tree_metadata
+                ),
+                "scheduled_tokens": int(
+                    scheduler_output.num_scheduled_tokens.get(req_id, 0)
+                ),
+                "forward_tokens": int(query_end - query_start),
+                "forward_root_only": bool(
+                    spec_decode_metadata is not None
+                    and spec_decode_metadata.force_root_only_forward
+                ),
+                "scheduled_spec_decode_tokens": [
+                    int(token_id)
+                    for token_id in scheduler_output.scheduled_spec_decode_tokens.get(
+                        req_id, []
+                    )
+                ],
+                "query_start": int(query_start),
+                "query_end": int(query_end),
+                "query_start_loc": query_start_loc,
+                "input_ids": input_ids[query_start:query_end]
+                if input_ids is not None
+                else None,
+                "positions": positions[query_start:query_end]
+                if positions is not None
+                else None,
+                "slot_mapping": slot_mapping[query_start:query_end]
+                if slot_mapping is not None
+                else None,
+                "seq_lens": seq_lens,
+                "attn_num_actual_tokens": attn_num_actual_tokens,
+                "attn_max_query_len": attn_max_query_len,
+                "attn_max_seq_len": attn_max_seq_len,
+                "block_table": block_table[req_idx]
+                if block_table is not None and req_idx < len(block_table)
+                else None,
+                "num_computed_tokens_cpu": int(
+                    self.input_batch.num_computed_tokens_cpu[req_idx]
+                ),
+                "num_prompt_tokens": int(self.input_batch.num_prompt_tokens[req_idx]),
+                "num_tokens_no_spec": int(self.input_batch.num_tokens_no_spec[req_idx]),
+                "token_ids_cpu_tail": [
+                    int(token_id)
+                    for token_id in self.input_batch.token_ids_cpu[
+                        req_idx, max(token_start, token_end - 32) : token_end
+                    ].tolist()
+                ],
+                "logits_indices": logits_indices_list,
+                "logits_argmax_token_ids": [
+                    int(token_id) for token_id in target_argmax
+                ],
+                "logits_top_token_ids": logits_top_token_ids,
+                "logits_top_values": logits_top_values,
+                "logits_top_margins": logits_top_margins,
+                "output_token_ids": output_token_ids[req_idx]
+                if req_idx < len(output_token_ids)
+                else [],
+            }
+            if spec_decode_metadata is not None:
+                record.update(
+                    {
+                        "num_draft_tokens": num_draft_tokens[req_idx]
+                        if num_draft_tokens is not None
+                        else None,
+                        "force_reject_all": spec_decode_metadata.force_reject_all,
+                        "force_root_only_forward": (
+                            spec_decode_metadata.force_root_only_forward
+                        ),
+                        "tree_linear_kv_safe": spec_decode_metadata.tree_linear_kv_safe,
+                        "draft_token_ids_flat": draft_token_ids,
+                        "draft_token_ids": draft_token_ids_by_req[req_idx]
+                        if draft_token_ids_by_req is not None
+                        else None,
+                        "target_logits_indices": target_logits_indices,
+                        "bonus_logits_indices": bonus_logits_indices,
+                        "tree_target_mask": tree_target_mask[req_idx]
+                        if tree_target_mask is not None
+                        else None,
+                        "tree_position_offsets": tree_position_offsets[req_idx]
+                        if tree_position_offsets is not None
+                        else None,
+                        "tree_attn_bias_mask": tree_attn_bias_mask[req_idx]
+                        if tree_attn_bias_mask is not None
+                        else None,
+                        "cu_num_draft_tokens": cu_num_draft_tokens,
+                        "cu_num_sampled_tokens": cu_num_sampled_tokens,
+                        "target_argmax_token_ids": target_argmax_by_req[req_idx]
+                        if target_argmax_by_req is not None
+                        else None,
+                        "accepted_prefix_len": accepted_prefix_len_by_req[req_idx]
+                        if accepted_prefix_len_by_req is not None
+                        else None,
+                        "first_reject_index": first_reject_index_by_req[req_idx]
+                        if first_reject_index_by_req is not None
+                        else None,
+                    }
+                )
+            records.append(record)
+
+        with open(
+            self.spec_verify_state_trace_path, "a", encoding="utf-8"
+        ) as f:
             for record in records:
                 f.write(json.dumps(record, sort_keys=True) + "\n")
 
@@ -4093,6 +4703,7 @@ class GPUModelRunner(
         num_reqs_padded: int,
         num_tokens_unpadded: int,
         ubatch_slices: "UBatchSlices | None" = None,
+        spec_decode_metadata: SpecDecodeMetadata | None = None,
     ) -> tuple[
         dict[int, torch.Tensor] | None,
         dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,
@@ -4132,6 +4743,27 @@ class GPUModelRunner(
             else:
                 blk_table = self.input_batch.block_table[kv_cache_gid]
                 slot_mapping = blk_table.slot_mapping.gpu[:num_tokens_padded]
+
+            if (
+                spec_decode_metadata is not None
+                and spec_decode_metadata.has_tree_metadata
+                and spec_decode_metadata.force_reject_all
+            ):
+                slot_mapping = slot_mapping.clone()
+                query_start_loc = self.query_start_loc.gpu
+                for req_idx, num_draft_tokens in enumerate(
+                    spec_decode_metadata.num_draft_tokens
+                ):
+                    if num_draft_tokens <= 0:
+                        continue
+                    row_start = int(query_start_loc[req_idx].item())
+                    row_end = min(
+                        int(query_start_loc[req_idx + 1].item()),
+                        row_start + int(num_draft_tokens) + 1,
+                        num_tokens_unpadded,
+                    )
+                    if row_start + 1 < row_end:
+                        slot_mapping[row_start + 1 : row_end].fill_(PAD_SLOT_ID)
 
             # Fill unused with -1. Needed for reshape_and_cache in full cuda
             # graph mode. `blk_table_tensor` -1 to match mamba PAD_SLOT_ID
@@ -4263,13 +4895,29 @@ class GPUModelRunner(
                 scheduler_output,
                 num_scheduled_tokens_np,
             )
+            root_only_forward = self._should_use_tree_root_only_forward(
+                spec_decode_metadata
+            )
+            if root_only_forward:
+                (
+                    forward_num_scheduled_tokens_np,
+                    num_tokens_unpadded,
+                    max_num_scheduled_tokens,
+                    logits_indices,
+                ) = self._apply_tree_root_only_forward_view(
+                    num_reqs,
+                    num_scheduled_tokens_np,
+                    spec_decode_metadata,
+                )
+            else:
+                forward_num_scheduled_tokens_np = num_scheduled_tokens_np
 
             cascade_attn_prefix_lens = None
             # Disable cascade attention when using microbatching (DBO)
             if self.cascade_attn_enabled and not self.parallel_config.use_ubatching:
                 # Pre-compute cascade attention prefix lengths
                 cascade_attn_prefix_lens = self._compute_cascade_attn_prefix_lens(
-                    num_scheduled_tokens_np,
+                    forward_num_scheduled_tokens_np,
                     self.input_batch.num_computed_tokens_cpu[:num_reqs],
                     scheduler_output.num_common_prefix_blocks,
                 )
@@ -4283,7 +4931,7 @@ class GPUModelRunner(
             ) = self._determine_batch_execution_and_padding(
                 num_tokens=num_tokens_unpadded,
                 num_reqs=num_reqs,
-                num_scheduled_tokens_np=num_scheduled_tokens_np,
+                num_scheduled_tokens_np=forward_num_scheduled_tokens_np,
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
@@ -4304,7 +4952,7 @@ class GPUModelRunner(
             )
             ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
                 should_ubatch,
-                num_scheduled_tokens_np,
+                forward_num_scheduled_tokens_np,
                 num_tokens_padded,
                 num_reqs_padded,
                 self.parallel_config.num_ubatches,
@@ -4357,6 +5005,11 @@ class GPUModelRunner(
                 self.num_accepted_tokens.copy_to_gpu(num_reqs)
 
             use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
+            scheduler_output_for_forward = (
+                self._make_tree_root_only_drafter_scheduler_output(scheduler_output)
+                if root_only_forward
+                else scheduler_output
+            )
             ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
             slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
@@ -4368,6 +5021,7 @@ class GPUModelRunner(
                 ),
                 num_tokens_unpadded=num_tokens_unpadded,
                 ubatch_slices=ubatch_slices_padded,
+                spec_decode_metadata=spec_decode_metadata,
             )
 
             attn_metadata, spec_decode_common_attn_metadata = (
@@ -4379,8 +5033,11 @@ class GPUModelRunner(
                     max_query_len=max_num_scheduled_tokens,
                     ubatch_slices=ubatch_slices_attn,
                     logits_indices=logits_indices,
+                    spec_decode_metadata=spec_decode_metadata,
                     use_spec_decode=use_spec_decode,
-                    num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+                    num_scheduled_tokens=(
+                        scheduler_output_for_forward.num_scheduled_tokens
+                    ),
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                     slot_mappings=slot_mappings_by_group,
                 )
@@ -4394,7 +5051,9 @@ class GPUModelRunner(
                 model_kwargs,
                 ec_connector_output,
             ) = self._preprocess(
-                scheduler_output, num_tokens_padded, intermediate_tensors
+                scheduler_output_for_forward,
+                num_tokens_padded,
+                intermediate_tensors,
             )
 
         # Set cudagraph mode to none if calc_kv_scales is true.
@@ -4431,7 +5090,7 @@ class GPUModelRunner(
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(
-                scheduler_output,
+                scheduler_output_for_forward,
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
@@ -4461,12 +5120,22 @@ class GPUModelRunner(
                     self.kv_connector_output = kv_connector_output
                     return hidden_states
 
+                if (
+                    spec_decode_metadata is not None
+                    and spec_decode_metadata.force_root_only_forward
+                    and aux_hidden_states is not None
+                ):
+                    aux_hidden_states = [
+                        h[:num_tokens_unpadded] for h in aux_hidden_states
+                    ]
+                    hidden_states = hidden_states[:num_tokens_unpadded]
+
                 if self.is_pooling_model:
                     # Return the pooling output.
                     return self._pool(
                         hidden_states,
-                        num_scheduled_tokens,
-                        num_scheduled_tokens_np,
+                        num_tokens_unpadded,
+                        forward_num_scheduled_tokens_np,
                         kv_connector_output,
                     )
 
@@ -4475,6 +5144,16 @@ class GPUModelRunner(
             else:
                 # Rare case.
                 assert not self.is_pooling_model
+
+                if (
+                    spec_decode_metadata is not None
+                    and spec_decode_metadata.force_root_only_forward
+                    and aux_hidden_states is not None
+                ):
+                    aux_hidden_states = [
+                        h[:num_tokens_unpadded] for h in aux_hidden_states
+                    ]
+                    hidden_states = hidden_states[:num_tokens_unpadded]
 
                 sample_hidden_states = hidden_states[logits_indices]
                 if not get_pp_group().is_last_rank:
@@ -4505,6 +5184,7 @@ class GPUModelRunner(
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
             logits,
+            logits_indices,
             spec_decode_metadata,
             spec_decode_common_attn_metadata,
             hidden_states,
@@ -4549,6 +5229,7 @@ class GPUModelRunner(
         (
             scheduler_output,
             logits,
+            logits_indices,
             spec_decode_metadata,
             spec_decode_common_attn_metadata,
             hidden_states,
@@ -4570,6 +5251,14 @@ class GPUModelRunner(
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
+        self._maybe_dump_spec_verify_state_trace(
+            scheduler_output=scheduler_output,
+            sampler_output=sampler_output,
+            logits=logits,
+            logits_indices=logits_indices,
+            spec_decode_metadata=spec_decode_metadata,
+            spec_decode_common_attn_metadata=spec_decode_common_attn_metadata,
+        )
         self._maybe_dump_tree_spec_trace(sampler_output, spec_decode_metadata)
         self._maybe_relocate_dynamic_tree_hidden_states(
             sampler_output,
@@ -4579,6 +5268,10 @@ class GPUModelRunner(
             aux_hidden_states,
         )
         self._maybe_relocate_dynamic_tree_kv(sampler_output, spec_decode_metadata)
+        self._mark_tree_spec_recovery_after_reject(
+            sampler_output,
+            spec_decode_metadata,
+        )
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
         )
@@ -4599,16 +5292,32 @@ class GPUModelRunner(
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
+            drafter_scheduler_output = scheduler_output
+            drafter_spec_decode_metadata = spec_decode_metadata
+            drafter_common_attn_metadata = spec_decode_common_attn_metadata
+            if (
+                spec_decode_metadata is not None
+                and spec_decode_metadata.force_root_only_forward
+            ):
+                drafter_scheduler_output = (
+                    self._make_tree_root_only_drafter_scheduler_output(
+                        scheduler_output
+                    )
+                )
+                drafter_spec_decode_metadata = None
+                drafter_common_attn_metadata = self._clear_tree_metadata_for_drafter(
+                    spec_decode_common_attn_metadata
+                )
             with record_function_or_nullcontext("gpu_model_runner: draft"):
                 self._draft_token_ids = self.propose_draft_token_ids(
-                    scheduler_output,
+                    drafter_scheduler_output,
                     sampled_token_ids,
                     self.input_batch.sampling_metadata,
                     hidden_states,
                     sample_hidden_states,
                     aux_hidden_states,
-                    spec_decode_metadata,
-                    spec_decode_common_attn_metadata,
+                    drafter_spec_decode_metadata,
+                    drafter_common_attn_metadata,
                     slot_mappings,
                 )
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
@@ -4621,12 +5330,17 @@ class GPUModelRunner(
                 spec_decode_common_attn_metadata.max_seq_len + self.num_spec_tokens
                 <= self.effective_drafter_max_model_len
             )
+            suppress_tree_attn_drafts = (
+                self._should_suppress_tree_attn_draft_tokens()
+            )
             use_gpu_toks = (
                 spec_config.use_eagle()
                 or spec_config.uses_draft_model()
                 or spec_config.uses_extract_hidden_states()
             ) and not spec_config.disable_padded_drafter_batch
-            if use_gpu_toks:
+            if suppress_tree_attn_drafts:
+                pass
+            elif use_gpu_toks:
                 # EAGLE/DraftModel speculative decoding can use the GPU sampled tokens
                 # as inputs, and does not need to wait for bookkeeping to finish.
                 assert isinstance(
@@ -4677,7 +5391,7 @@ class GPUModelRunner(
             else:
                 propose_drafts_after_bookkeeping = input_fits_in_drafter
 
-            if not input_fits_in_drafter:
+            if not input_fits_in_drafter and not suppress_tree_attn_drafts:
                 # Zero out draft tokens so the scheduler doesn't schedule
                 # stale drafts from the previous step.
                 # For Nemotron-H: it is necessary to zero out the draft tokens,
@@ -4818,29 +5532,115 @@ class GPUModelRunner(
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         if not self.num_spec_tokens or not self._draft_token_req_ids:
             return None
+        if self._should_suppress_tree_attn_draft_tokens():
+            req_ids = self._draft_token_req_ids
+            return DraftTokenIds(req_ids, [[] for _ in req_ids])
+        dynamic_tree_draft_token_ids = getattr(
+            self.drafter, "_dynamic_tree_last_draft_token_ids", None
+        )
+        if self.enable_dynamic_draft_tree and dynamic_tree_draft_token_ids is not None:
+            req_ids = self._draft_token_req_ids
+            tree_metadata = self._get_draft_tree_metadata(req_ids)
+            draft_token_ids = [
+                list(tokens)
+                for tokens in dynamic_tree_draft_token_ids[: len(req_ids)]
+            ]
+            draft_token_ids, tree_metadata = self._apply_tree_spec_recovery(
+                req_ids,
+                draft_token_ids,
+                tree_metadata,
+            )
+            return DraftTokenIds(
+                req_ids,
+                draft_token_ids,
+                tree_metadata=tree_metadata,
+            )
         draft_token_ids, req_ids = self._get_draft_token_ids_cpu()
+        tree_metadata = self._get_draft_tree_metadata(req_ids)
+        draft_token_ids, tree_metadata = self._apply_tree_spec_recovery(
+            req_ids,
+            draft_token_ids,
+            tree_metadata,
+        )
         return DraftTokenIds(
             req_ids,
             draft_token_ids,
-            tree_metadata=self._get_draft_tree_metadata(req_ids),
+            tree_metadata=tree_metadata,
         )
+
+    def _mark_tree_spec_recovery_after_reject(
+        self,
+        sampler_output: SamplerOutput,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> None:
+        if (
+            spec_decode_metadata is None
+            or not spec_decode_metadata.has_tree_metadata
+            or not self.enable_dynamic_draft_tree
+            or spec_decode_metadata.force_reject_all
+        ):
+            return
+        if not hasattr(self, "_tree_spec_recovery_req_ids"):
+            self._tree_spec_recovery_req_ids = set()
+        sampled_token_ids = sampler_output.sampled_token_ids
+        if sampled_token_ids is None:
+            return
+        req_ids = self.input_batch.req_ids[: len(spec_decode_metadata.num_draft_tokens)]
+        for req_id, num_draft_tokens, output_row in zip(
+            req_ids,
+            spec_decode_metadata.num_draft_tokens,
+            sampled_token_ids,
+        ):
+            if num_draft_tokens <= 0:
+                continue
+            valid_tokens = int((output_row >= 0).sum().item())
+            num_accepted = max(0, valid_tokens - 1)
+            if num_accepted < int(num_draft_tokens):
+                self._tree_spec_recovery_req_ids.add(req_id)
+
+    def _apply_tree_spec_recovery(
+        self,
+        req_ids: list[str],
+        draft_token_ids: list[list[int]],
+        tree_metadata: dict[str, dict[str, list[int] | list[list[int]] | int | bool]]
+        | None,
+    ) -> tuple[
+        list[list[int]],
+        dict[str, dict[str, list[int] | list[list[int]] | int | bool]] | None,
+    ]:
+        recovery_req_ids = getattr(self, "_tree_spec_recovery_req_ids", set())
+        if not recovery_req_ids:
+            return draft_token_ids, tree_metadata
+        tree_metadata = None if tree_metadata is None else tree_metadata.copy()
+        for req_idx, req_id in enumerate(req_ids):
+            if req_id not in recovery_req_ids:
+                continue
+            draft_token_ids[req_idx] = []
+            if tree_metadata is not None:
+                tree_metadata.pop(req_id, None)
+        recovery_req_ids.difference_update(req_ids)
+        return draft_token_ids, tree_metadata or None
 
     def _get_draft_tree_metadata(
         self, req_ids: list[str]
-    ) -> dict[str, dict[str, list[int] | int | bool]] | None:
+    ) -> dict[str, dict[str, list[int] | list[list[int]] | int | bool]] | None:
         if not isinstance(self.drafter, EagleProposer):
             return None
         dynamic_tree_metadata = getattr(
             self.drafter, "_dynamic_tree_last_metadata", None
         )
         if self.enable_dynamic_draft_tree and dynamic_tree_metadata is not None:
-            metadata_by_req: dict[str, dict[str, list[int] | int | bool]] = {}
+            metadata_by_req: dict[
+                str, dict[str, list[int] | list[list[int]] | int | bool]
+            ] = {}
             for req_id, tree_metadata in zip(req_ids, dynamic_tree_metadata):
                 if tree_metadata is not None:
                     metadata_by_req[req_id] = tree_metadata.copy()
             return metadata_by_req
         tree_metadata = getattr(self.drafter, "tree_retrieve_metadata", None)
         if tree_metadata is None:
+            return None
+        if tree_metadata.get("is_linear_chain", False):
             return None
         return {req_id: tree_metadata.copy() for req_id in req_ids}
 
@@ -4875,6 +5675,10 @@ class GPUModelRunner(
             else:
                 # No copy needed, just zero-out cpu tensor.
                 self.draft_token_ids_cpu[:num_reqs] = 0
+                if hasattr(self.drafter, "_dynamic_tree_last_draft_token_ids"):
+                    self.drafter._dynamic_tree_last_draft_token_ids = None
+                if hasattr(self.drafter, "_dynamic_tree_last_metadata"):
+                    self.drafter._dynamic_tree_last_metadata = None
             self.draft_token_ids_event.record()
 
     def _get_draft_token_ids_cpu(self) -> tuple[list[list[int]], list[str]]:

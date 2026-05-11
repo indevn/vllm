@@ -402,6 +402,19 @@ class CommonAttentionMetadata:
     (num_computed_tokens < num_prompt_tokens). Used by some backends to
     distinguish actual decodes from short extends."""
 
+    tree_target_mask: torch.Tensor | None = None
+    """Optional root-inclusive per-request mask for TREE_ATTN speculative
+    verification. Shape is (batch_size, tree_width)."""
+
+    tree_attn_bias: torch.Tensor | None = None
+    """Optional root-inclusive per-request TREE_ATTN qq-bias override.
+    Shape is (batch_size, tree_width, tree_width)."""
+
+    tree_root_only: bool = False
+    """When true, TREE_ATTN metadata is present for tracing/verifier state, but
+    target attention should compute the scheduled tokens as ordinary causal
+    rows. This is the correctness bridge for root-only tree verification."""
+
     seq_lens_cpu_upper_bound: torch.Tensor | None = None
     """(batch_size,) CPU upper bound on seq_lens. Precise for prefill rows
     and for all rows outside async spec decode; optimistic for async-spec
@@ -490,6 +503,9 @@ class CommonAttentionMetadata:
             dcp_local_seq_lens=maybe_slice_reqs(self.dcp_local_seq_lens),
             dcp_local_seq_lens_cpu=maybe_slice_reqs(self.dcp_local_seq_lens_cpu),
             is_prefilling=maybe_slice_reqs(self.is_prefilling),
+            tree_target_mask=maybe_slice_reqs(self.tree_target_mask),
+            tree_attn_bias=maybe_slice_reqs(self.tree_attn_bias),
+            tree_root_only=self.tree_root_only,
         )
 
 
