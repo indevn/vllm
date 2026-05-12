@@ -598,6 +598,11 @@ class GPUModelRunner(
             self.speculative_config is not None
             and self.speculative_config.enable_dynamic_draft_tree
         )
+        self.dynamic_draft_tree_runtime_mode = (
+            self.speculative_config.dynamic_draft_tree_runtime_mode
+            if self.speculative_config is not None
+            else "root_only"
+        )
         self.enable_tree_spec_decode_kv_relocation = (
             self.speculative_config is not None
             and self.speculative_config.enable_tree_spec_decode_kv_relocation
@@ -2777,6 +2782,8 @@ class GPUModelRunner(
         return bool(
             self._uses_tree_attn_eagle_proposer()
             and self.enable_dynamic_draft_tree
+            and getattr(self, "dynamic_draft_tree_runtime_mode", "root_only")
+            == "root_only"
         )
 
     def _should_suppress_tree_attn_draft_tokens(self) -> bool:
@@ -2789,6 +2796,14 @@ class GPUModelRunner(
 
         if tree_metadata.get("is_linear_chain", False):
             return not getattr(self, "enable_tree_attn_linear_chain_verify", False)
+
+        if self.enable_dynamic_draft_tree:
+            runtime_mode = getattr(
+                self, "dynamic_draft_tree_runtime_mode", "root_only"
+            )
+            return runtime_mode == "branching" and not (
+                self.enable_dynamic_tree_kv_relocation
+            )
 
         dynamic_tree_metadata = getattr(
             self.drafter, "_dynamic_tree_last_metadata", None
@@ -2837,6 +2852,7 @@ class GPUModelRunner(
         tree_valid = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
         tree_num_spec_steps = 0
         all_tree_rows_are_linear_chain = True
+        has_dynamic_tree_metadata = False
 
         for req_idx, req_id in enumerate(req_ids):
             num_nodes = int(num_draft_tokens[req_idx]) + 1
@@ -2845,6 +2861,9 @@ class GPUModelRunner(
             tree_metadata = tree_metadata_by_req.get(req_id)
             if tree_metadata is None:
                 continue
+            has_dynamic_tree_metadata = has_dynamic_tree_metadata or bool(
+                tree_metadata.get("is_dynamic_tree", False)
+            )
             all_tree_rows_are_linear_chain = (
                 all_tree_rows_are_linear_chain
                 and bool(tree_metadata.get("is_linear_chain", False))
@@ -2953,11 +2972,28 @@ class GPUModelRunner(
         metadata.tree_position_offsets = tree_position_offsets
         metadata.tree_num_spec_steps = tree_num_spec_steps
         metadata.tree_valid = tree_valid
-        metadata.tree_linear_kv_safe = not self.enable_dynamic_tree_kv_relocation
+        if has_dynamic_tree_metadata:
+            runtime_mode = getattr(
+                self, "dynamic_draft_tree_runtime_mode", "root_only"
+            )
+            metadata.tree_runtime_mode = runtime_mode
+            metadata.tree_linear_kv_safe = (
+                runtime_mode != "branching"
+                or not self.enable_dynamic_tree_kv_relocation
+            )
+        else:
+            metadata.tree_linear_kv_safe = not self.enable_dynamic_tree_kv_relocation
         if (
-            all_tree_rows_are_linear_chain
-            and getattr(self, "enable_tree_attn_linear_chain_verify", False)
-            and not getattr(self, "force_tree_attn_linear_chain_root_only", False)
+            (
+                has_dynamic_tree_metadata
+                and metadata.tree_runtime_mode == "prefix_only"
+                and metadata.tree_linear_kv_safe
+            )
+            or (
+                all_tree_rows_are_linear_chain
+                and getattr(self, "enable_tree_attn_linear_chain_verify", False)
+                and not getattr(self, "force_tree_attn_linear_chain_root_only", False)
+            )
         ):
             metadata.tree_force_single_row_logits = True
             metadata.tree_force_serial_q1_forward = True
@@ -3555,6 +3591,7 @@ class GPUModelRunner(
                         "tree_serial_q1_forward_used": (
                             spec_decode_metadata.tree_serial_q1_forward_used
                         ),
+                        "tree_runtime_mode": spec_decode_metadata.tree_runtime_mode,
                         "draft_token_ids_flat": draft_token_ids,
                         "draft_token_ids": draft_token_ids_by_req[req_idx]
                         if draft_token_ids_by_req is not None

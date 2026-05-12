@@ -67,6 +67,7 @@ SpeculativeMethod = Literal[
 ]
 RejectionSampleMethod = Literal["standard", "synthetic"]
 DraftSampleMethod = Literal["greedy", "gumbel"]
+DynamicDraftTreeRuntimeMode = Literal["root_only", "prefix_only", "branching"]
 
 
 @config
@@ -155,6 +156,15 @@ class SpeculativeConfig:
     subtree from the configured speculative token tree using live draft logits.
     Target and draft attention must both use TREE_ATTN so target verification
     logits have tree semantics.
+    """
+    dynamic_draft_tree_runtime_mode: DynamicDraftTreeRuntimeMode = "root_only"
+    """Runtime safety mode for dynamic draft tree verification.
+
+    ``root_only`` carries request-local DDT metadata through the runtime but
+    target-forward/verifier emit only the root target token. ``prefix_only``
+    verifies the dynamic subtree while accepting only the contiguous packed
+    prefix that is already safe in the scheduled KV layout. ``branching``
+    allows non-prefix tree accepts and therefore requires KV/state relocation.
     """
     enable_dynamic_tree_target_mask: bool = False
     """Enable an experimental per-request target-mask path for tree speculation.
@@ -1018,6 +1028,22 @@ class SpeculativeConfig:
                     "enable_dynamic_tree_target_mask currently supports only "
                     "standard greedy rejection sampling."
                 )
+        if (
+            self.dynamic_draft_tree_runtime_mode != "root_only"
+            and not self.enable_dynamic_draft_tree
+        ):
+            raise ValueError(
+                "dynamic_draft_tree_runtime_mode other than root_only requires "
+                "enable_dynamic_draft_tree=True."
+            )
+        if (
+            self.dynamic_draft_tree_runtime_mode == "branching"
+            and not self.enable_tree_spec_decode_kv_relocation
+        ):
+            raise ValueError(
+                "dynamic_draft_tree_runtime_mode='branching' requires "
+                "enable_tree_spec_decode_kv_relocation=True."
+            )
         if self.enable_tree_spec_decode_kv_relocation:
             if self.speculative_token_tree is None:
                 raise ValueError(

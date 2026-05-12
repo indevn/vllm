@@ -219,6 +219,32 @@ def test_verify_dynamic_tree_greedy_accepts_first_matching_path():
     assert output.predicts.tolist() == [[11, 13, 0, 14, 42]]
 
 
+def test_verify_dynamic_tree_greedy_linear_kv_safe_accepts_only_prefix_path():
+    build = build_dynamic_tree(
+        torch.tensor([[0, 0, 2, 0, 0]], dtype=torch.int64),
+        torch.tensor([[0, 1, 2, 4]], dtype=torch.int64),
+        top_k=2,
+        depth=3,
+    )
+    candidates = torch.tensor([[101, 11, 12, 13, 14]], dtype=torch.int64)
+    target_predict = torch.tensor([[11, 13, 99, 14, 42]], dtype=torch.int64)
+
+    output = verify_dynamic_tree_greedy(
+        candidates,
+        build.retrieve_index,
+        build.retrieve_next_token,
+        build.retrieve_next_sibling,
+        target_predict,
+        num_spec_steps=4,
+        linear_kv_safe=True,
+    )
+
+    assert output.accept_token_num.tolist() == [1]
+    assert output.accept_index.tolist() == [[0, 1, 0, 0]]
+    assert output.accept_token.tolist() == [[11, 13, 0, 0]]
+    assert output.predicts.tolist() == [[11, 13, 0, 0, 0]]
+
+
 def test_verify_dynamic_tree_greedy_scans_siblings_and_stops_on_miss():
     build = build_dynamic_tree(
         torch.tensor([[0, 0, 2, 0, 0]], dtype=torch.int64),

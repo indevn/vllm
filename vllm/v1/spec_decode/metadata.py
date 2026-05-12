@@ -73,6 +73,9 @@ class SpecDecodeMetadata:
     # Trace-only marker set by the runner when the serial q1 target forward path
     # actually executes for this batch.
     tree_serial_q1_forward_used: bool = False
+    # Current DDT runtime safety mode. Static TREE_ATTN metadata leaves this as
+    # None; dynamic root-only/prefix-only/branching modes set it explicitly.
+    tree_runtime_mode: str | None = None
 
     def __post_init__(self):
         self.max_spec_len = max(self.num_draft_tokens)

@@ -187,6 +187,26 @@ def test_tree_attn_runtime_bias_applies_dynamic_target_mask():
     assert not torch.isneginf(tree_metadata.tree_attn_bias[1, :, 2]).any()
 
 
+def test_tree_attn_root_only_ignores_runtime_tree_bias():
+    builder = create_tree_attn_builder(
+        speculative_token_tree="[(0,), (1,), (0, 0), (0, 1)]"
+    )
+    full_tree_decode = create_common_attn_metadata(
+        BatchSpec(seq_lens=[20], query_lens=[3]),
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+    full_tree_decode.tree_attn_bias = torch.zeros((1, 3, 3), dtype=torch.float32)
+    full_tree_decode.tree_target_mask = torch.tensor([[1, 0, 1]], dtype=torch.int32)
+    full_tree_decode.tree_root_only = True
+
+    tree_metadata = builder.build(0, full_tree_decode).decode_metadata
+
+    assert tree_metadata is not None
+    assert tree_metadata.tree_attn_bias is None
+    assert tree_metadata.tree_root_only
+
+
 def test_static_tree_retrieve_metadata_marks_linear_chain():
     chain = build_static_tree_retrieve_metadata([(0,), (0, 0)])
     branching = build_static_tree_retrieve_metadata([(0,), (1,)])

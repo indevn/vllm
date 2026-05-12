@@ -310,6 +310,9 @@ class SpecDecodeBaseProposer:
         self._enable_dynamic_tree_target_mask = (
             self.speculative_config.enable_dynamic_tree_target_mask
         )
+        self._dynamic_tree_runtime_mode = (
+            self.speculative_config.dynamic_draft_tree_runtime_mode
+        )
         self._dynamic_tree_last_metadata: (
             list[dict[str, list[int] | list[list[int]] | int | bool] | None] | None
         ) = None
@@ -1364,9 +1367,26 @@ class SpecDecodeBaseProposer:
                         "target_mask_enabled": self._enable_dynamic_tree_target_mask,
                         "num_spec_steps": 1,
                         "tree_valid": False,
+                        "is_dynamic_tree": True,
+                        "is_linear_chain": True,
                     }
                 )
                 continue
+            if self._dynamic_tree_runtime_mode == "prefix_only":
+                best_static_idx = min(
+                    static_scores,
+                    key=lambda idx: (
+                        -len(self.tree_choices[idx - 1]),
+                        -static_scores[idx],
+                        idx,
+                    ),
+                )
+                prefix_path: list[int] = []
+                cur_static_idx = best_static_idx
+                while cur_static_idx > 0:
+                    prefix_path.append(cur_static_idx)
+                    cur_static_idx = parent_for_static.get(cur_static_idx, 0)
+                selected_static_nodes = list(reversed(prefix_path))[:max_selected]
             packed_static_nodes = selected_static_nodes
             static_to_packed = {
                 static_idx: packed_idx + 1
@@ -1430,6 +1450,10 @@ class SpecDecodeBaseProposer:
                     "target_mask_enabled": self._enable_dynamic_tree_target_mask,
                     "num_spec_steps": max_depth + 1,
                     "tree_valid": True,
+                    "is_dynamic_tree": True,
+                    "is_linear_chain": (
+                        self._dynamic_tree_runtime_mode == "prefix_only"
+                    ),
                 }
             )
         return metadata_by_req

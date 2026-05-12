@@ -658,6 +658,7 @@ def test_attach_linear_chain_metadata_enables_serial_q1_forward():
         tree_num_spec_steps=None,
         tree_valid=None,
         tree_linear_kv_safe=False,
+        tree_runtime_mode=None,
         tree_force_single_row_logits=False,
         tree_force_serial_q1_forward=False,
     )
@@ -711,6 +712,7 @@ def test_attach_linear_chain_root_only_skips_serial_q1_forward():
         tree_num_spec_steps=None,
         tree_valid=None,
         tree_linear_kv_safe=False,
+        tree_runtime_mode=None,
         tree_force_single_row_logits=False,
         tree_force_serial_q1_forward=False,
     )
@@ -946,8 +948,93 @@ def test_dynamic_tree_attn_root_only_force_rejects_verify_rows():
     )
     runner.enable_dynamic_draft_tree = True
     runner.enable_dynamic_tree_kv_relocation = True
+    runner.dynamic_draft_tree_runtime_mode = "root_only"
 
     assert runner._should_force_dynamic_tree_attn_root_only()
+
+
+def test_dynamic_tree_attn_prefix_only_does_not_force_reject():
+    runner = object.__new__(GPUModelRunner)
+    runner.drafter = object.__new__(EagleProposer)
+    runner.vllm_config = SimpleNamespace(
+        attention_config=SimpleNamespace(backend=SimpleNamespace(name="TREE_ATTN"))
+    )
+    runner.enable_dynamic_draft_tree = True
+    runner.enable_dynamic_tree_kv_relocation = False
+    runner.dynamic_draft_tree_runtime_mode = "prefix_only"
+
+    assert not runner._should_force_dynamic_tree_attn_root_only()
+
+
+def test_dynamic_tree_prefix_only_keeps_drafts_without_kv_relocation(monkeypatch):
+    runner = object.__new__(GPUModelRunner)
+    runner.num_spec_tokens = 4
+    runner._draft_token_req_ids = ["req_0"]
+    runner.drafter = object.__new__(EagleProposer)
+    runner.drafter.tree_retrieve_metadata = {"is_linear_chain": False}
+    runner.drafter._dynamic_tree_last_draft_token_ids = [[11, 13]]
+    runner.drafter._dynamic_tree_last_metadata = [
+        {
+            "retrieve_index": [0, 1, 2],
+            "retrieve_next_token": [1, 2, -1],
+            "retrieve_next_sibling": [-1, -1, -1],
+            "target_mask": [1, 1, 1],
+            "tree_attn_mask": [[1, 0, 0], [1, 1, 0], [1, 1, 1]],
+            "position_offsets": [0, 1, 2],
+            "selected_static_nodes": [1, 3],
+            "target_mask_enabled": True,
+            "num_spec_steps": 3,
+            "tree_valid": True,
+            "is_dynamic_tree": True,
+        }
+    ]
+    runner.vllm_config = SimpleNamespace(
+        attention_config=SimpleNamespace(backend=SimpleNamespace(name="TREE_ATTN"))
+    )
+    runner.enable_dynamic_draft_tree = True
+    runner.enable_dynamic_tree_kv_relocation = False
+    runner.dynamic_draft_tree_runtime_mode = "prefix_only"
+    monkeypatch.setattr(runner, "_apply_tree_spec_recovery", lambda *args: args[1:])
+
+    draft_token_ids = runner.take_draft_token_ids()
+
+    assert draft_token_ids is not None
+    assert draft_token_ids.draft_token_ids == [[11, 13]]
+    assert draft_token_ids.tree_metadata is not None
+    assert draft_token_ids.tree_metadata["req_0"]["is_dynamic_tree"]
+
+
+def test_dynamic_tree_branching_suppresses_drafts_without_kv_relocation():
+    runner = object.__new__(GPUModelRunner)
+    runner.num_spec_tokens = 4
+    runner._draft_token_req_ids = ["req_0"]
+    runner.drafter = object.__new__(EagleProposer)
+    runner.drafter.tree_retrieve_metadata = {"is_linear_chain": False}
+    runner.drafter._dynamic_tree_last_draft_token_ids = [[11, 13]]
+    runner.drafter._dynamic_tree_last_metadata = [
+        {
+            "retrieve_index": [0, 1, 2],
+            "retrieve_next_token": [1, 2, -1],
+            "retrieve_next_sibling": [-1, -1, -1],
+            "target_mask": [1, 1, 1],
+            "position_offsets": [0, 1, 2],
+            "num_spec_steps": 3,
+            "tree_valid": True,
+            "is_dynamic_tree": True,
+        }
+    ]
+    runner.vllm_config = SimpleNamespace(
+        attention_config=SimpleNamespace(backend=SimpleNamespace(name="TREE_ATTN"))
+    )
+    runner.enable_dynamic_draft_tree = True
+    runner.enable_dynamic_tree_kv_relocation = False
+    runner.dynamic_draft_tree_runtime_mode = "branching"
+
+    draft_token_ids = runner.take_draft_token_ids()
+
+    assert draft_token_ids is not None
+    assert draft_token_ids.draft_token_ids == [[]]
+    assert draft_token_ids.tree_metadata is None
 
 
 def test_root_only_drafter_scheduler_output_keeps_original_scheduler_intact():
@@ -996,6 +1083,9 @@ def test_tree_target_mask_disabled_defaults_to_full_attention_mask():
         tree_num_spec_steps=None,
         tree_valid=None,
         tree_linear_kv_safe=False,
+        tree_runtime_mode=None,
+        tree_force_single_row_logits=False,
+        tree_force_serial_q1_forward=False,
     )
     scheduler_output = SimpleNamespace(
         scheduled_spec_decode_tree_metadata={
@@ -1044,6 +1134,7 @@ def test_tree_target_mask_enabled_preserves_dynamic_mask():
         tree_num_spec_steps=None,
         tree_valid=None,
         tree_linear_kv_safe=False,
+        tree_runtime_mode=None,
     )
     scheduler_output = SimpleNamespace(
         scheduled_spec_decode_tree_metadata={
@@ -1091,6 +1182,7 @@ def test_attach_tree_metadata_builds_runtime_tree_attn_bias():
         tree_num_spec_steps=None,
         tree_valid=None,
         tree_linear_kv_safe=False,
+        tree_runtime_mode=None,
     )
     scheduler_output = SimpleNamespace(
         scheduled_spec_decode_tree_metadata={
@@ -1121,6 +1213,117 @@ def test_attach_tree_metadata_builds_runtime_tree_attn_bias():
     assert torch.isneginf(metadata.tree_attn_bias[0, 2, 1])
     assert metadata.tree_attn_bias[0, 2, 2] == 0
     assert metadata.tree_position_offsets.tolist() == [[0, 1, 1]]
+
+
+def test_attach_dynamic_prefix_only_metadata_marks_kv_safe_runtime_mode():
+    runner = object.__new__(GPUModelRunner)
+    runner.device = torch.device(DEVICE_TYPE)
+    runner.enable_dynamic_tree_kv_relocation = False
+    runner.dynamic_draft_tree_runtime_mode = "prefix_only"
+    metadata = SimpleNamespace(
+        draft_token_ids=torch.tensor([11, 12], device=runner.device),
+        num_draft_tokens=[2],
+        cu_num_draft_tokens=torch.tensor([2], dtype=torch.int32, device=runner.device),
+        cu_num_sampled_tokens=torch.tensor(
+            [3], dtype=torch.int32, device=runner.device
+        ),
+        tree_target_logits_indices=None,
+        tree_retrieve_index=None,
+        tree_retrieve_next_token=None,
+        tree_retrieve_next_sibling=None,
+        tree_target_mask=None,
+        tree_attn_bias=None,
+        tree_position_offsets=None,
+        tree_num_spec_steps=None,
+        tree_valid=None,
+        tree_linear_kv_safe=False,
+        tree_runtime_mode=None,
+    )
+    scheduler_output = SimpleNamespace(
+        scheduled_spec_decode_tree_metadata={
+            "req_0": {
+                "retrieve_index": [0, 1, 2],
+                "retrieve_next_token": [1, 2, -1],
+                "retrieve_next_sibling": [-1, -1, -1],
+                "target_mask": [1, 1, 1],
+                "tree_attn_mask": [[1, 0, 0], [1, 1, 0], [1, 1, 1]],
+                "position_offsets": [0, 1, 2],
+                "target_mask_enabled": True,
+                "num_spec_steps": 3,
+                "tree_valid": True,
+                "is_dynamic_tree": True,
+                "is_linear_chain": True,
+            }
+        }
+    )
+    runner.input_batch = SimpleNamespace(req_ids=["req_0"])
+
+    runner._attach_tree_spec_decode_metadata(
+        metadata,
+        scheduler_output,
+        np.array([3], dtype=np.int32),
+        np.array([2], dtype=np.int32),
+    )
+
+    assert metadata.tree_runtime_mode == "prefix_only"
+    assert metadata.tree_linear_kv_safe
+    assert metadata.tree_force_single_row_logits
+    assert metadata.tree_force_serial_q1_forward
+    assert metadata.tree_target_mask.tolist() == [[1, 1, 1]]
+
+
+def test_attach_dynamic_branching_metadata_can_disable_kv_safe_with_relocation():
+    runner = object.__new__(GPUModelRunner)
+    runner.device = torch.device(DEVICE_TYPE)
+    runner.enable_dynamic_tree_kv_relocation = True
+    runner.dynamic_draft_tree_runtime_mode = "branching"
+    metadata = SimpleNamespace(
+        draft_token_ids=torch.tensor([11, 12], device=runner.device),
+        num_draft_tokens=[2],
+        cu_num_draft_tokens=torch.tensor([2], dtype=torch.int32, device=runner.device),
+        cu_num_sampled_tokens=torch.tensor(
+            [3], dtype=torch.int32, device=runner.device
+        ),
+        tree_target_logits_indices=None,
+        tree_retrieve_index=None,
+        tree_retrieve_next_token=None,
+        tree_retrieve_next_sibling=None,
+        tree_target_mask=None,
+        tree_attn_bias=None,
+        tree_position_offsets=None,
+        tree_num_spec_steps=None,
+        tree_valid=None,
+        tree_linear_kv_safe=True,
+        tree_runtime_mode=None,
+        tree_force_single_row_logits=False,
+        tree_force_serial_q1_forward=False,
+    )
+    scheduler_output = SimpleNamespace(
+        scheduled_spec_decode_tree_metadata={
+            "req_0": {
+                "retrieve_index": [0, 1, 2],
+                "retrieve_next_token": [1, 2, -1],
+                "retrieve_next_sibling": [-1, -1, -1],
+                "target_mask": [1, 1, 1],
+                "position_offsets": [0, 1, 2],
+                "target_mask_enabled": True,
+                "num_spec_steps": 3,
+                "tree_valid": True,
+                "is_dynamic_tree": True,
+            }
+        }
+    )
+    runner.input_batch = SimpleNamespace(req_ids=["req_0"])
+
+    runner._attach_tree_spec_decode_metadata(
+        metadata,
+        scheduler_output,
+        np.array([3], dtype=np.int32),
+        np.array([2], dtype=np.int32),
+    )
+
+    assert metadata.tree_runtime_mode == "branching"
+    assert not metadata.tree_linear_kv_safe
 
 
 def test_apply_tree_position_offsets_keeps_physical_slots_untouched():
