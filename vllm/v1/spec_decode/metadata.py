@@ -76,6 +76,13 @@ class SpecDecodeMetadata:
     # Current DDT runtime safety mode. Static TREE_ATTN metadata leaves this as
     # None; dynamic root-only/prefix-only/branching modes set it explicitly.
     tree_runtime_mode: str | None = None
+    # Correctness candidate: when set, the runner may collapse low-margin tree
+    # outputs to q1-equivalent token emission.
+    tree_near_tie_q1_fallback_threshold: float | None = None
+    tree_near_tie_q1_fallback_applied: list[dict] | None = None
+    # Correctness candidate: after tree verification/relocation, the runner may
+    # q1-recompute accepted rows and overwrite linear target state.
+    tree_serial_accepted_state_repair_applied: list[dict] | None = None
 
     def __post_init__(self):
         self.max_spec_len = max(self.num_draft_tokens)

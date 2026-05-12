@@ -166,7 +166,7 @@ from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.rejection_sampler import RejectionSampler
+from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID, RejectionSampler
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
@@ -390,6 +390,13 @@ class ExecuteModelState(NamedTuple):
     hidden_states: torch.Tensor
     sample_hidden_states: torch.Tensor
     aux_hidden_states: list[torch.Tensor] | None
+    input_ids: torch.Tensor | None
+    positions: torch.Tensor
+    intermediate_tensors: IntermediateTensors | None
+    model_kwargs: dict[str, Any]
+    batch_desc: BatchDescriptor
+    slot_mappings_by_group: dict[int, torch.Tensor] | None
+    has_encoder_input: bool
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
@@ -617,6 +624,14 @@ class GPUModelRunner(
         )
         self.force_tree_attn_single_row_logits_replay = (
             os.environ.get("VLLM_TREE_ATTN_FORCE_SINGLE_ROW_LOGITS_REPLAY") == "1"
+        )
+        self.tree_attn_near_tie_q1_fallback_threshold = (
+            float(os.environ["VLLM_TREE_ATTN_NEAR_TIE_Q1_FALLBACK_THRESHOLD"])
+            if "VLLM_TREE_ATTN_NEAR_TIE_Q1_FALLBACK_THRESHOLD" in os.environ
+            else None
+        )
+        self.tree_attn_serial_accepted_state_repair = (
+            os.environ.get("VLLM_TREE_ATTN_SERIAL_ACCEPTED_STATE_REPAIR") == "1"
         )
         self.enable_tree_attn_linear_chain_multi_token_verify = (
             os.environ.get("VLLM_TREE_ATTN_ENABLE_LINEAR_CHAIN_MULTI_TOKEN_VERIFY")
@@ -3033,6 +3048,9 @@ class GPUModelRunner(
                 runtime_mode != "branching"
                 or not self.enable_dynamic_tree_kv_relocation
             )
+            metadata.tree_near_tie_q1_fallback_threshold = (
+                getattr(self, "tree_attn_near_tie_q1_fallback_threshold", None)
+            )
         else:
             metadata.tree_linear_kv_safe = not self.enable_dynamic_tree_kv_relocation
         if (
@@ -3526,7 +3544,27 @@ class GPUModelRunner(
         accepted_prefix_len_by_req = None
         first_reject_index_by_req = None
         relocation_trace_by_req: dict[int, list[dict[str, int]]] = {}
+        near_tie_q1_fallback_threshold = None
+        near_tie_q1_fallback_by_req: dict[int, list[dict[str, Any]]] = {}
+        serial_repair_by_req: dict[int, list[dict[str, Any]]] = {}
         if spec_decode_metadata is not None:
+            near_tie_q1_fallback_threshold = (
+                spec_decode_metadata.tree_near_tie_q1_fallback_threshold
+            )
+            for fallback_record in (
+                spec_decode_metadata.tree_near_tie_q1_fallback_applied or []
+            ):
+                req_idx = int(fallback_record["req_idx"])
+                near_tie_q1_fallback_by_req.setdefault(req_idx, []).append(
+                    dict(fallback_record)
+                )
+            for repair_record in (
+                spec_decode_metadata.tree_serial_accepted_state_repair_applied or []
+            ):
+                req_idx = int(repair_record["req_idx"])
+                serial_repair_by_req.setdefault(req_idx, []).append(
+                    dict(repair_record)
+                )
             draft_token_ids = self._tensor_trace_list(
                 spec_decode_metadata.draft_token_ids
             )
@@ -3759,6 +3797,15 @@ class GPUModelRunner(
                             spec_decode_metadata.tree_serial_q1_forward_used
                         ),
                         "tree_runtime_mode": spec_decode_metadata.tree_runtime_mode,
+                        "tree_near_tie_q1_fallback_threshold": (
+                            near_tie_q1_fallback_threshold
+                        ),
+                        "tree_near_tie_q1_fallback_applied": (
+                            near_tie_q1_fallback_by_req.get(req_idx, [])
+                        ),
+                        "tree_serial_accepted_state_repair_applied": (
+                            serial_repair_by_req.get(req_idx, [])
+                        ),
                         "draft_token_ids_flat": draft_token_ids,
                         "draft_token_ids": draft_token_ids_by_req[req_idx]
                         if draft_token_ids_by_req is not None
@@ -5600,6 +5647,13 @@ class GPUModelRunner(
             hidden_states,
             sample_hidden_states,
             aux_hidden_states,
+            input_ids,
+            positions,
+            intermediate_tensors,
+            model_kwargs,
+            batch_desc,
+            slot_mappings_by_group,
+            has_encoder_input,
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
@@ -5667,6 +5721,452 @@ class GPUModelRunner(
             and not self.uses_mrope
             and self.uses_xdrope_dim == 0
         )
+
+    @staticmethod
+    def _logits_top2_margin(logits_row: torch.Tensor) -> float:
+        top2 = torch.topk(logits_row.to(torch.float32), k=2).values
+        return float((top2[0] - top2[1]).item())
+
+    def _tree_near_tie_q1_replacement_candidates(
+        self,
+        sampler_output: SamplerOutput,
+        logits: torch.Tensor | None,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> list[dict[str, int | float]]:
+        if (
+            logits is None
+            or spec_decode_metadata is None
+            or not spec_decode_metadata.has_tree_metadata
+            or spec_decode_metadata.tree_near_tie_q1_fallback_threshold is None
+            or spec_decode_metadata.tree_target_logits_indices is None
+            or sampler_output.spec_decode_accept_indices is None
+        ):
+            return []
+        threshold = spec_decode_metadata.tree_near_tie_q1_fallback_threshold
+        accept_indices = sampler_output.spec_decode_accept_indices
+        output_token_ids = sampler_output.sampled_token_ids
+        tree_indices = spec_decode_metadata.tree_target_logits_indices
+        candidates: list[dict[str, int | float]] = []
+        num_reqs = min(accept_indices.shape[0], output_token_ids.shape[0])
+        for req_idx in range(num_reqs):
+            if req_idx >= len(spec_decode_metadata.num_draft_tokens):
+                break
+            if int(spec_decode_metadata.num_draft_tokens[req_idx]) <= 0:
+                continue
+            if (
+                spec_decode_metadata.tree_valid is not None
+                and not bool(spec_decode_metadata.tree_valid[req_idx].item())
+            ):
+                continue
+            row_width = min(accept_indices.shape[1], output_token_ids.shape[1])
+            for output_idx in range(row_width):
+                token_id = int(output_token_ids[req_idx, output_idx].item())
+                if token_id < 0:
+                    break
+                local_idx = int(accept_indices[req_idx, output_idx].item())
+                if local_idx < 0 or local_idx >= tree_indices.shape[1]:
+                    break
+                logits_idx = int(tree_indices[req_idx, local_idx].item())
+                if logits_idx < 0 or logits_idx >= logits.shape[0]:
+                    break
+                margin = self._logits_top2_margin(logits[logits_idx])
+                if margin <= threshold:
+                    candidates.append(
+                        {
+                            "req_idx": req_idx,
+                            "output_idx": output_idx,
+                            "local_idx": local_idx,
+                            "logits_idx": logits_idx,
+                            "margin": margin,
+                        }
+                    )
+                    break
+        return candidates
+
+    def _compute_serial_q1_outputs_for_candidates(
+        self,
+        *,
+        candidates: Sequence[dict[str, int | float]],
+        spec_decode_common_attn_metadata: CommonAttentionMetadata,
+        input_ids: torch.Tensor,
+        logits_indices: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None,
+        model_kwargs: dict[str, Any],
+        batch_desc: BatchDescriptor,
+        slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,
+        slot_mappings_by_group: dict[int, torch.Tensor] | None,
+        has_encoder_input: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor] | None]:
+        req_indices = [int(candidate["req_idx"]) for candidate in candidates]
+        global_token_indices = [
+            int(logits_indices[int(candidate["logits_idx"])].item())
+            for candidate in candidates
+        ]
+        serial_attn_metadata = self._build_serial_q1_attn_metadata_for_rows(
+            spec_decode_common_attn_metadata,
+            slot_mappings_by_group,
+            req_indices,
+            local_token_idx=0,
+            global_token_indices=global_token_indices,
+        )
+        token_indices = torch.tensor(
+            global_token_indices,
+            dtype=torch.long,
+            device=input_ids.device,
+        )
+        serial_slot_mappings = self._slice_slot_mappings_for_indices(
+            slot_mappings,
+            token_indices,
+        )
+        serial_batch_desc = replace(
+            batch_desc,
+            num_tokens=len(global_token_indices),
+            num_reqs=len(req_indices),
+            uniform=True,
+        )
+        with set_forward_context(
+            serial_attn_metadata,
+            self.vllm_config,
+            num_tokens=len(global_token_indices),
+            num_tokens_across_dp=None,
+            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            batch_descriptor=serial_batch_desc,
+            ubatch_slices=None,
+            slot_mapping=serial_slot_mappings,
+            skip_compiled=has_encoder_input,
+        ):
+            row_output = self._model_forward(
+                input_ids=input_ids[token_indices],
+                positions=positions[token_indices],
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=None,
+                **model_kwargs,
+            )
+        if self.use_aux_hidden_state_outputs:
+            row_hidden, row_aux_hidden = row_output
+        else:
+            row_hidden = row_output
+            row_aux_hidden = None
+        return row_hidden, row_aux_hidden, self.model.compute_logits(row_hidden)
+
+    def _tree_accepted_state_repair_rows(
+        self,
+        sampler_output: SamplerOutput,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+        spec_decode_common_attn_metadata: CommonAttentionMetadata | None,
+    ) -> list[dict[str, int]]:
+        if (
+            spec_decode_metadata is None
+            or spec_decode_common_attn_metadata is None
+            or not spec_decode_metadata.has_tree_metadata
+            or spec_decode_metadata.tree_linear_kv_safe
+            or spec_decode_metadata.tree_target_logits_indices is None
+            or sampler_output.spec_decode_accept_indices is None
+        ):
+            return []
+
+        accept_indices = sampler_output.spec_decode_accept_indices
+        output_token_ids = sampler_output.sampled_token_ids
+        tree_indices = spec_decode_metadata.tree_target_logits_indices
+        query_start_loc_cpu = spec_decode_common_attn_metadata.query_start_loc_cpu
+        rows: list[dict[str, int]] = []
+        num_reqs = min(
+            output_token_ids.shape[0],
+            accept_indices.shape[0],
+            tree_indices.shape[0],
+            len(spec_decode_metadata.num_draft_tokens),
+        )
+        for req_idx in range(num_reqs):
+            if int(spec_decode_metadata.num_draft_tokens[req_idx]) <= 0:
+                continue
+            row_start = int(query_start_loc_cpu[req_idx].item())
+            row_end = int(query_start_loc_cpu[req_idx + 1].item())
+            row_width = row_end - row_start
+            if row_width <= 1:
+                continue
+            max_outputs = min(
+                output_token_ids.shape[1],
+                accept_indices.shape[1],
+                tree_indices.shape[1],
+                row_width,
+            )
+            for output_idx in range(max_outputs):
+                token_id = int(output_token_ids[req_idx, output_idx].item())
+                if token_id < 0:
+                    break
+                local_idx = int(accept_indices[req_idx, output_idx].item())
+                if local_idx < 0 or local_idx >= tree_indices.shape[1]:
+                    break
+                source_logits_idx = int(tree_indices[req_idx, local_idx].item())
+                if source_logits_idx < 0:
+                    break
+                rows.append(
+                    {
+                        "req_idx": req_idx,
+                        "output_idx": output_idx,
+                        "local_idx": local_idx,
+                        "source_logits_idx": source_logits_idx,
+                        "linear_input_idx": row_start + output_idx,
+                    }
+                )
+        return rows
+
+    def _compute_serial_q1_outputs_for_global_indices(
+        self,
+        *,
+        rows: Sequence[dict[str, int]],
+        local_token_idx: int,
+        spec_decode_common_attn_metadata: CommonAttentionMetadata,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None,
+        model_kwargs: dict[str, Any],
+        batch_desc: BatchDescriptor,
+        slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,
+        slot_mappings_by_group: dict[int, torch.Tensor] | None,
+        has_encoder_input: bool,
+    ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
+        req_indices = [int(row["req_idx"]) for row in rows]
+        global_token_indices = [int(row["linear_input_idx"]) for row in rows]
+        serial_attn_metadata = self._build_serial_q1_attn_metadata_for_rows(
+            spec_decode_common_attn_metadata,
+            slot_mappings_by_group,
+            req_indices,
+            local_token_idx=local_token_idx,
+            global_token_indices=global_token_indices,
+        )
+        token_indices = torch.tensor(
+            global_token_indices,
+            dtype=torch.long,
+            device=input_ids.device,
+        )
+        serial_slot_mappings = self._slice_slot_mappings_for_indices(
+            slot_mappings,
+            token_indices,
+        )
+        serial_batch_desc = replace(
+            batch_desc,
+            num_tokens=len(global_token_indices),
+            num_reqs=len(req_indices),
+            uniform=True,
+        )
+        with set_forward_context(
+            serial_attn_metadata,
+            self.vllm_config,
+            num_tokens=len(global_token_indices),
+            num_tokens_across_dp=None,
+            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            batch_descriptor=serial_batch_desc,
+            ubatch_slices=None,
+            slot_mapping=serial_slot_mappings,
+            skip_compiled=has_encoder_input,
+        ):
+            row_output = self._model_forward(
+                input_ids=input_ids[token_indices],
+                positions=positions[token_indices],
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=None,
+                **model_kwargs,
+            )
+        if self.use_aux_hidden_state_outputs:
+            row_hidden, row_aux_hidden = row_output
+        else:
+            row_hidden = row_output
+            row_aux_hidden = None
+        return row_hidden, row_aux_hidden
+
+    def _maybe_apply_tree_serial_accepted_state_repair(
+        self,
+        *,
+        sampler_output: SamplerOutput,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+        spec_decode_common_attn_metadata: CommonAttentionMetadata | None,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor | None,
+        sample_hidden_states: torch.Tensor | None,
+        aux_hidden_states: list[torch.Tensor] | None,
+        intermediate_tensors: IntermediateTensors | None,
+        model_kwargs: dict[str, Any],
+        batch_desc: BatchDescriptor,
+        slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,
+        slot_mappings_by_group: dict[int, torch.Tensor] | None,
+        has_encoder_input: bool,
+    ) -> None:
+        if (
+            not getattr(self, "tree_attn_serial_accepted_state_repair", False)
+            or input_ids is None
+            or hidden_states is None
+            or sample_hidden_states is None
+        ):
+            return
+        repair_rows = self._tree_accepted_state_repair_rows(
+            sampler_output,
+            spec_decode_metadata,
+            spec_decode_common_attn_metadata,
+        )
+        if not repair_rows or spec_decode_common_attn_metadata is None:
+            return
+
+        # Later accepted rows attend to earlier accepted linear rows, so replay
+        # them in output order instead of batching the entire accepted path.
+        applied: list[dict[str, int]] = []
+        for row in repair_rows:
+            row_hidden, row_aux_hidden = (
+                self._compute_serial_q1_outputs_for_global_indices(
+                    rows=[row],
+                    local_token_idx=int(row["output_idx"]),
+                    spec_decode_common_attn_metadata=spec_decode_common_attn_metadata,
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    model_kwargs=model_kwargs,
+                    batch_desc=batch_desc,
+                    slot_mappings=slot_mappings,
+                    slot_mappings_by_group=slot_mappings_by_group,
+                    has_encoder_input=has_encoder_input,
+                )
+            )
+            input_idx = int(row["linear_input_idx"])
+            source_logits_idx = int(row["source_logits_idx"])
+            hidden_states[input_idx].copy_(row_hidden[0])
+            if source_logits_idx < sample_hidden_states.shape[0]:
+                sample_hidden_states[source_logits_idx].copy_(row_hidden[0])
+            if aux_hidden_states is not None and row_aux_hidden is not None:
+                for aux_hidden, aux_repair in zip(aux_hidden_states, row_aux_hidden):
+                    aux_hidden[input_idx].copy_(aux_repair[0])
+            applied.append(dict(row))
+
+        assert spec_decode_metadata is not None
+        spec_decode_metadata.tree_serial_accepted_state_repair_applied = applied
+
+    def _maybe_apply_tree_near_tie_q1_fallback(
+        self,
+        *,
+        sampler_output: SamplerOutput,
+        logits: torch.Tensor | None,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+        spec_decode_common_attn_metadata: CommonAttentionMetadata | None,
+        input_ids: torch.Tensor | None,
+        logits_indices: torch.Tensor,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor | None,
+        sample_hidden_states: torch.Tensor | None,
+        aux_hidden_states: list[torch.Tensor] | None,
+        intermediate_tensors: IntermediateTensors | None,
+        model_kwargs: dict[str, Any],
+        batch_desc: BatchDescriptor,
+        slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,
+        slot_mappings_by_group: dict[int, torch.Tensor] | None,
+        has_encoder_input: bool,
+    ) -> SamplerOutput:
+        candidates = self._tree_near_tie_q1_replacement_candidates(
+            sampler_output,
+            logits,
+            spec_decode_metadata,
+        )
+        if (
+            not candidates
+            or spec_decode_metadata is None
+            or logits is None
+        ):
+            return sampler_output
+
+        root_candidates = [
+            candidate for candidate in candidates if int(candidate["output_idx"]) == 0
+        ]
+        applied: list[dict[str, int | float | str]] = []
+        if (
+            root_candidates
+            and spec_decode_common_attn_metadata is not None
+            and input_ids is not None
+        ):
+            (
+                serial_hidden_states,
+                serial_aux_hidden_states,
+                serial_logits,
+            ) = self._compute_serial_q1_outputs_for_candidates(
+                candidates=root_candidates,
+                spec_decode_common_attn_metadata=spec_decode_common_attn_metadata,
+                input_ids=input_ids,
+                logits_indices=logits_indices,
+                positions=positions,
+                intermediate_tensors=intermediate_tensors,
+                model_kwargs=model_kwargs,
+                batch_desc=batch_desc,
+                slot_mappings=slot_mappings,
+                slot_mappings_by_group=slot_mappings_by_group,
+                has_encoder_input=has_encoder_input,
+            )
+            for row_idx, candidate in enumerate(root_candidates):
+                logits_idx = int(candidate["logits_idx"])
+                req_idx = int(candidate["req_idx"])
+                input_idx = int(logits_indices[logits_idx].item())
+                candidate["input_idx"] = input_idx
+                logits[logits_idx].copy_(serial_logits[row_idx])
+                if hidden_states is not None and input_idx < hidden_states.shape[0]:
+                    hidden_states[input_idx].copy_(serial_hidden_states[row_idx])
+                if (
+                    sample_hidden_states is not None
+                    and logits_idx < sample_hidden_states.shape[0]
+                ):
+                    sample_hidden_states[logits_idx].copy_(
+                        serial_hidden_states[row_idx]
+                    )
+                if (
+                    aux_hidden_states is not None
+                    and serial_aux_hidden_states is not None
+                ):
+                    for aux_hidden, serial_aux_hidden in zip(
+                        aux_hidden_states, serial_aux_hidden_states
+                    ):
+                        if input_idx < aux_hidden.shape[0]:
+                            aux_hidden[input_idx].copy_(serial_aux_hidden[row_idx])
+                token_id = int(serial_logits[row_idx].argmax(dim=-1).item())
+                q1_top_token_ids, q1_top_values, q1_top_margins = (
+                    self._logits_topk_trace(
+                        serial_logits[row_idx : row_idx + 1],
+                        k=5,
+                    )
+                )
+                sampler_output.sampled_token_ids[req_idx].fill_(PLACEHOLDER_TOKEN_ID)
+                sampler_output.sampled_token_ids[req_idx, 0] = token_id
+                if sampler_output.spec_decode_accept_indices is not None:
+                    sampler_output.spec_decode_accept_indices[req_idx].fill_(
+                        PLACEHOLDER_TOKEN_ID
+                    )
+                    sampler_output.spec_decode_accept_indices[req_idx, 0] = 0
+                applied.append(
+                    {
+                        **candidate,
+                        "fallback": "root_q1",
+                        "q1_token_id": token_id,
+                        "q1_top_token_ids": q1_top_token_ids[0]
+                        if q1_top_token_ids
+                        else [],
+                        "q1_top_values": q1_top_values[0] if q1_top_values else [],
+                        "q1_margin": q1_top_margins[0] if q1_top_margins else None,
+                    }
+                )
+
+        for candidate in candidates:
+            output_idx = int(candidate["output_idx"])
+            if output_idx == 0:
+                continue
+            req_idx = int(candidate["req_idx"])
+            sampler_output.sampled_token_ids[req_idx, output_idx:].fill_(
+                PLACEHOLDER_TOKEN_ID
+            )
+            if sampler_output.spec_decode_accept_indices is not None:
+                sampler_output.spec_decode_accept_indices[req_idx, output_idx:].fill_(
+                    PLACEHOLDER_TOKEN_ID
+                )
+            applied.append({**candidate, "fallback": "truncate_before_near_tie"})
+
+        if applied:
+            spec_decode_metadata.tree_near_tie_q1_fallback_applied = applied
+        return sampler_output
 
     def _slice_slot_mappings_for_token(
         self,
@@ -6035,6 +6535,13 @@ class GPUModelRunner(
             hidden_states,
             sample_hidden_states,
             aux_hidden_states,
+            input_ids,
+            positions,
+            intermediate_tensors,
+            model_kwargs,
+            batch_desc,
+            slot_mappings_by_group,
+            has_encoder_input,
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
@@ -6050,6 +6557,24 @@ class GPUModelRunner(
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+            sampler_output = self._maybe_apply_tree_near_tie_q1_fallback(
+                sampler_output=sampler_output,
+                logits=logits,
+                spec_decode_metadata=spec_decode_metadata,
+                spec_decode_common_attn_metadata=spec_decode_common_attn_metadata,
+                input_ids=input_ids,
+                logits_indices=logits_indices,
+                positions=positions,
+                hidden_states=hidden_states,
+                sample_hidden_states=sample_hidden_states,
+                aux_hidden_states=aux_hidden_states,
+                intermediate_tensors=intermediate_tensors,
+                model_kwargs=model_kwargs,
+                batch_desc=batch_desc,
+                slot_mappings=slot_mappings,
+                slot_mappings_by_group=slot_mappings_by_group,
+                has_encoder_input=has_encoder_input,
+            )
 
         self._maybe_dump_spec_verify_state_trace(
             scheduler_output=scheduler_output,
@@ -6072,6 +6597,22 @@ class GPUModelRunner(
             aux_hidden_states,
         )
         self._maybe_relocate_dynamic_tree_kv(sampler_output, spec_decode_metadata)
+        self._maybe_apply_tree_serial_accepted_state_repair(
+            sampler_output=sampler_output,
+            spec_decode_metadata=spec_decode_metadata,
+            spec_decode_common_attn_metadata=spec_decode_common_attn_metadata,
+            input_ids=input_ids,
+            positions=positions,
+            hidden_states=hidden_states,
+            sample_hidden_states=sample_hidden_states,
+            aux_hidden_states=aux_hidden_states,
+            intermediate_tensors=intermediate_tensors,
+            model_kwargs=model_kwargs,
+            batch_desc=batch_desc,
+            slot_mappings=slot_mappings,
+            slot_mappings_by_group=slot_mappings_by_group,
+            has_encoder_input=has_encoder_input,
+        )
         self._mark_tree_spec_recovery_after_reject(
             sampler_output,
             spec_decode_metadata,

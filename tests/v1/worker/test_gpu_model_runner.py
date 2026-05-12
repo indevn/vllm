@@ -40,6 +40,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.worker.gpu_input_batch import InputBatch
@@ -1372,6 +1373,278 @@ def test_tree_attn_bias_keeps_no_draft_rows_visible_in_mixed_batch():
         ],
     ]
     assert metadata.tree_valid.tolist() == [False, True]
+
+
+def test_tree_near_tie_fallback_truncates_before_non_root_tie():
+    runner = object.__new__(GPUModelRunner)
+    logits = torch.tensor(
+        [
+            [10.0, 0.0, 0.0],
+            [0.0, 7.0, 7.0],
+            [0.0, 0.0, 8.0],
+        ]
+    )
+    metadata = SpecDecodeMetadata.make_dummy(
+        [[1, 2]], device=torch.device("cpu")
+    )
+    metadata.tree_target_logits_indices = torch.arange(
+        3, dtype=torch.int32
+    ).view(1, 3)
+    metadata.tree_retrieve_index = torch.arange(3, dtype=torch.int32).view(1, 3)
+    metadata.tree_retrieve_next_token = torch.tensor(
+        [[1, 2, -1]], dtype=torch.int32
+    )
+    metadata.tree_retrieve_next_sibling = torch.tensor(
+        [[-1, -1, -1]], dtype=torch.int32
+    )
+    metadata.tree_num_spec_steps = 3
+    metadata.tree_near_tie_q1_fallback_threshold = 0.0
+    sampler_output = SamplerOutput(
+        sampled_token_ids=torch.tensor([[1, 2, -1]], dtype=torch.int32),
+        logprobs_tensors=None,
+        spec_decode_accept_indices=torch.tensor([[0, 1, -1]], dtype=torch.int32),
+    )
+
+    output = runner._maybe_apply_tree_near_tie_q1_fallback(
+        sampler_output=sampler_output,
+        logits=logits,
+        spec_decode_metadata=metadata,
+        spec_decode_common_attn_metadata=None,
+        input_ids=None,
+        logits_indices=torch.arange(3),
+        positions=torch.empty(0),
+        hidden_states=None,
+        sample_hidden_states=None,
+        aux_hidden_states=None,
+        intermediate_tensors=None,
+        model_kwargs={},
+        batch_desc=SimpleNamespace(),
+        slot_mappings=None,
+        slot_mappings_by_group=None,
+        has_encoder_input=False,
+    )
+
+    assert output.sampled_token_ids.tolist() == [[1, PLACEHOLDER_TOKEN_ID, -1]]
+    assert output.spec_decode_accept_indices is not None
+    assert output.spec_decode_accept_indices.tolist() == [
+        [0, PLACEHOLDER_TOKEN_ID, -1]
+    ]
+    assert metadata.tree_near_tie_q1_fallback_applied == [
+        {
+            "fallback": "truncate_before_near_tie",
+            "logits_idx": 1,
+            "local_idx": 1,
+            "margin": 0.0,
+            "output_idx": 1,
+            "req_idx": 0,
+        }
+    ]
+
+
+def test_tree_near_tie_root_fallback_replaces_output_and_state(monkeypatch):
+    runner = object.__new__(GPUModelRunner)
+    logits = torch.tensor(
+        [
+            [1.0, 1.0, 0.0],
+            [0.0, 3.0, 0.0],
+        ]
+    )
+    metadata = SpecDecodeMetadata.make_dummy([[1]], device=torch.device("cpu"))
+    metadata.tree_target_logits_indices = torch.arange(
+        2, dtype=torch.int32
+    ).view(1, 2)
+    metadata.tree_retrieve_index = torch.arange(2, dtype=torch.int32).view(1, 2)
+    metadata.tree_retrieve_next_token = torch.tensor([[1, -1]], dtype=torch.int32)
+    metadata.tree_retrieve_next_sibling = torch.tensor([[-1, -1]], dtype=torch.int32)
+    metadata.tree_num_spec_steps = 2
+    metadata.tree_near_tie_q1_fallback_threshold = 0.0
+    sampler_output = SamplerOutput(
+        sampled_token_ids=torch.tensor([[0, -1]], dtype=torch.int32),
+        logprobs_tensors=None,
+        spec_decode_accept_indices=torch.tensor([[0, -1]], dtype=torch.int32),
+    )
+    hidden_states = torch.zeros((2, 4))
+    sample_hidden_states = hidden_states.clone()
+    aux_hidden_states = [torch.zeros((2, 4))]
+    serial_hidden = torch.full((1, 4), 2.0)
+    serial_aux_hidden = [torch.full((1, 4), 3.0)]
+    serial_logits = torch.tensor([[0.0, 5.0, 1.0]])
+
+    def fake_serial_outputs(**kwargs):
+        return serial_hidden, serial_aux_hidden, serial_logits
+
+    monkeypatch.setattr(
+        runner,
+        "_compute_serial_q1_outputs_for_candidates",
+        fake_serial_outputs,
+    )
+
+    output = runner._maybe_apply_tree_near_tie_q1_fallback(
+        sampler_output=sampler_output,
+        logits=logits,
+        spec_decode_metadata=metadata,
+        spec_decode_common_attn_metadata=SimpleNamespace(),
+        input_ids=torch.tensor([10, 11]),
+        logits_indices=torch.arange(2),
+        positions=torch.arange(2),
+        hidden_states=hidden_states,
+        sample_hidden_states=sample_hidden_states,
+        aux_hidden_states=aux_hidden_states,
+        intermediate_tensors=None,
+        model_kwargs={},
+        batch_desc=SimpleNamespace(),
+        slot_mappings=None,
+        slot_mappings_by_group=None,
+        has_encoder_input=False,
+    )
+
+    assert output.sampled_token_ids.tolist() == [[1, PLACEHOLDER_TOKEN_ID]]
+    assert output.spec_decode_accept_indices is not None
+    assert output.spec_decode_accept_indices.tolist() == [[0, PLACEHOLDER_TOKEN_ID]]
+    assert logits[0].tolist() == [0.0, 5.0, 1.0]
+    assert hidden_states[0].tolist() == [2.0, 2.0, 2.0, 2.0]
+    assert sample_hidden_states[0].tolist() == [2.0, 2.0, 2.0, 2.0]
+    assert aux_hidden_states[0][0].tolist() == [3.0, 3.0, 3.0, 3.0]
+    assert metadata.tree_near_tie_q1_fallback_applied == [
+        {
+            "fallback": "root_q1",
+            "input_idx": 0,
+            "logits_idx": 0,
+            "local_idx": 0,
+            "margin": 0.0,
+            "output_idx": 0,
+            "q1_margin": 4.0,
+            "q1_token_id": 1,
+            "q1_top_token_ids": [1, 2, 0],
+            "q1_top_values": [5.0, 1.0, 0.0],
+            "req_idx": 0,
+        }
+    ]
+
+
+def test_tree_near_tie_fallback_ignores_no_draft_rows():
+    runner = object.__new__(GPUModelRunner)
+    logits = torch.tensor(
+        [
+            [1.0, 1.0, 0.0],
+            [0.0, 3.0, 0.0],
+        ]
+    )
+    metadata = SpecDecodeMetadata.make_dummy([[], [1]], device=torch.device("cpu"))
+    metadata.tree_target_logits_indices = torch.arange(
+        4, dtype=torch.int32
+    ).view(2, 2)
+    metadata.tree_retrieve_index = torch.arange(4, dtype=torch.int32).view(2, 2)
+    metadata.tree_retrieve_next_token = torch.tensor(
+        [[-1, -1], [1, -1]], dtype=torch.int32
+    )
+    metadata.tree_retrieve_next_sibling = torch.tensor(
+        [[-1, -1], [-1, -1]], dtype=torch.int32
+    )
+    metadata.tree_num_spec_steps = 2
+    metadata.tree_near_tie_q1_fallback_threshold = 0.0
+    sampler_output = SamplerOutput(
+        sampled_token_ids=torch.tensor([[0, -1], [1, -1]], dtype=torch.int32),
+        logprobs_tensors=None,
+        spec_decode_accept_indices=torch.tensor([[0, -1], [0, -1]], dtype=torch.int32),
+    )
+
+    assert runner._tree_near_tie_q1_replacement_candidates(
+        sampler_output,
+        logits,
+        metadata,
+    ) == []
+
+
+def test_tree_serial_accepted_state_repair_replays_linear_rows(monkeypatch):
+    runner = object.__new__(GPUModelRunner)
+    runner.tree_attn_serial_accepted_state_repair = True
+    metadata = SpecDecodeMetadata.make_dummy([[11, 12, 13]], device=torch.device("cpu"))
+    metadata.tree_target_logits_indices = torch.arange(
+        4, dtype=torch.int32
+    ).view(1, 4)
+    metadata.tree_retrieve_index = torch.arange(4, dtype=torch.int32).view(1, 4)
+    metadata.tree_retrieve_next_token = torch.tensor(
+        [[1, -1, -1, -1]], dtype=torch.int32
+    )
+    metadata.tree_retrieve_next_sibling = torch.tensor(
+        [[-1, 2, 3, -1]], dtype=torch.int32
+    )
+    metadata.tree_num_spec_steps = 3
+    metadata.tree_linear_kv_safe = False
+    sampler_output = SamplerOutput(
+        sampled_token_ids=torch.tensor([[11, 13, -1, -1]], dtype=torch.int32),
+        logprobs_tensors=None,
+        spec_decode_accept_indices=torch.tensor([[0, 2, -1, -1]], dtype=torch.int32),
+    )
+    hidden_states = torch.zeros((4, 4))
+    sample_hidden_states = torch.zeros((4, 4))
+    aux_hidden_states = [torch.zeros((4, 4))]
+    calls = []
+
+    def fake_serial_outputs(**kwargs):
+        row = kwargs["rows"][0]
+        calls.append(
+            {
+                "local_token_idx": kwargs["local_token_idx"],
+                "linear_input_idx": row["linear_input_idx"],
+                "source_logits_idx": row["source_logits_idx"],
+            }
+        )
+        value = float(row["linear_input_idx"] + 10)
+        return torch.full((1, 4), value), [torch.full((1, 4), value + 100)]
+
+    monkeypatch.setattr(
+        runner,
+        "_compute_serial_q1_outputs_for_global_indices",
+        fake_serial_outputs,
+    )
+
+    runner._maybe_apply_tree_serial_accepted_state_repair(
+        sampler_output=sampler_output,
+        spec_decode_metadata=metadata,
+        spec_decode_common_attn_metadata=SimpleNamespace(
+            query_start_loc_cpu=torch.tensor([0, 4], dtype=torch.int32)
+        ),
+        input_ids=torch.tensor([100, 101, 102, 103]),
+        positions=torch.arange(4),
+        hidden_states=hidden_states,
+        sample_hidden_states=sample_hidden_states,
+        aux_hidden_states=aux_hidden_states,
+        intermediate_tensors=None,
+        model_kwargs={},
+        batch_desc=SimpleNamespace(),
+        slot_mappings=None,
+        slot_mappings_by_group=None,
+        has_encoder_input=False,
+    )
+
+    assert calls == [
+        {"local_token_idx": 0, "linear_input_idx": 0, "source_logits_idx": 0},
+        {"local_token_idx": 1, "linear_input_idx": 1, "source_logits_idx": 2},
+    ]
+    assert hidden_states[0].tolist() == [10.0, 10.0, 10.0, 10.0]
+    assert hidden_states[1].tolist() == [11.0, 11.0, 11.0, 11.0]
+    assert sample_hidden_states[0].tolist() == [10.0, 10.0, 10.0, 10.0]
+    assert sample_hidden_states[2].tolist() == [11.0, 11.0, 11.0, 11.0]
+    assert aux_hidden_states[0][0].tolist() == [110.0, 110.0, 110.0, 110.0]
+    assert aux_hidden_states[0][1].tolist() == [111.0, 111.0, 111.0, 111.0]
+    assert metadata.tree_serial_accepted_state_repair_applied == [
+        {
+            "linear_input_idx": 0,
+            "local_idx": 0,
+            "output_idx": 0,
+            "req_idx": 0,
+            "source_logits_idx": 0,
+        },
+        {
+            "linear_input_idx": 1,
+            "local_idx": 2,
+            "output_idx": 1,
+            "req_idx": 0,
+            "source_logits_idx": 2,
+        },
+    ]
 
 
 def test_tree_target_mask_enabled_preserves_dynamic_mask():
