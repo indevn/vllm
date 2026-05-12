@@ -1,0 +1,16 @@
+{"id":"code_short_0","prompt":"Write a Python function that merges two sorted lists and"}
+{"id":"code_short_1","prompt":"In Rust, an iterator adapter that filters even numbers should"}
+{"id":"code_short_2","prompt":"Explain the difference between a mutex and an atomic counter in"}
+{"id":"code_short_3","prompt":"A SQL query for counting users by country would"}
+{"id":"math_short_0","prompt":"If a matrix has orthonormal columns, then multiplying by its transpose"}
+{"id":"math_short_1","prompt":"The derivative of sin(x) times exp(x) is"}
+{"id":"math_short_2","prompt":"A probability distribution must sum to one because"}
+{"id":"math_short_3","prompt":"To solve a linear system with Gaussian elimination, first"}
+{"id":"natural_short_0","prompt":"A careful summary of the meeting should mention"}
+{"id":"natural_short_1","prompt":"The main reason urban gardens are useful is"}
+{"id":"natural_short_2","prompt":"When explaining a hard idea to beginners, it helps to"}
+{"id":"natural_short_3","prompt":"The museum exhibit was memorable because"}
+{"id":"long_context_0","prompt":"The engineering team reviewed the incident report, compared it with deployment logs, and noticed that the first warning appeared before the traffic spike. Based on this information, the most likely next step is"}
+{"id":"long_context_1","prompt":"In a classroom discussion about climate, economics, and public policy, the teacher asked students to separate evidence from opinion. A strong answer would"}
+{"id":"long_context_2","prompt":"A database migration plan should describe backups, rollback steps, validation checks, and communication. The part that reduces operational risk most directly is"}
+{"id":"long_context_3","prompt":"During a code review, one engineer suggested simplifying the abstraction while another argued for future extensibility. The best compromise would"}

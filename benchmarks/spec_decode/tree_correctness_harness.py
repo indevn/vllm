@@ -52,16 +52,35 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_prompts(path: str) -> list[dict[str, str]]:
+def load_prompts(path: str) -> list[dict[str, Any]]:
     prompts = []
     with open(path, encoding="utf-8") as f:
         for line_no, line in enumerate(f, start=1):
             if not line.strip():
                 continue
             item = json.loads(line)
-            if "id" not in item or "prompt" not in item:
-                raise ValueError(f"{path}:{line_no} must contain id and prompt")
-            prompts.append({"id": str(item["id"]), "prompt": str(item["prompt"])})
+            if "id" not in item:
+                raise ValueError(f"{path}:{line_no} must contain id")
+            has_prompt = "prompt" in item
+            has_prompt_tokens = "prompt_token_ids" in item
+            if has_prompt == has_prompt_tokens:
+                raise ValueError(
+                    f"{path}:{line_no} must contain exactly one of prompt "
+                    "or prompt_token_ids"
+                )
+            prompt: str | list[int]
+            if has_prompt_tokens:
+                token_ids = item["prompt_token_ids"]
+                if not isinstance(token_ids, list) or not all(
+                    isinstance(token_id, int) for token_id in token_ids
+                ):
+                    raise ValueError(
+                        f"{path}:{line_no} prompt_token_ids must be list[int]"
+                    )
+                prompt = token_ids
+            else:
+                prompt = str(item["prompt"])
+            prompts.append({"id": str(item["id"]), "prompt": prompt})
     return prompts
 
 
@@ -89,7 +108,7 @@ def request_completion(
     *,
     base_url: str,
     model: str,
-    prompt: str,
+    prompt: str | list[int],
     max_tokens: int,
     temperature: float,
     timeout: float,
@@ -129,7 +148,7 @@ def request_completion(
 
 def request_case_outputs(
     *,
-    prompts: list[dict[str, str]],
+    prompts: list[dict[str, Any]],
     base_url: str,
     model: str,
     max_tokens: int,

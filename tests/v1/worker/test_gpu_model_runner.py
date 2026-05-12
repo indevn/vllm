@@ -619,6 +619,7 @@ def test_linear_tree_attn_verify_defaults_to_root_only_reject():
 
 def test_linear_tree_attn_diagnostic_logits_can_run_single_row():
     runner = object.__new__(GPUModelRunner)
+    runner.force_tree_attn_single_row_logits_replay = False
     calls = []
 
     class FakeModel:
@@ -629,6 +630,41 @@ def test_linear_tree_attn_diagnostic_logits_can_run_single_row():
     runner.model = FakeModel()
     metadata = SimpleNamespace(tree_force_single_row_logits=True)
     hidden_states = torch.arange(12, dtype=torch.float32).view(3, 4)
+
+    logits = runner._compute_sample_logits(hidden_states, metadata)
+
+    assert calls == [(1, 4), (1, 4), (1, 4)]
+    assert torch.equal(logits, hidden_states.sum(dim=-1, keepdim=True))
+
+
+def test_tree_attn_replay_logits_can_force_single_row():
+    runner = object.__new__(GPUModelRunner)
+    runner.force_tree_attn_single_row_logits_replay = True
+    calls = []
+
+    class FakeModel:
+        def compute_logits(self, hidden_states):
+            calls.append(tuple(hidden_states.shape))
+            return hidden_states.sum(dim=-1, keepdim=True)
+
+    runner.model = FakeModel()
+    metadata = SpecDecodeMetadata.make_dummy(
+        [[11, 12]], device=torch.device(DEVICE_TYPE)
+    )
+    metadata.tree_target_logits_indices = torch.arange(
+        3, dtype=torch.int32, device=DEVICE_TYPE
+    ).view(1, 3)
+    metadata.tree_retrieve_index = torch.arange(
+        3, dtype=torch.int32, device=DEVICE_TYPE
+    ).view(1, 3)
+    metadata.tree_retrieve_next_token = torch.tensor(
+        [[1, 2, -1]], dtype=torch.int32, device=DEVICE_TYPE
+    )
+    metadata.tree_retrieve_next_sibling = torch.tensor(
+        [[-1, -1, -1]], dtype=torch.int32, device=DEVICE_TYPE
+    )
+    metadata.tree_num_spec_steps = 3
+    hidden_states = torch.arange(12, dtype=torch.float32, device=DEVICE_TYPE).view(3, 4)
 
     logits = runner._compute_sample_logits(hidden_states, metadata)
 
@@ -827,6 +863,43 @@ def test_serial_q1_forward_allows_multi_request_batches(monkeypatch):
     )
     spec_decode_metadata = SimpleNamespace(tree_force_serial_q1_forward=True)
     common_metadata = SimpleNamespace(num_reqs=2, num_actual_tokens=6)
+
+    assert runner._should_use_tree_serial_q1_forward(
+        spec_decode_metadata,
+        common_metadata,
+    )
+
+
+def test_tree_attn_replay_can_force_serial_q1_forward(monkeypatch):
+    runner = object.__new__(GPUModelRunner)
+    runner.force_tree_attn_serial_q1_replay = True
+    runner.broadcast_pp_output = False
+    runner.is_pooling_model = False
+    runner.enable_prompt_embeds = False
+    runner.supports_mm_inputs = False
+    runner.uses_mrope = False
+    runner.uses_xdrope_dim = 0
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu_model_runner.get_pp_group",
+        lambda: SimpleNamespace(is_last_rank=True),
+    )
+    spec_decode_metadata = SpecDecodeMetadata.make_dummy(
+        [[11, 12]], device=torch.device(DEVICE_TYPE)
+    )
+    spec_decode_metadata.tree_target_logits_indices = torch.arange(
+        3, dtype=torch.int32, device=DEVICE_TYPE
+    ).view(1, 3)
+    spec_decode_metadata.tree_retrieve_index = torch.arange(
+        3, dtype=torch.int32, device=DEVICE_TYPE
+    ).view(1, 3)
+    spec_decode_metadata.tree_retrieve_next_token = torch.tensor(
+        [[1, 2, -1]], dtype=torch.int32, device=DEVICE_TYPE
+    )
+    spec_decode_metadata.tree_retrieve_next_sibling = torch.tensor(
+        [[-1, -1, -1]], dtype=torch.int32, device=DEVICE_TYPE
+    )
+    spec_decode_metadata.tree_num_spec_steps = 3
+    common_metadata = SimpleNamespace(num_reqs=1, num_actual_tokens=3)
 
     assert runner._should_use_tree_serial_q1_forward(
         spec_decode_metadata,
@@ -1243,6 +1316,62 @@ def test_tree_target_mask_disabled_keeps_tree_visibility_mask():
     assert torch.isfinite(metadata.tree_attn_bias).to(torch.int32).tolist() == [
         [[1, 0, 0], [1, 1, 0], [1, 0, 1]]
     ]
+
+
+def test_tree_attn_bias_keeps_no_draft_rows_visible_in_mixed_batch():
+    runner = object.__new__(GPUModelRunner)
+    runner.device = torch.device(DEVICE_TYPE)
+    metadata = SpecDecodeMetadata.make_dummy(
+        [[], [21, 22, 23]], device=runner.device
+    )
+    scheduler_output = SimpleNamespace(
+        scheduled_spec_decode_tree_metadata={
+            "req_1": {
+                "retrieve_index": [0, 1, 2, 3],
+                "retrieve_next_token": [1, -1, -1, -1],
+                "retrieve_next_sibling": [-1, 2, 3, -1],
+                "target_mask": [1, 1, 1, 1],
+                "tree_attn_mask": [
+                    [1, 0, 0, 0],
+                    [1, 1, 0, 0],
+                    [1, 0, 1, 0],
+                    [1, 1, 0, 1],
+                ],
+                "position_offsets": [0, 1, 1, 2],
+                "target_mask_enabled": True,
+                "num_spec_steps": 3,
+                "tree_valid": True,
+                "is_dynamic_tree": True,
+            }
+        }
+    )
+    runner.input_batch = SimpleNamespace(req_ids=["req_0", "req_1"])
+    runner.enable_dynamic_tree_kv_relocation = True
+    runner.dynamic_draft_tree_runtime_mode = "branching"
+
+    runner._attach_tree_spec_decode_metadata(
+        metadata,
+        scheduler_output,
+        np.array([1, 5], dtype=np.int32),
+        np.array([0, 3], dtype=np.int32),
+    )
+
+    assert metadata.tree_attn_bias is not None
+    assert torch.isfinite(metadata.tree_attn_bias).to(torch.int32).tolist() == [
+        [
+            [1, 0, 0, 0],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+        ],
+        [
+            [1, 0, 0, 0],
+            [1, 1, 0, 0],
+            [1, 0, 1, 0],
+            [1, 1, 0, 1],
+        ],
+    ]
+    assert metadata.tree_valid.tolist() == [False, True]
 
 
 def test_tree_target_mask_enabled_preserves_dynamic_mask():

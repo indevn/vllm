@@ -612,6 +612,12 @@ class GPUModelRunner(
         self.spec_verify_state_trace_path = os.environ.get(
             "VLLM_SPEC_VERIFY_STATE_TRACE_PATH"
         )
+        self.force_tree_attn_serial_q1_replay = (
+            os.environ.get("VLLM_TREE_ATTN_FORCE_SERIAL_Q1_REPLAY") == "1"
+        )
+        self.force_tree_attn_single_row_logits_replay = (
+            os.environ.get("VLLM_TREE_ATTN_FORCE_SINGLE_ROW_LOGITS_REPLAY") == "1"
+        )
         self.enable_tree_attn_linear_chain_multi_token_verify = (
             os.environ.get("VLLM_TREE_ATTN_ENABLE_LINEAR_CHAIN_MULTI_TOKEN_VERIFY")
             == "1"
@@ -3005,6 +3011,10 @@ class GPUModelRunner(
 
         if tree_num_spec_steps == 0:
             return
+        if tree_attn_bias is not None:
+            for req_idx, draft_len in enumerate(num_draft_tokens[:batch_size]):
+                if int(draft_len) == 0:
+                    tree_attn_bias[req_idx, 0, 0] = 0
         metadata.tree_target_logits_indices = tree_target_logits_indices
         metadata.tree_retrieve_index = tree_retrieve_index
         metadata.tree_retrieve_next_token = tree_retrieve_next_token
@@ -3502,6 +3512,7 @@ class GPUModelRunner(
         tree_target_mask = None
         tree_position_offsets = None
         tree_attn_bias_mask = None
+        tree_valid = None
         cu_num_draft_tokens = None
         cu_num_sampled_tokens = None
         num_draft_tokens = None
@@ -3547,6 +3558,8 @@ class GPUModelRunner(
                     .cpu()
                     .tolist()
                 )
+            if spec_decode_metadata.tree_valid is not None:
+                tree_valid = spec_decode_metadata.tree_valid.detach().cpu().tolist()
             cu_num_draft_tokens = self._tensor_trace_list(
                 spec_decode_metadata.cu_num_draft_tokens
             )
@@ -3765,6 +3778,9 @@ class GPUModelRunner(
                         else None,
                         "tree_attn_bias_mask": tree_attn_bias_mask[req_idx]
                         if tree_attn_bias_mask is not None
+                        else None,
+                        "tree_valid": tree_valid[req_idx]
+                        if tree_valid is not None
                         else None,
                         "cu_num_draft_tokens": cu_num_draft_tokens,
                         "cu_num_sampled_tokens": cu_num_sampled_tokens,
@@ -5604,7 +5620,13 @@ class GPUModelRunner(
     ) -> torch.Tensor | None:
         if not (
             spec_decode_metadata is not None
-            and spec_decode_metadata.tree_force_single_row_logits
+            and (
+                spec_decode_metadata.tree_force_single_row_logits
+                or (
+                    self.force_tree_attn_single_row_logits_replay
+                    and spec_decode_metadata.has_tree_metadata
+                )
+            )
             and not getattr(spec_decode_metadata, "force_root_only_forward", False)
             and sample_hidden_states.shape[0] > 1
         ):
@@ -5627,7 +5649,13 @@ class GPUModelRunner(
     ) -> bool:
         return bool(
             spec_decode_metadata is not None
-            and spec_decode_metadata.tree_force_serial_q1_forward
+            and (
+                spec_decode_metadata.tree_force_serial_q1_forward
+                or (
+                    self.force_tree_attn_serial_q1_replay
+                    and spec_decode_metadata.has_tree_metadata
+                )
+            )
             and not getattr(spec_decode_metadata, "force_root_only_forward", False)
             and spec_decode_common_attn_metadata is not None
             and spec_decode_common_attn_metadata.num_actual_tokens > 1
