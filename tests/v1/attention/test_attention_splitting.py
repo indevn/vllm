@@ -215,6 +215,20 @@ def test_static_tree_retrieve_metadata_marks_linear_chain():
     assert not branching["is_linear_chain"]
 
 
+def test_static_tree_retrieve_metadata_builds_branch_visibility_mask():
+    metadata = build_static_tree_retrieve_metadata(
+        [(0,), (1,), (0, 0), (0, 1)]
+    )
+
+    assert metadata["tree_attn_mask"] == [
+        [1, 0, 0, 0, 0],
+        [1, 1, 0, 0, 0],
+        [1, 0, 1, 0, 0],
+        [1, 1, 0, 1, 0],
+        [1, 1, 0, 0, 1],
+    ]
+
+
 @pytest.fixture
 def sample_query_start_loc():
     """Sample query_start_loc tensor for testing"""

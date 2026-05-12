@@ -630,7 +630,7 @@ class GPUModelRunner(
         if (
             self.speculative_config is not None
             and hasattr(self, "drafter")
-            and self._should_suppress_tree_attn_draft_tokens()
+            and self._should_disable_aux_hidden_state_outputs_for_tree_attn()
         ):
             self.use_aux_hidden_state_outputs = False
         self._tree_spec_recovery_req_ids: set[str] = set()
@@ -2813,6 +2813,42 @@ class GPUModelRunner(
         ) or tree_metadata is not None
         return bool(has_tree_metadata and not self.enable_dynamic_tree_kv_relocation)
 
+    def _should_disable_aux_hidden_state_outputs_for_tree_attn(self) -> bool:
+        if not self._should_suppress_tree_attn_draft_tokens():
+            return False
+        # KV relocation support is refreshed only after KV caches are bound. Keep
+        # EAGLE3 auxiliary hidden states enabled when relocation was requested so
+        # the drafter can still run once relocation is confirmed available.
+        return not getattr(self, "enable_tree_spec_decode_kv_relocation", False)
+
+    @staticmethod
+    def _tree_attn_mask_from_retrieve_metadata(
+        retrieve_next_token: Sequence[int],
+        retrieve_next_sibling: Sequence[int],
+        num_nodes: int,
+    ) -> list[list[int]]:
+        parent_by_child = [-1] * num_nodes
+        for parent_idx, first_child in enumerate(retrieve_next_token[:num_nodes]):
+            child_idx = int(first_child)
+            visited: set[int] = set()
+            while 0 <= child_idx < num_nodes and child_idx not in visited:
+                visited.add(child_idx)
+                parent_by_child[child_idx] = parent_idx
+                child_idx = int(retrieve_next_sibling[child_idx])
+
+        tree_attn_mask = [[0] * num_nodes for _ in range(num_nodes)]
+        for local_idx in range(num_nodes):
+            tree_attn_mask[local_idx][0] = 1
+            cur_idx = local_idx
+            visited: set[int] = set()
+            while 0 <= cur_idx < num_nodes and cur_idx not in visited:
+                visited.add(cur_idx)
+                tree_attn_mask[local_idx][cur_idx] = 1
+                if cur_idx == 0:
+                    break
+                cur_idx = parent_by_child[cur_idx]
+        return tree_attn_mask
+
     def _attach_tree_spec_decode_metadata(
         self,
         metadata: SpecDecodeMetadata,
@@ -2932,6 +2968,12 @@ class GPUModelRunner(
                 )
             else:
                 tree_target_mask[req_idx, :num_nodes] = 1
+            if tree_attn_mask is None:
+                tree_attn_mask = self._tree_attn_mask_from_retrieve_metadata(
+                    retrieve_next_token,
+                    retrieve_next_sibling,
+                    num_nodes,
+                )
             if tree_attn_mask is not None:
                 if tree_attn_bias is None:
                     tree_attn_bias = torch.full(
@@ -3268,6 +3310,107 @@ class GPUModelRunner(
             margins,
         )
 
+    def _dynamic_tree_relocation_pairs(
+        self,
+        sampler_output: SamplerOutput,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> list[dict[str, int]]:
+        if (
+            spec_decode_metadata is None
+            or not spec_decode_metadata.has_tree_metadata
+            or spec_decode_metadata.tree_linear_kv_safe
+        ):
+            return []
+        accept_indices = sampler_output.spec_decode_accept_indices
+        if accept_indices is None or accept_indices.shape[-1] <= 1:
+            return []
+
+        num_reqs = min(self.input_batch.num_reqs, accept_indices.shape[0])
+        if num_reqs == 0:
+            return []
+
+        query_start_loc = self.query_start_loc.gpu
+        pairs: list[dict[str, int]] = []
+        for req_idx in range(num_reqs):
+            row_start = int(query_start_loc[req_idx].item())
+            row_end = int(query_start_loc[req_idx + 1].item())
+            row_width = row_end - row_start
+            if row_width <= 1:
+                continue
+            max_outputs = min(accept_indices.shape[1], row_width)
+            for out_pos in range(1, max_outputs):
+                src_local = int(accept_indices[req_idx, out_pos].item())
+                if src_local < 0 or src_local >= row_width:
+                    continue
+                dst_local = out_pos
+                if src_local == dst_local:
+                    continue
+                pairs.append(
+                    {
+                        "req_idx": req_idx,
+                        "src_local": src_local,
+                        "dst_local": dst_local,
+                        "src_index": row_start + src_local,
+                        "dst_index": row_start + dst_local,
+                    }
+                )
+        return pairs
+
+    def _dynamic_tree_sample_relocation_pairs(
+        self,
+        pairs: Sequence[dict[str, int]],
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> list[dict[str, int]]:
+        if (
+            spec_decode_metadata is None
+            or spec_decode_metadata.tree_target_logits_indices is None
+            or not pairs
+        ):
+            return []
+        sample_pairs: list[dict[str, int]] = []
+        tree_indices = spec_decode_metadata.tree_target_logits_indices.detach().cpu()
+        for pair in pairs:
+            req_idx = pair["req_idx"]
+            if req_idx >= tree_indices.shape[0]:
+                continue
+            if (
+                pair["src_local"] >= tree_indices.shape[1]
+                or pair["dst_local"] >= tree_indices.shape[1]
+            ):
+                continue
+            sample_pairs.append(
+                {
+                    **pair,
+                    "src_index": int(tree_indices[req_idx, pair["src_local"]].item()),
+                    "dst_index": int(tree_indices[req_idx, pair["dst_local"]].item()),
+                }
+            )
+        return sample_pairs
+
+    def _dynamic_tree_relocation_trace_by_req(
+        self,
+        sampler_output: SamplerOutput,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+        slot_mapping: torch.Tensor | None,
+    ) -> dict[int, list[dict[str, int]]]:
+        pairs = self._dynamic_tree_relocation_pairs(
+            sampler_output, spec_decode_metadata
+        )
+        by_req: dict[int, list[dict[str, int]]] = defaultdict(list)
+        for pair in pairs:
+            record = dict(pair)
+            if slot_mapping is not None:
+                src_index = pair["src_index"]
+                dst_index = pair["dst_index"]
+                if (
+                    0 <= src_index < slot_mapping.shape[0]
+                    and 0 <= dst_index < slot_mapping.shape[0]
+                ):
+                    record["src_slot"] = int(slot_mapping[src_index].item())
+                    record["dst_slot"] = int(slot_mapping[dst_index].item())
+            by_req[pair["req_idx"]].append(record)
+        return by_req
+
     def _maybe_dump_spec_verify_state_trace(
         self,
         *,
@@ -3371,6 +3514,7 @@ class GPUModelRunner(
         draft_token_ids_by_req = None
         accepted_prefix_len_by_req = None
         first_reject_index_by_req = None
+        relocation_trace_by_req: dict[int, list[dict[str, int]]] = {}
         if spec_decode_metadata is not None:
             draft_token_ids = self._tensor_trace_list(
                 spec_decode_metadata.draft_token_ids
@@ -3501,6 +3645,16 @@ class GPUModelRunner(
                 accepted_prefix_len_by_req.append(accept_prefix)
                 first_reject_index_by_req.append(first_reject)
                 start = end
+            relocation_tensor = (
+                None
+                if slot_mapping is None
+                else torch.tensor(slot_mapping, device=self.device)
+            )
+            relocation_trace_by_req = self._dynamic_tree_relocation_trace_by_req(
+                sampler_output,
+                spec_decode_metadata,
+                relocation_tensor,
+            )
 
         records: list[dict[str, object]] = []
         for req_idx, req_id in enumerate(req_ids):
@@ -3617,6 +3771,9 @@ class GPUModelRunner(
                         "accept_indices": accept_indices[req_idx]
                         if accept_indices is not None
                         else None,
+                        "tree_relocation_pairs": relocation_trace_by_req.get(
+                            req_idx, []
+                        ),
                         "target_argmax_token_ids": target_argmax_by_req[req_idx]
                         if target_argmax_by_req is not None
                         else None,
@@ -3668,14 +3825,11 @@ class GPUModelRunner(
             or not self.enable_dynamic_tree_kv_relocation
         ):
             return
-        accept_indices = sampler_output.spec_decode_accept_indices
-        if accept_indices is None or accept_indices.shape[-1] <= 1:
+        pairs = self._dynamic_tree_relocation_pairs(
+            sampler_output, spec_decode_metadata
+        )
+        if not pairs:
             return
-
-        num_reqs = min(self.input_batch.num_reqs, accept_indices.shape[0])
-        if num_reqs == 0:
-            return
-        query_start_loc = self.query_start_loc.gpu
 
         for group in self._kv_cache_spec_attn_group_iterator():
             if not isinstance(group.kv_cache_spec, AttentionSpec):
@@ -3687,29 +3841,16 @@ class GPUModelRunner(
 
             src_slots: list[torch.Tensor] = []
             dst_slots: list[torch.Tensor] = []
-            for req_idx in range(num_reqs):
-                row_start = int(query_start_loc[req_idx].item())
-                row_end = int(query_start_loc[req_idx + 1].item())
-                row_width = row_end - row_start
-                if row_width <= 1:
+            for pair in pairs:
+                src_slot = slot_mapping[pair["src_index"]]
+                dst_slot = slot_mapping[pair["dst_index"]]
+                if (
+                    int(src_slot.item()) == PAD_SLOT_ID
+                    or int(dst_slot.item()) == PAD_SLOT_ID
+                ):
                     continue
-                max_outputs = min(accept_indices.shape[1], row_width)
-                for out_pos in range(1, max_outputs):
-                    src_local = int(accept_indices[req_idx, out_pos].item())
-                    if src_local < 0 or src_local >= row_width:
-                        continue
-                    dst_local = out_pos
-                    if src_local == dst_local:
-                        continue
-                    src_slot = slot_mapping[row_start + src_local]
-                    dst_slot = slot_mapping[row_start + dst_local]
-                    if (
-                        int(src_slot.item()) == PAD_SLOT_ID
-                        or int(dst_slot.item()) == PAD_SLOT_ID
-                    ):
-                        continue
-                    src_slots.append(src_slot)
-                    dst_slots.append(dst_slot)
+                src_slots.append(src_slot)
+                dst_slots.append(dst_slot)
             if not src_slots:
                 continue
 
@@ -3737,11 +3878,27 @@ class GPUModelRunner(
         sample_hidden_states: torch.Tensor,
         aux_hidden_states: list[torch.Tensor] | None,
     ) -> None:
-        tensors: list[torch.Tensor] = [hidden_states, sample_hidden_states]
+        tensors: list[torch.Tensor] = [hidden_states]
         if aux_hidden_states is not None:
             tensors.extend(aux_hidden_states)
         self._maybe_relocate_dynamic_tree_tensors(
             sampler_output, spec_decode_metadata, tensors
+        )
+        self._maybe_relocate_dynamic_tree_sample_tensors(
+            sampler_output,
+            spec_decode_metadata,
+            [sample_hidden_states],
+        )
+
+    def _maybe_relocate_dynamic_tree_inputs(
+        self,
+        sampler_output: SamplerOutput,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> None:
+        self._maybe_relocate_dynamic_tree_tensors(
+            sampler_output,
+            spec_decode_metadata,
+            [self.input_ids.gpu, self.positions],
         )
 
     def _maybe_relocate_dynamic_tree_tensors(
@@ -3757,25 +3914,42 @@ class GPUModelRunner(
             or not tensors
         ):
             return
-        accept_indices = sampler_output.spec_decode_accept_indices
-        if accept_indices is None or accept_indices.shape[-1] <= 1:
+        pairs = self._dynamic_tree_relocation_pairs(
+            sampler_output, spec_decode_metadata
+        )
+        src_indices = [pair["src_index"] for pair in pairs]
+        dst_indices = [pair["dst_index"] for pair in pairs]
+        if not src_indices:
             return
 
-        num_reqs = min(self.input_batch.num_reqs, accept_indices.shape[0])
-        query_start_loc = self.query_start_loc.gpu
-        src_indices: list[int] = []
-        dst_indices: list[int] = []
-        for req_idx in range(num_reqs):
-            row_start = int(query_start_loc[req_idx].item())
-            row_end = int(query_start_loc[req_idx + 1].item())
-            row_width = row_end - row_start
-            max_outputs = min(accept_indices.shape[1], row_width)
-            for out_pos in range(1, max_outputs):
-                src_local = int(accept_indices[req_idx, out_pos].item())
-                if src_local < 0 or src_local >= row_width or src_local == out_pos:
-                    continue
-                src_indices.append(row_start + src_local)
-                dst_indices.append(row_start + out_pos)
+        src = torch.tensor(src_indices, dtype=torch.long, device=self.device)
+        dst = torch.tensor(dst_indices, dtype=torch.long, device=self.device)
+        for tensor in tensors:
+            if tensor.shape[0] <= int(max(max(src_indices), max(dst_indices))):
+                continue
+            tensor[dst] = tensor[src].clone()
+
+    def _maybe_relocate_dynamic_tree_sample_tensors(
+        self,
+        sampler_output: SamplerOutput,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+        tensors: Sequence[torch.Tensor],
+    ) -> None:
+        if (
+            spec_decode_metadata is None
+            or not spec_decode_metadata.has_tree_metadata
+            or spec_decode_metadata.tree_linear_kv_safe
+            or not tensors
+        ):
+            return
+        pairs = self._dynamic_tree_sample_relocation_pairs(
+            self._dynamic_tree_relocation_pairs(
+                sampler_output, spec_decode_metadata
+            ),
+            spec_decode_metadata,
+        )
+        src_indices = [pair["src_index"] for pair in pairs]
+        dst_indices = [pair["dst_index"] for pair in pairs]
         if not src_indices:
             return
 
@@ -5858,6 +6032,10 @@ class GPUModelRunner(
             spec_decode_common_attn_metadata=spec_decode_common_attn_metadata,
         )
         self._maybe_dump_tree_spec_trace(sampler_output, spec_decode_metadata)
+        self._maybe_relocate_dynamic_tree_inputs(
+            sampler_output,
+            spec_decode_metadata,
+        )
         self._maybe_relocate_dynamic_tree_hidden_states(
             sampler_output,
             spec_decode_metadata,

@@ -55,6 +55,7 @@ def _create_proposer(
     enable_dynamic_tree_target_mask: bool = False,
     dynamic_draft_tree_runtime_mode: str = "root_only",
     dynamic_draft_tree_max_draft_tokens: int | None = None,
+    enable_tree_spec_decode_kv_relocation: bool = False,
 ) -> EagleProposer:
     # Method-dependent setup
     if method == "eagle":
@@ -97,6 +98,7 @@ def _create_proposer(
         enable_dynamic_tree_target_mask=enable_dynamic_tree_target_mask,
         dynamic_draft_tree_runtime_mode=dynamic_draft_tree_runtime_mode,
         dynamic_draft_tree_max_draft_tokens=dynamic_draft_tree_max_draft_tokens,
+        enable_tree_spec_decode_kv_relocation=enable_tree_spec_decode_kv_relocation,
     )
     if parallel_drafting:
         # Overwrite pard_token to avoid crash during init
@@ -1342,6 +1344,43 @@ def test_propose_tree_runtime_dynamic_tree_prefix_only_selects_linear_path():
     assert metadata[0]["selected_static_nodes"] == [1, 3]
     assert metadata[0]["retrieve_next_token"] == [1, 2, -1]
     assert metadata[0]["retrieve_next_sibling"] == [-1, -1, -1]
+
+
+def test_propose_tree_runtime_dynamic_tree_branching_keeps_siblings():
+    proposer = _create_proposer(
+        "eagle",
+        4,
+        attention_backend="TREE_ATTN",
+        speculative_token_tree=[(0,), (1,), (0, 0), (0, 1)],
+        enable_dynamic_draft_tree=True,
+        dynamic_draft_tree_runtime_mode="branching",
+        dynamic_draft_tree_max_draft_tokens=2,
+        enable_tree_spec_decode_kv_relocation=True,
+    )
+
+    metadata = proposer._build_runtime_dynamic_tree_metadata(
+        batch_size=1,
+        all_tokens_by_level=[
+            torch.tensor([[10, 20]], device=DEVICE_TYPE),
+            torch.tensor([[11, 12]], device=DEVICE_TYPE),
+        ],
+        all_scores_by_level=[
+            torch.tensor([[0.9, 0.85]], device=DEVICE_TYPE),
+            torch.tensor([[0.7, 0.6]], device=DEVICE_TYPE),
+        ],
+        selected_child_offsets_by_level=[
+            torch.tensor([[0, 1]], device=DEVICE_TYPE),
+            torch.tensor([[0, 0]], device=DEVICE_TYPE),
+        ],
+    )
+
+    assert metadata[0]["is_dynamic_tree"] is True
+    assert metadata[0]["is_linear_chain"] is False
+    assert metadata[0]["selected_static_nodes"] == [1, 2]
+    assert metadata[0]["retrieve_next_token"] == [1, -1, -1]
+    assert metadata[0]["retrieve_next_sibling"] == [-1, 2, -1]
+    assert metadata[0]["tree_attn_mask"][1][2] == 0
+    assert metadata[0]["tree_attn_mask"][2][1] == 0
 
 
 def test_set_inputs_first_pass_dflash():

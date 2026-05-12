@@ -451,6 +451,10 @@ def build_static_tree_retrieve_metadata(
     choice_to_local_idx = {
         choice: local_idx + 1 for local_idx, choice in enumerate(sorted_tree_choices)
     }
+    tree_attn_mask = [[0] * num_nodes for _ in range(num_nodes)]
+    for local_idx in range(num_nodes):
+        tree_attn_mask[local_idx][0] = 1
+        tree_attn_mask[local_idx][local_idx] = 1
     for local_idx in range(num_nodes - 1, 0, -1):
         choice = sorted_tree_choices[local_idx - 1]
         parent_idx = 0 if len(choice) == 1 else choice_to_local_idx[choice[:-1]]
@@ -458,6 +462,14 @@ def build_static_tree_retrieve_metadata(
         retrieve_next_token[parent_idx] = local_idx
         if old_first_child != -1:
             retrieve_next_sibling[local_idx] = old_first_child
+        while parent_idx > 0:
+            tree_attn_mask[local_idx][parent_idx] = 1
+            parent_choice = sorted_tree_choices[parent_idx - 1]
+            parent_idx = (
+                0
+                if len(parent_choice) == 1
+                else choice_to_local_idx[parent_choice[:-1]]
+            )
 
     max_depth = max((len(choice) for choice in sorted_tree_choices), default=0)
     return {
@@ -465,6 +477,7 @@ def build_static_tree_retrieve_metadata(
         "retrieve_next_token": retrieve_next_token,
         "retrieve_next_sibling": retrieve_next_sibling,
         "target_mask": [1] * num_nodes,
+        "tree_attn_mask": tree_attn_mask,
         "position_offsets": [0]
         + [len(choice) for choice in sorted_tree_choices],
         "num_spec_steps": max_depth + 1,

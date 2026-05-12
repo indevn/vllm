@@ -38,8 +38,10 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheTensor,
 )
+from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.eagle import EagleProposer
+from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.worker.gpu_input_batch import InputBatch
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
@@ -659,8 +661,6 @@ def test_attach_linear_chain_metadata_enables_serial_q1_forward():
         tree_valid=None,
         tree_linear_kv_safe=False,
         tree_runtime_mode=None,
-        tree_force_single_row_logits=False,
-        tree_force_serial_q1_forward=False,
     )
     scheduler_output = SimpleNamespace(
         scheduled_spec_decode_tree_metadata={
@@ -892,6 +892,135 @@ def test_static_branch_tree_attn_keeps_drafts_with_kv_relocation(monkeypatch):
     assert draft_token_ids.tree_metadata == {"req_0": tree_metadata}
 
 
+def test_tree_attn_aux_hidden_outputs_stay_enabled_when_kv_relocation_requested():
+    runner = object.__new__(GPUModelRunner)
+    runner.enable_tree_spec_decode_kv_relocation = True
+    runner._should_suppress_tree_attn_draft_tokens = lambda: True
+
+    assert not runner._should_disable_aux_hidden_state_outputs_for_tree_attn()
+
+    runner.enable_tree_spec_decode_kv_relocation = False
+
+    assert runner._should_disable_aux_hidden_state_outputs_for_tree_attn()
+
+
+@pytest.mark.parametrize("tree_runtime_mode", [None, "branching"])
+def test_branching_tree_relocation_moves_non_prefix_accept_state(
+    tree_runtime_mode,
+):
+    runner = object.__new__(GPUModelRunner)
+    runner.device = torch.device(DEVICE_TYPE)
+    runner.enable_dynamic_tree_kv_relocation = True
+    runner.cache_config = SimpleNamespace(cache_dtype="auto")
+    runner.query_start_loc = SimpleNamespace(
+        gpu=torch.tensor([0, 4], dtype=torch.int32, device=runner.device)
+    )
+    runner.input_ids = SimpleNamespace(
+        gpu=torch.tensor([100, 101, 102, 103], dtype=torch.int32, device=runner.device)
+    )
+    runner.positions = torch.tensor(
+        [10, 11, 21, 31], dtype=torch.int64, device=runner.device
+    )
+
+    block_size = 4
+    slot_mapping = torch.tensor([4, 5, 6, 7], dtype=torch.int64, device=runner.device)
+    runner.input_batch = SimpleNamespace(
+        num_reqs=1,
+        block_table=[
+            SimpleNamespace(
+                block_size=block_size,
+                slot_mapping=SimpleNamespace(gpu=slot_mapping),
+            )
+        ],
+    )
+
+    class FakeBackend:
+        @staticmethod
+        def get_kv_cache_block_dim(*args, **kwargs):
+            return 1
+
+    group = SimpleNamespace(
+        kv_cache_group_id=0,
+        kv_cache_spec=FullAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=2,
+            dtype=torch.float32,
+        ),
+        backend=FakeBackend,
+        layer_names=["layer.0"],
+    )
+    runner._kv_cache_spec_attn_group_iterator = lambda: iter([group])
+    kv_cache = torch.arange(
+        2 * 2 * block_size * 1 * 2,
+        dtype=torch.float32,
+        device=runner.device,
+    ).view(2, 2, block_size, 1, 2)
+    src_kv = kv_cache[:, 1, 2].clone()
+    dst_kv_before = kv_cache[:, 1, 1].clone()
+    runner.compilation_config = SimpleNamespace(
+        static_forward_context={"layer.0": SimpleNamespace(kv_cache=kv_cache)}
+    )
+
+    metadata = SpecDecodeMetadata.make_dummy(
+        [[11, 12, 13]], device=runner.device
+    )
+    metadata.tree_target_logits_indices = torch.arange(
+        4, dtype=torch.int32, device=runner.device
+    ).view(1, 4)
+    metadata.tree_retrieve_index = torch.arange(
+        4, dtype=torch.int32, device=runner.device
+    ).view(1, 4)
+    metadata.tree_retrieve_next_token = torch.tensor(
+        [[1, -1, -1, -1]], dtype=torch.int32, device=runner.device
+    )
+    metadata.tree_retrieve_next_sibling = torch.tensor(
+        [[-1, 2, 3, -1]], dtype=torch.int32, device=runner.device
+    )
+    metadata.tree_num_spec_steps = 2
+    metadata.tree_linear_kv_safe = False
+    metadata.tree_runtime_mode = tree_runtime_mode
+
+    sampler_output = SamplerOutput(
+        sampled_token_ids=torch.tensor(
+            [[11, 13, -1, -1]], dtype=torch.int32, device=runner.device
+        ),
+        logprobs_tensors=None,
+        spec_decode_accept_indices=torch.tensor(
+            [[0, 2, -1, -1]], dtype=torch.int32, device=runner.device
+        ),
+    )
+    hidden_states = torch.arange(
+        4 * 3, dtype=torch.float32, device=runner.device
+    ).view(4, 3)
+    sample_hidden_states = hidden_states + 100
+    aux_hidden_states = [hidden_states + 200]
+    src_input_id = runner.input_ids.gpu[2].clone()
+    src_position = runner.positions[2].clone()
+    src_hidden = hidden_states[2].clone()
+    src_sample_hidden = sample_hidden_states[2].clone()
+    src_aux_hidden = aux_hidden_states[0][2].clone()
+
+    runner._maybe_relocate_dynamic_tree_inputs(sampler_output, metadata)
+    runner._maybe_relocate_dynamic_tree_hidden_states(
+        sampler_output,
+        metadata,
+        hidden_states,
+        sample_hidden_states,
+        aux_hidden_states,
+    )
+    runner._maybe_relocate_dynamic_tree_kv(sampler_output, metadata)
+
+    assert runner.input_ids.gpu[1].item() == src_input_id.item()
+    assert runner.positions[1].item() == src_position.item()
+    assert torch.equal(hidden_states[1], src_hidden)
+    assert torch.equal(sample_hidden_states[1], src_sample_hidden)
+    assert torch.equal(aux_hidden_states[0][1], src_aux_hidden)
+    assert torch.equal(kv_cache[:, 1, 1], src_kv)
+    assert not torch.equal(kv_cache[:, 1, 1], dst_kv_before)
+    assert metadata.tree_runtime_mode == tree_runtime_mode
+
+
 def test_dynamic_tree_take_draft_tokens_returns_packed_subtree():
     runner = object.__new__(GPUModelRunner)
     runner.num_spec_tokens = 4
@@ -1063,7 +1192,7 @@ def test_root_only_drafter_scheduler_output_keeps_original_scheduler_intact():
     assert original.scheduled_spec_decode_tokens == {"req_0": [11, 12]}
 
 
-def test_tree_target_mask_disabled_defaults_to_full_attention_mask():
+def test_tree_target_mask_disabled_keeps_tree_visibility_mask():
     runner = object.__new__(GPUModelRunner)
     runner.device = torch.device(DEVICE_TYPE)
     metadata = SimpleNamespace(
@@ -1111,7 +1240,9 @@ def test_tree_target_mask_disabled_defaults_to_full_attention_mask():
     )
 
     assert metadata.tree_target_mask.tolist() == [[1, 1, 1]]
-    assert metadata.tree_attn_bias is None
+    assert torch.isfinite(metadata.tree_attn_bias).to(torch.int32).tolist() == [
+        [[1, 0, 0], [1, 1, 0], [1, 0, 1]]
+    ]
 
 
 def test_tree_target_mask_enabled_preserves_dynamic_mask():
@@ -1213,6 +1344,67 @@ def test_attach_tree_metadata_builds_runtime_tree_attn_bias():
     assert torch.isneginf(metadata.tree_attn_bias[0, 2, 1])
     assert metadata.tree_attn_bias[0, 2, 2] == 0
     assert metadata.tree_position_offsets.tolist() == [[0, 1, 1]]
+
+
+def test_attach_static_tree_metadata_falls_back_to_retrieve_visibility_mask():
+    runner = object.__new__(GPUModelRunner)
+    runner.device = torch.device(DEVICE_TYPE)
+    metadata = SimpleNamespace(
+        draft_token_ids=torch.tensor([11, 12, 13, 14], device=runner.device),
+        num_draft_tokens=[4],
+        cu_num_draft_tokens=torch.tensor([4], dtype=torch.int32, device=runner.device),
+        cu_num_sampled_tokens=torch.tensor(
+            [5], dtype=torch.int32, device=runner.device
+        ),
+        tree_target_logits_indices=None,
+        tree_retrieve_index=None,
+        tree_retrieve_next_token=None,
+        tree_retrieve_next_sibling=None,
+        tree_target_mask=None,
+        tree_attn_bias=None,
+        tree_position_offsets=None,
+        tree_num_spec_steps=None,
+        tree_valid=None,
+        tree_linear_kv_safe=False,
+        tree_runtime_mode=None,
+        tree_force_single_row_logits=False,
+        tree_force_serial_q1_forward=False,
+    )
+    scheduler_output = SimpleNamespace(
+        scheduled_spec_decode_tree_metadata={
+            "req_0": {
+                "retrieve_index": [0, 1, 2, 3, 4],
+                "retrieve_next_token": [1, 3, -1, -1, -1],
+                "retrieve_next_sibling": [-1, 2, -1, 4, -1],
+                "target_mask": [1, 1, 1, 1, 1],
+                "position_offsets": [0, 1, 1, 2, 2],
+                "target_mask_enabled": True,
+                "num_spec_steps": 3,
+                "tree_valid": True,
+            }
+        }
+    )
+    runner.input_batch = SimpleNamespace(req_ids=["req_0"])
+    runner.enable_dynamic_tree_kv_relocation = True
+
+    runner._attach_tree_spec_decode_metadata(
+        metadata,
+        scheduler_output,
+        np.array([5], dtype=np.int32),
+        np.array([4], dtype=np.int32),
+    )
+
+    visibility = torch.isfinite(metadata.tree_attn_bias).to(torch.int32)
+
+    assert visibility.tolist() == [
+        [
+            [1, 0, 0, 0, 0],
+            [1, 1, 0, 0, 0],
+            [1, 0, 1, 0, 0],
+            [1, 1, 0, 1, 0],
+            [1, 1, 0, 0, 1],
+        ]
+    ]
 
 
 def test_attach_dynamic_prefix_only_metadata_marks_kv_safe_runtime_mode():
