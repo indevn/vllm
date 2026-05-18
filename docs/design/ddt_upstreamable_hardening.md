@@ -113,9 +113,9 @@ Next splits:
 - `dynamic_tree_select.py`: import boundary is landed for proposer/tests;
   physical movement of compact metadata builders and runtime selection out of
   `dynamic_tree.py` remains.
-- `dynamic_tree_verify.py`: import boundary is landed for sampler/tests;
-  physical movement of reference verifier and Triton wrapper out of
-  `dynamic_tree.py` remains.
+- `dynamic_tree_verify.py`: reference verifier and Triton wrapper now live in
+  the verify module; `dynamic_tree.py` keeps compatibility wrappers for legacy
+  imports.
 - typed metadata handoff: scheduler/request/runner should pass a compact
   metadata object or device handle instead of rebuilding list/dict/tensor glue.
 
