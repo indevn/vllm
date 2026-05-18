@@ -170,6 +170,11 @@ from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
+from vllm.v1.spec_decode.dynamic_tree_metrics import (
+    annotate_tree_cudagraph_runtime,
+    make_tree_stage_profile_record,
+    tree_stage_num_output_tokens,
+)
 from vllm.v1.spec_decode.dynamic_tree_near_tie import (
     NearTieCandidate,
     apply_tree_near_tie_q1_fallback,
@@ -3839,83 +3844,28 @@ class GPUModelRunner(
         num_tokens_padded: int,
         forward_num_scheduled_tokens_np: np.ndarray,
     ) -> None:
-        if (
-            spec_decode_metadata is None
-            or not spec_decode_metadata.has_tree_metadata
-        ):
-            return
-
-        tree_width = (
-            int(spec_decode_metadata.tree_parent.shape[-1])
-            if spec_decode_metadata.tree_parent is not None
-            else None
-        )
-        q_lens = [
-            int(query_len)
-            for query_len in forward_num_scheduled_tokens_np[:num_reqs].tolist()
-        ]
-        compact_kernel_requested = (
-            os.environ.get("VLLM_TREE_ATTN_DYNAMIC_MASK_KERNEL") == "1"
-        )
-        metadata_buffered = bool(
-            spec_decode_metadata.tree_cudagraph_metadata_buffered
-        )
-        fallback_reason = spec_decode_metadata.tree_cudagraph_metadata_buffer_reason
-        if cudagraph_mode == CUDAGraphMode.NONE:
-            fallback_reason = fallback_reason or "cudagraph_mode_none"
-        elif not metadata_buffered and getattr(
-            self, "tree_attn_cudagraph_probe", False
-        ):
-            fallback_reason = fallback_reason or "metadata_not_buffered"
-
-        spec_decode_metadata.tree_cudagraph_key = {
-            "runtime_mode": spec_decode_metadata.tree_runtime_mode,
-            "tree_width": tree_width,
-            "q_lens": q_lens,
-            "max_query_len": max(q_lens) if q_lens else 0,
-            "num_reqs": int(num_reqs),
-            "num_draft_tokens": [
-                int(num_tokens)
-                for num_tokens in spec_decode_metadata.num_draft_tokens[:num_reqs]
-            ],
-            "dynamic_mask_kernel": compact_kernel_requested,
-            "near_tie_threshold": (
-                spec_decode_metadata.tree_near_tie_q1_fallback_threshold
+        annotate_tree_cudagraph_runtime(
+            spec_decode_metadata=spec_decode_metadata,
+            cudagraph_mode=cudagraph_mode,
+            batch_desc=batch_desc,
+            num_reqs=num_reqs,
+            num_tokens_unpadded=num_tokens_unpadded,
+            num_tokens_padded=num_tokens_padded,
+            forward_num_scheduled_tokens_np=forward_num_scheduled_tokens_np,
+            compact_kernel_requested=(
+                os.environ.get("VLLM_TREE_ATTN_DYNAMIC_MASK_KERNEL") == "1"
             ),
-            "serial_repair_enabled": bool(
+            tree_attn_cudagraph_probe=bool(
+                getattr(self, "tree_attn_cudagraph_probe", False)
+            ),
+            serial_repair_enabled=bool(
                 self.tree_attn_serial_accepted_state_repair
             ),
-            "serial_repair_scope": (
-                self.tree_attn_serial_accepted_state_repair_scope
-            ),
-            "metadata_buffer_capacity": self._tree_cudagraph_metadata_width,
-        }
-        spec_decode_metadata.tree_cudagraph_runtime = {
-            "probe_enabled": bool(getattr(self, "tree_attn_cudagraph_probe", False)),
-            "mode": str(cudagraph_mode),
-            "dispatch_hit": cudagraph_mode != CUDAGraphMode.NONE,
-            "eager_fallback": cudagraph_mode == CUDAGraphMode.NONE,
-            "num_tokens_unpadded": int(num_tokens_unpadded),
-            "num_tokens_padded": int(num_tokens_padded),
-            "num_paddings": int(num_tokens_padded - num_tokens_unpadded),
-            "batch_descriptor": {
-                "num_tokens": int(batch_desc.num_tokens),
-                "num_reqs": (
-                    None if batch_desc.num_reqs is None else int(batch_desc.num_reqs)
-                ),
-                "uniform": bool(batch_desc.uniform),
-                "has_lora": bool(batch_desc.has_lora),
-                "num_active_loras": int(batch_desc.num_active_loras),
-            },
-            "metadata_buffered": metadata_buffered,
-            "fallback_reason": fallback_reason,
-            "capture_count_total_at_dispatch": int(
-                compilation_counter.num_cudagraph_captured
-            ),
-            "replay_count_total_at_dispatch": int(
-                compilation_counter.num_cudagraph_replayed
-            ),
-        }
+            serial_repair_scope=self.tree_attn_serial_accepted_state_repair_scope,
+            metadata_buffer_capacity=self._tree_cudagraph_metadata_width,
+            cudagraph_capture_count=compilation_counter.num_cudagraph_captured,
+            cudagraph_replay_count=compilation_counter.num_cudagraph_replayed,
+        )
 
     def _maybe_apply_tree_position_offsets(
         self,
@@ -4174,9 +4124,7 @@ class GPUModelRunner(
     def _tree_stage_num_output_tokens(
         sampler_output: SamplerOutput | None,
     ) -> int:
-        if sampler_output is None or sampler_output.sampled_token_ids is None:
-            return 0
-        return int((sampler_output.sampled_token_ids >= 0).sum().item())
+        return tree_stage_num_output_tokens(sampler_output)
 
     def _make_tree_stage_profile_record(
         self,
@@ -4187,13 +4135,6 @@ class GPUModelRunner(
         stage_ms: dict[str, float],
     ) -> dict[str, object]:
         num_reqs = len(spec_decode_metadata.num_draft_tokens)
-        scheduled_spec_tokens = sum(
-            len(tokens)
-            for req_id, tokens in scheduler_output.scheduled_spec_decode_tokens.items()
-            if req_id in self.input_batch.req_ids[:num_reqs]
-        )
-        output_tokens = self._tree_stage_num_output_tokens(sampler_output)
-        accepted_tokens = max(0, output_tokens - num_reqs)
         relocation_pairs = 0
         if sampler_output is not None:
             relocation_pairs = len(
@@ -4202,150 +4143,49 @@ class GPUModelRunner(
                     spec_decode_metadata,
                 )
             )
-        compact_requested = os.environ.get("VLLM_TREE_ATTN_DYNAMIC_MASK_KERNEL") == "1"
-        compact_used = False
-        if spec_decode_metadata.tree_parent is not None:
-            tree_width = int(spec_decode_metadata.tree_parent.shape[-1])
-            query_start_loc = self._tensor_trace_list(self.query_start_loc.gpu[
-                : num_reqs + 1
-            ])
-            if query_start_loc and not spec_decode_metadata.force_root_only_forward:
-                query_lens = [
-                    int(query_start_loc[i + 1]) - int(query_start_loc[i])
-                    for i in range(num_reqs)
-                ]
-                decode_query_lens: list[int] = []
-                for query_len in query_lens:
-                    if query_len > tree_width:
-                        break
-                    decode_query_lens.append(query_len)
-                compact_used = (
-                    compact_requested
-                    and bool(decode_query_lens)
-                    and all(
-                        0 < query_len <= tree_width
-                        for query_len in decode_query_lens
-                    )
-                )
-        tree_cudagraph_runtime = None
-        if spec_decode_metadata.tree_cudagraph_runtime is not None:
-            tree_cudagraph_runtime = dict(spec_decode_metadata.tree_cudagraph_runtime)
-            capture_count_at_dispatch = int(
-                tree_cudagraph_runtime.get("capture_count_total_at_dispatch") or 0
-            )
-            replay_count_at_dispatch = int(
-                tree_cudagraph_runtime.get("replay_count_total_at_dispatch") or 0
-            )
-            tree_cudagraph_runtime["capture_count_total_at_record"] = int(
-                compilation_counter.num_cudagraph_captured
-            )
-            tree_cudagraph_runtime["replay_count_total_at_record"] = int(
-                compilation_counter.num_cudagraph_replayed
-            )
-            tree_cudagraph_runtime["capture_count_delta"] = max(
-                0,
-                tree_cudagraph_runtime["capture_count_total_at_record"]
-                - capture_count_at_dispatch,
-            )
-            tree_cudagraph_runtime["replay_count_delta"] = max(
-                0,
-                tree_cudagraph_runtime["replay_count_total_at_record"]
-                - replay_count_at_dispatch,
-            )
-        serial_repair_records = (
-            spec_decode_metadata.tree_serial_accepted_state_repair_applied or []
-        )
-        serial_repair_nonprefix_rows = sum(
-            int(record.get("is_nonprefix") or 0)
-            for record in serial_repair_records
-        )
-        serial_repair_near_tie_rows = sum(
-            int(record.get("has_near_tie_fallback") or 0)
-            for record in serial_repair_records
-        )
-
         self._tree_attn_stage_profile_step += 1
-        return {
-            "trace_kind": "tree_attn_stage_profile",
-            "step": self._tree_attn_stage_profile_step,
-            "num_reqs": num_reqs,
-            "num_draft_tokens": [
-                int(num_tokens)
-                for num_tokens in spec_decode_metadata.num_draft_tokens
-            ],
-            "scheduled_spec_decode_tokens": scheduled_spec_tokens,
-            "output_tokens": output_tokens,
-            "accepted_tokens": accepted_tokens,
-            "relocation_pairs": relocation_pairs,
-            "tree_runtime_mode": spec_decode_metadata.tree_runtime_mode,
-            "tree_linear_kv_safe": spec_decode_metadata.tree_linear_kv_safe,
-            "tree_compact_bias_kernel_requested": compact_requested,
-            "tree_compact_bias_kernel_used": compact_used,
-            "tree_cudagraph_key": spec_decode_metadata.tree_cudagraph_key,
-            "tree_cudagraph_runtime": tree_cudagraph_runtime,
-            "tree_cudagraph_metadata_buffered": (
-                spec_decode_metadata.tree_cudagraph_metadata_buffered
+        query_start_loc = self._tensor_trace_list(
+            self.query_start_loc.gpu[: num_reqs + 1]
+        )
+        return make_tree_stage_profile_record(
+            step=self._tree_attn_stage_profile_step,
+            req_ids=self.input_batch.req_ids,
+            scheduled_spec_decode_tokens=(
+                scheduler_output.scheduled_spec_decode_tokens
             ),
-            "tree_cudagraph_metadata_buffer_reason": (
-                spec_decode_metadata.tree_cudagraph_metadata_buffer_reason
+            spec_decode_metadata=spec_decode_metadata,
+            sampler_output=sampler_output,
+            stage_ms=stage_ms,
+            relocation_pairs=relocation_pairs,
+            compact_kernel_requested=(
+                os.environ.get("VLLM_TREE_ATTN_DYNAMIC_MASK_KERNEL") == "1"
             ),
-            "tree_metadata_host_staged": (
-                spec_decode_metadata.tree_metadata_host_staged
-            ),
-            "tree_metadata_device_buffered": (
-                spec_decode_metadata.tree_metadata_device_buffered
-            ),
-            "tree_metadata_device_buffer_reason": (
-                spec_decode_metadata.tree_metadata_device_buffer_reason
-            ),
-            "tree_metadata_typed_view": (
-                spec_decode_metadata.tree_metadata_typed_view
-            ),
-            "tree_dynamic_select_vectorized": (
-                spec_decode_metadata.tree_dynamic_select_vectorized
-            ),
-            "near_tie_fallback_rows": len(
-                spec_decode_metadata.tree_near_tie_q1_fallback_applied or []
-            ),
-            "serial_repair_rows": len(serial_repair_records),
-            "serial_repair_prefix_rows": (
-                len(serial_repair_records) - serial_repair_nonprefix_rows
-            ),
-            "serial_repair_nonprefix_rows": serial_repair_nonprefix_rows,
-            "serial_repair_near_tie_rows": serial_repair_near_tie_rows,
-            "serial_repair_scope": (
+            query_start_loc=query_start_loc,
+            cudagraph_capture_count=compilation_counter.num_cudagraph_captured,
+            cudagraph_replay_count=compilation_counter.num_cudagraph_replayed,
+            serial_repair_scope=(
                 self.tree_attn_serial_accepted_state_repair_scope
             ),
-            "serial_repair_batch_by_depth": bool(
+            serial_repair_batch_by_depth=bool(
                 getattr(
                     self,
                     "tree_attn_serial_accepted_state_repair_batch_by_depth",
                     False,
                 )
             ),
-            "draft_stage_ms": dict(
-                getattr(self.drafter, "_tree_draft_last_stage_ms", None) or {}
+            draft_stage_ms=getattr(self.drafter, "_tree_draft_last_stage_ms", None),
+            dynamic_metadata_stage_ms=getattr(
+                self.drafter,
+                "_dynamic_tree_metadata_last_stage_ms",
+                None,
             ),
-            "dynamic_metadata_stage_ms": dict(
-                getattr(
-                    self.drafter,
-                    "_dynamic_tree_metadata_last_stage_ms",
-                    None,
-                )
-                or {}
+            sample_stage_ms=getattr(
+                self.rejection_sampler,
+                "tree_sample_last_stage_ms",
+                None,
             ),
-            "sample_stage_ms": dict(
-                getattr(
-                    self.rejection_sampler,
-                    "tree_sample_last_stage_ms",
-                    None,
-                )
-                or {}
-            ),
-            "stage_ms": stage_ms,
-            "stage_total_ms": sum(stage_ms.values()),
-            "sync": self.tree_attn_stage_profile_sync,
-        }
+            sync=self.tree_attn_stage_profile_sync,
+        )
 
     def _maybe_dump_tree_stage_profile(
         self,

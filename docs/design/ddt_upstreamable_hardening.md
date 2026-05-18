@@ -103,12 +103,17 @@ First landed split:
 - `vllm/v1/spec_decode/dynamic_tree_near_tie.py` now owns near-tie candidate
   filtering and fallback record construction. `gpu_model_runner.py` was reduced
   by the extracted algorithm block while preserving wrapper method names.
+- `vllm/v1/spec_decode/dynamic_tree_metrics.py` now owns CUDA graph runtime
+  annotation and stage-profile record construction. Runner code passes runtime
+  counters and small context values instead of assembling graph/fallback/
+  metadata/acceptance records inline.
 
 Next splits:
 
 - `dynamic_tree_select.py`: runtime selected-subtree metadata construction.
 - `dynamic_tree_verify.py`: reference verifier and verifier-kernel wrapper.
-- `dynamic_tree_metrics.py`: graph/fallback/metadata/acceptance runtime records.
+- typed metadata handoff: scheduler/request/runner should pass a compact
+  metadata object or device handle instead of rebuilding list/dict/tensor glue.
 
 Review target:
 
