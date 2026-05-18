@@ -19,6 +19,19 @@ For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
 
 ---
 
+## Fork Note: Dynamic Draft Tree
+
+This fork carries an experimental Dynamic Draft Tree (DDT) runtime integration
+on top of vLLM's existing speculative decoding and TREE_ATTN work. The goal is
+to move from a static draft tree topology to per-step compact tree metadata,
+runtime target masks, dynamic verifier state, and KV/state relocation paths that
+can be validated against target-only decoding before performance optimization.
+
+For a reviewer-oriented overview of the design, current validation scope, and
+upstreaming plan, see [Dynamic Draft Tree](docs/design/dynamic_draft_tree.md).
+
+---
+
 ## About
 
 vLLM is a fast and easy-to-use library for LLM inference and serving.
