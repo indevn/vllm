@@ -166,10 +166,17 @@ from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID, RejectionSampler
+from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
+from vllm.v1.spec_decode.dynamic_tree_near_tie import (
+    NearTieCandidate,
+    apply_tree_near_tie_q1_fallback,
+    logits_top2_margin,
+    logits_topk_trace,
+    tree_near_tie_q1_replacement_candidates,
+)
 from vllm.v1.spec_decode.dynamic_tree_relocation import (
     clear_dynamic_tree_relocation_cache,
     dynamic_tree_relocation_index_tensors,
@@ -4389,23 +4396,7 @@ class GPUModelRunner(
         *,
         k: int = 5,
     ) -> tuple[list[list[int]], list[list[float]], list[float | None]]:
-        if logits.numel() == 0 or k <= 0:
-            return [], [], []
-        k = min(k, logits.shape[-1])
-        top_values, top_indices = torch.topk(logits.to(torch.float32), k=k, dim=-1)
-        top_values_cpu = top_values.detach().cpu().tolist()
-        top_indices_cpu = top_indices.detach().cpu().tolist()
-        margins: list[float | None] = []
-        for values in top_values_cpu:
-            if len(values) < 2:
-                margins.append(None)
-            else:
-                margins.append(float(values[0] - values[1]))
-        return (
-            [[int(token_id) for token_id in row] for row in top_indices_cpu],
-            [[float(value) for value in row] for row in top_values_cpu],
-            margins,
-        )
+        return logits_topk_trace(logits, k=k)
 
     def _dynamic_tree_relocation_pairs(
         self,
@@ -6884,64 +6875,19 @@ class GPUModelRunner(
 
     @staticmethod
     def _logits_top2_margin(logits_row: torch.Tensor) -> float:
-        top2 = torch.topk(logits_row.to(torch.float32), k=2).values
-        return float((top2[0] - top2[1]).item())
+        return logits_top2_margin(logits_row)
 
     def _tree_near_tie_q1_replacement_candidates(
         self,
         sampler_output: SamplerOutput,
         logits: torch.Tensor | None,
         spec_decode_metadata: SpecDecodeMetadata | None,
-    ) -> list[dict[str, int | float]]:
-        if (
-            logits is None
-            or spec_decode_metadata is None
-            or not spec_decode_metadata.has_tree_metadata
-            or spec_decode_metadata.tree_near_tie_q1_fallback_threshold is None
-            or spec_decode_metadata.tree_target_logits_indices is None
-            or sampler_output.spec_decode_accept_indices is None
-        ):
-            return []
-        threshold = spec_decode_metadata.tree_near_tie_q1_fallback_threshold
-        accept_indices = sampler_output.spec_decode_accept_indices
-        output_token_ids = sampler_output.sampled_token_ids
-        tree_indices = spec_decode_metadata.tree_target_logits_indices
-        candidates: list[dict[str, int | float]] = []
-        num_reqs = min(accept_indices.shape[0], output_token_ids.shape[0])
-        for req_idx in range(num_reqs):
-            if req_idx >= len(spec_decode_metadata.num_draft_tokens):
-                break
-            if int(spec_decode_metadata.num_draft_tokens[req_idx]) <= 0:
-                continue
-            if (
-                spec_decode_metadata.tree_valid is not None
-                and not bool(spec_decode_metadata.tree_valid[req_idx].item())
-            ):
-                continue
-            row_width = min(accept_indices.shape[1], output_token_ids.shape[1])
-            for output_idx in range(row_width):
-                token_id = int(output_token_ids[req_idx, output_idx].item())
-                if token_id < 0:
-                    break
-                local_idx = int(accept_indices[req_idx, output_idx].item())
-                if local_idx < 0 or local_idx >= tree_indices.shape[1]:
-                    break
-                logits_idx = int(tree_indices[req_idx, local_idx].item())
-                if logits_idx < 0 or logits_idx >= logits.shape[0]:
-                    break
-                margin = self._logits_top2_margin(logits[logits_idx])
-                if margin <= threshold:
-                    candidates.append(
-                        {
-                            "req_idx": req_idx,
-                            "output_idx": output_idx,
-                            "local_idx": local_idx,
-                            "logits_idx": logits_idx,
-                            "margin": margin,
-                        }
-                    )
-                    break
-        return candidates
+    ) -> list[NearTieCandidate]:
+        return tree_near_tie_q1_replacement_candidates(
+            sampler_output,
+            logits,
+            spec_decode_metadata,
+        )
 
     def _compute_serial_q1_outputs_for_candidates(
         self,
@@ -7304,133 +7250,36 @@ class GPUModelRunner(
         slot_mappings_by_group: dict[int, torch.Tensor] | None,
         has_encoder_input: bool,
     ) -> SamplerOutput:
-        candidates = self._tree_near_tie_q1_replacement_candidates(
-            sampler_output,
-            logits,
-            spec_decode_metadata,
+        serial_q1_outputs_for_candidates = None
+        if spec_decode_common_attn_metadata is not None and input_ids is not None:
+
+            def serial_q1_outputs_for_candidates(
+                candidates: Sequence[NearTieCandidate],
+            ) -> tuple[torch.Tensor, list[torch.Tensor] | None, torch.Tensor]:
+                return self._compute_serial_q1_outputs_for_candidates(
+                    candidates=candidates,
+                    spec_decode_common_attn_metadata=spec_decode_common_attn_metadata,
+                    input_ids=input_ids,
+                    logits_indices=logits_indices,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    model_kwargs=model_kwargs,
+                    batch_desc=batch_desc,
+                    slot_mappings=slot_mappings,
+                    slot_mappings_by_group=slot_mappings_by_group,
+                    has_encoder_input=has_encoder_input,
+                )
+
+        return apply_tree_near_tie_q1_fallback(
+            sampler_output=sampler_output,
+            logits=logits,
+            spec_decode_metadata=spec_decode_metadata,
+            logits_indices=logits_indices,
+            hidden_states=hidden_states,
+            sample_hidden_states=sample_hidden_states,
+            aux_hidden_states=aux_hidden_states,
+            serial_q1_outputs_for_candidates=serial_q1_outputs_for_candidates,
         )
-        if (
-            not candidates
-            or spec_decode_metadata is None
-            or logits is None
-        ):
-            return sampler_output
-
-        root_candidates = [
-            candidate for candidate in candidates if int(candidate["output_idx"]) == 0
-        ]
-        applied: list[dict[str, int | float | str]] = []
-        if (
-            root_candidates
-            and spec_decode_common_attn_metadata is not None
-            and input_ids is not None
-        ):
-            (
-                serial_hidden_states,
-                serial_aux_hidden_states,
-                serial_logits,
-            ) = self._compute_serial_q1_outputs_for_candidates(
-                candidates=root_candidates,
-                spec_decode_common_attn_metadata=spec_decode_common_attn_metadata,
-                input_ids=input_ids,
-                logits_indices=logits_indices,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                model_kwargs=model_kwargs,
-                batch_desc=batch_desc,
-                slot_mappings=slot_mappings,
-                slot_mappings_by_group=slot_mappings_by_group,
-                has_encoder_input=has_encoder_input,
-            )
-            for row_idx, candidate in enumerate(root_candidates):
-                logits_idx = int(candidate["logits_idx"])
-                req_idx = int(candidate["req_idx"])
-                input_idx = int(logits_indices[logits_idx].item())
-                candidate["input_idx"] = input_idx
-                old_output = sampler_output.sampled_token_ids[req_idx]
-                truncated_tokens = int((old_output[1:] >= 0).sum().item())
-                logits[logits_idx].copy_(serial_logits[row_idx])
-                if hidden_states is not None and input_idx < hidden_states.shape[0]:
-                    hidden_states[input_idx].copy_(serial_hidden_states[row_idx])
-                if (
-                    sample_hidden_states is not None
-                    and logits_idx < sample_hidden_states.shape[0]
-                ):
-                    sample_hidden_states[logits_idx].copy_(
-                        serial_hidden_states[row_idx]
-                    )
-                if (
-                    aux_hidden_states is not None
-                    and serial_aux_hidden_states is not None
-                ):
-                    for aux_hidden, serial_aux_hidden in zip(
-                        aux_hidden_states, serial_aux_hidden_states
-                    ):
-                        if input_idx < aux_hidden.shape[0]:
-                            aux_hidden[input_idx].copy_(serial_aux_hidden[row_idx])
-                token_id = int(serial_logits[row_idx].argmax(dim=-1).item())
-                q1_top_token_ids, q1_top_values, q1_top_margins = (
-                    self._logits_topk_trace(
-                        serial_logits[row_idx : row_idx + 1],
-                        k=5,
-                    )
-                )
-                sampler_output.sampled_token_ids[req_idx].fill_(PLACEHOLDER_TOKEN_ID)
-                sampler_output.sampled_token_ids[req_idx, 0] = token_id
-                if sampler_output.spec_decode_accept_indices is not None:
-                    sampler_output.spec_decode_accept_indices[req_idx].fill_(
-                        PLACEHOLDER_TOKEN_ID
-                    )
-                    sampler_output.spec_decode_accept_indices[req_idx, 0] = 0
-                applied.append(
-                    {
-                        **candidate,
-                        "fallback": "root_q1",
-                        "q1_token_id": token_id,
-                        "q1_top_token_ids": q1_top_token_ids[0]
-                        if q1_top_token_ids
-                        else [],
-                        "q1_top_values": q1_top_values[0] if q1_top_values else [],
-                        "q1_margin": q1_top_margins[0] if q1_top_margins else None,
-                        "threshold": (
-                            spec_decode_metadata
-                            .tree_near_tie_q1_fallback_threshold
-                        ),
-                        "truncated_accepted_tokens": truncated_tokens,
-                    }
-                )
-
-        for candidate in candidates:
-            output_idx = int(candidate["output_idx"])
-            if output_idx == 0:
-                continue
-            req_idx = int(candidate["req_idx"])
-            truncated_tokens = int(
-                (sampler_output.sampled_token_ids[req_idx, output_idx:] >= 0)
-                .sum()
-                .item()
-            )
-            sampler_output.sampled_token_ids[req_idx, output_idx:].fill_(
-                PLACEHOLDER_TOKEN_ID
-            )
-            if sampler_output.spec_decode_accept_indices is not None:
-                sampler_output.spec_decode_accept_indices[req_idx, output_idx:].fill_(
-                    PLACEHOLDER_TOKEN_ID
-                )
-            applied.append(
-                {
-                    **candidate,
-                    "fallback": "truncate_before_near_tie",
-                    "threshold": (
-                        spec_decode_metadata.tree_near_tie_q1_fallback_threshold
-                    ),
-                    "truncated_accepted_tokens": truncated_tokens,
-                }
-            )
-
-        if applied:
-            spec_decode_metadata.tree_near_tie_q1_fallback_applied = applied
-        return sampler_output
 
     def _slice_slot_mappings_for_token(
         self,

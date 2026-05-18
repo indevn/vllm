@@ -62,6 +62,13 @@ Production policy:
 
 Current repo evidence:
 
+- `vllm/v1/spec_decode/dynamic_tree_near_tie.py` owns near-tie margin
+  classification, candidate filtering, root q1 replacement records, and
+  non-root truncation records. `gpu_model_runner.py` keeps only the serial q1
+  forward callback and thin compatibility wrappers.
+- `tests/v1/spec_decode/test_dynamic_tree_near_tie.py` covers helper-level
+  candidate filtering, non-root truncation, root q1 replacement, state updates,
+  and record schema.
 - Worker tests cover disabled threshold, no-draft rows, invalid tree rows,
   root q1 replacement, non-root truncation, and fallback records.
 - Replay classifier tests separate `hard_fail`, `explained_low_margin`, and
@@ -70,8 +77,10 @@ Current repo evidence:
 
 Open hardening item:
 
-- Move near-tie candidate filtering out of `gpu_model_runner.py` into a small
-  helper module before upstreaming the fallback itself.
+- The fallback is still opt-in and still considered a correctness guard rather
+  than the default fast path. The next policy hardening step is an explicit
+  deterministic q1 guard that either rejects/truncates before the near-tie row
+  or runs a documented serial q1 recompute for commit rows only.
 
 ## Step 3: Runner Intrusion Reduction
 
@@ -91,10 +100,12 @@ First landed split:
 - `tests/v1/worker/test_gpu_model_runner.py::test_dynamic_tree_relocation_helper_matches_runner_contract`
   validates pair construction, sample pair conversion, index tensors, and cache
   clearing.
+- `vllm/v1/spec_decode/dynamic_tree_near_tie.py` now owns near-tie candidate
+  filtering and fallback record construction. `gpu_model_runner.py` was reduced
+  by the extracted algorithm block while preserving wrapper method names.
 
 Next splits:
 
-- `dynamic_tree_near_tie.py`: near-tie candidate filtering and record building.
 - `dynamic_tree_select.py`: runtime selected-subtree metadata construction.
 - `dynamic_tree_verify.py`: reference verifier and verifier-kernel wrapper.
 - `dynamic_tree_metrics.py`: graph/fallback/metadata/acceptance runtime records.
