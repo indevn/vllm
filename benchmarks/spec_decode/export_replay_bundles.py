@@ -20,6 +20,7 @@ from benchmarks.spec_decode.analyze_verify_state_trace import (  # noqa: E402
     best_trace_offset,
     group_traces_by_request,
     match_trace_groups_to_prompts,
+    token_trace_records,
 )
 
 
@@ -58,6 +59,7 @@ def emitted_spans(
     trace_tokens: list[int],
     traces: list[dict[str, Any]],
 ) -> list[tuple[int, int, dict[str, Any]]]:
+    traces = token_trace_records(traces)
     trace_outputs: list[int] = []
     for record in traces:
         trace_outputs.extend(int(token_id) for token_id in record["output_token_ids"])
@@ -183,6 +185,9 @@ def build_bundle(
         "tree_attn_bias_mask": None
         if first_diff_record is None
         else first_diff_record.get("tree_attn_bias_mask"),
+        "tree_parent": None
+        if first_diff_record is None
+        else first_diff_record.get("tree_parent"),
         "tree_target_mask": None
         if first_diff_record is None
         else first_diff_record.get("tree_target_mask"),

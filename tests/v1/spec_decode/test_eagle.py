@@ -30,8 +30,14 @@ from vllm.platforms import current_platform
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
+from vllm.v1.spec_decode.dynamic_tree import (
+    build_static_topk_compact_metadata,
+)
 from vllm.v1.spec_decode.eagle import EagleProposer
-from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.spec_decode.metadata import (
+    DynamicTreeDeviceMetadataHandle,
+    SpecDecodeMetadata,
+)
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 model_dir = "meta-llama/Llama-3.1-8B-Instruct"
@@ -1277,9 +1283,13 @@ def test_propose_tree_runtime_dynamic_tree_selects_request_local_subtree():
     assert metadata[1] != metadata[0]
     assert metadata[0]["target_mask_enabled"] is False
     assert metadata[0]["selected_static_nodes"]
-    assert metadata[0]["tree_attn_mask"][0][0] == 1
-    assert proposer._dynamic_tree_last_draft_token_ids is not None
-    assert len(proposer._dynamic_tree_last_draft_token_ids[0]) == len(
+    assert metadata[0]["tree_attn_mask"] is None
+    derived_mask = metadata[0].as_array_view().tree_attn_mask_or_derive(
+        len(metadata[0]["retrieve_index"])
+    )
+    assert derived_mask[0][0]
+    assert proposer._dynamic_tree_last_draft_token_ids is None
+    assert len(metadata[0]["selected_token_ids"]) == len(
         metadata[0]["selected_static_nodes"]
     )
 
@@ -1311,6 +1321,618 @@ def test_propose_tree_runtime_dynamic_tree_marks_target_mask_enabled():
     )
 
     assert metadata[0]["target_mask_enabled"] is True
+    view = metadata[0].as_array_view()
+    assert metadata[0].as_array_view() is view
+    assert view.retrieve_next_token.tolist() == metadata[0]["retrieve_next_token"]
+
+
+def test_propose_tree_runtime_dynamic_tree_reuses_build_buffers():
+    proposer = _create_proposer(
+        "eagle",
+        4,
+        attention_backend="TREE_ATTN",
+        speculative_token_tree=[(0,), (1,), (0, 0), (0, 1)],
+        enable_dynamic_draft_tree=True,
+        enable_dynamic_tree_target_mask=True,
+    )
+
+    static_tokens_buffer = proposer._dynamic_tree_static_tokens_buffer
+    static_scores_buffer = proposer._dynamic_tree_static_scores_buffer
+    selected_bool_buffer = proposer._dynamic_tree_selected_bool_buffer
+
+    metadata_1 = proposer._build_runtime_dynamic_tree_metadata(
+        batch_size=1,
+        all_tokens_by_level=[
+            torch.tensor([[10, 20]], device=DEVICE_TYPE),
+            torch.tensor([[11, 12]], device=DEVICE_TYPE),
+        ],
+        all_scores_by_level=[
+            torch.tensor([[0.9, 0.1]], device=DEVICE_TYPE),
+            torch.tensor([[0.8, 0.7]], device=DEVICE_TYPE),
+        ],
+        selected_child_offsets_by_level=[
+            torch.tensor([[0, 1]], device=DEVICE_TYPE),
+            torch.tensor([[0, 0]], device=DEVICE_TYPE),
+        ],
+    )
+    metadata_2 = proposer._build_runtime_dynamic_tree_metadata(
+        batch_size=1,
+        all_tokens_by_level=[
+            torch.tensor([[30, 40]], device=DEVICE_TYPE),
+            torch.tensor([[31, 32]], device=DEVICE_TYPE),
+        ],
+        all_scores_by_level=[
+            torch.tensor([[0.2, 0.9]], device=DEVICE_TYPE),
+            torch.tensor([[0.3, 0.8]], device=DEVICE_TYPE),
+        ],
+        selected_child_offsets_by_level=[
+            torch.tensor([[0, 1]], device=DEVICE_TYPE),
+            torch.tensor([[0, 0]], device=DEVICE_TYPE),
+        ],
+    )
+
+    assert proposer._dynamic_tree_static_tokens_buffer is static_tokens_buffer
+    assert proposer._dynamic_tree_static_scores_buffer is static_scores_buffer
+    assert proposer._dynamic_tree_selected_bool_buffer is selected_bool_buffer
+    assert metadata_1[0]["selected_token_ids"] != metadata_2[0][
+        "selected_token_ids"
+    ]
+    assert 30 in metadata_2[0]["selected_token_ids"]
+    assert metadata_2[0].as_array_view().selected_token_ids.tolist() == metadata_2[
+        0
+    ]["selected_token_ids"]
+    assert len(proposer._dynamic_tree_metadata_template_cache) == 1
+    assert (
+        metadata_1[0].as_array_view().retrieve_index
+        is metadata_2[0].as_array_view().retrieve_index
+    )
+    assert (
+        metadata_1[0].as_array_view().selected_token_ids
+        is not metadata_2[0].as_array_view().selected_token_ids
+    )
+
+
+def test_propose_tree_runtime_dynamic_tree_compact_select_matches_full_cpu(
+    monkeypatch,
+):
+    proposer = _create_proposer(
+        "eagle",
+        6,
+        attention_backend="TREE_ATTN",
+        speculative_token_tree=[
+            (0,),
+            (1,),
+            (0, 0),
+            (0, 1),
+            (1, 0),
+            (1, 1),
+        ],
+        enable_dynamic_draft_tree=True,
+        dynamic_draft_tree_max_draft_tokens=2,
+        enable_dynamic_tree_target_mask=True,
+    )
+
+    all_tokens_by_level = [
+        torch.tensor([[10, 20], [30, 40]], device=DEVICE_TYPE),
+        torch.tensor([[11, 12, 21, 22], [31, 32, 41, 42]], device=DEVICE_TYPE),
+    ]
+    all_scores_by_level = [
+        torch.tensor([[0.9, 0.7], [0.6, 0.8]], device=DEVICE_TYPE),
+        torch.tensor(
+            [[0.81, 0.63, 0.42, 0.35], [0.24, 0.18, 0.72, 0.64]],
+            device=DEVICE_TYPE,
+        ),
+    ]
+    selected_child_offsets_by_level = [
+        torch.tensor([[0, 1], [0, 1]], device=DEVICE_TYPE),
+        torch.tensor([[0, 0, 1, 1], [0, 0, 1, 1]], device=DEVICE_TYPE),
+    ]
+
+    monkeypatch.setenv("VLLM_DYNAMIC_TREE_COMPACT_CANDIDATE_SELECT", "1")
+    monkeypatch.delenv("VLLM_DYNAMIC_TREE_FULL_CPU_SELECT", raising=False)
+    compact = proposer._build_runtime_dynamic_tree_metadata(
+        batch_size=2,
+        all_tokens_by_level=all_tokens_by_level,
+        all_scores_by_level=all_scores_by_level,
+        selected_child_offsets_by_level=selected_child_offsets_by_level,
+        scores_are_cumulative=True,
+    )
+
+    monkeypatch.setenv("VLLM_DYNAMIC_TREE_FULL_CPU_SELECT", "1")
+    full_cpu = proposer._build_runtime_dynamic_tree_metadata(
+        batch_size=2,
+        all_tokens_by_level=all_tokens_by_level,
+        all_scores_by_level=all_scores_by_level,
+        selected_child_offsets_by_level=selected_child_offsets_by_level,
+        scores_are_cumulative=True,
+    )
+
+    assert compact == full_cpu
+    for compact_entry, full_cpu_entry in zip(compact, full_cpu, strict=True):
+        assert (
+            compact_entry.as_array_view().selected_token_ids.tolist()
+            == full_cpu_entry.as_array_view().selected_token_ids.tolist()
+        )
+
+
+def test_propose_tree_runtime_dynamic_tree_cpu_closure_select_matches_full_cpu(
+    monkeypatch,
+):
+    proposer = _create_proposer(
+        "eagle",
+        6,
+        attention_backend="TREE_ATTN",
+        speculative_token_tree=[
+            (0,),
+            (1,),
+            (0, 0),
+            (0, 1),
+            (1, 0),
+            (1, 1),
+        ],
+        enable_dynamic_draft_tree=True,
+        dynamic_draft_tree_max_draft_tokens=2,
+        enable_dynamic_tree_target_mask=True,
+    )
+
+    all_tokens_by_level = [
+        torch.tensor([[10, 20], [30, 40]], device=DEVICE_TYPE),
+        torch.tensor([[11, 12, 21, 22], [31, 32, 41, 42]], device=DEVICE_TYPE),
+    ]
+    all_scores_by_level = [
+        torch.tensor([[0.9, 0.7], [0.6, 0.8]], device=DEVICE_TYPE),
+        torch.tensor(
+            [[0.81, 0.63, 0.42, 0.35], [0.24, 0.18, 0.72, 0.64]],
+            device=DEVICE_TYPE,
+        ),
+    ]
+    selected_child_offsets_by_level = [
+        torch.tensor([[0, 1], [0, 1]], device=DEVICE_TYPE),
+        torch.tensor([[0, 0, 1, 1], [0, 0, 1, 1]], device=DEVICE_TYPE),
+    ]
+
+    monkeypatch.setenv("VLLM_DYNAMIC_TREE_CPU_CLOSURE_SELECT", "1")
+    monkeypatch.delenv("VLLM_DYNAMIC_TREE_COMPACT_CANDIDATE_SELECT", raising=False)
+    monkeypatch.delenv("VLLM_DYNAMIC_TREE_FULL_CPU_SELECT", raising=False)
+    cpu_closure = proposer._build_runtime_dynamic_tree_metadata(
+        batch_size=2,
+        all_tokens_by_level=all_tokens_by_level,
+        all_scores_by_level=all_scores_by_level,
+        selected_child_offsets_by_level=selected_child_offsets_by_level,
+        scores_are_cumulative=True,
+    )
+
+    monkeypatch.setenv("VLLM_DYNAMIC_TREE_FULL_CPU_SELECT", "1")
+    full_cpu = proposer._build_runtime_dynamic_tree_metadata(
+        batch_size=2,
+        all_tokens_by_level=all_tokens_by_level,
+        all_scores_by_level=all_scores_by_level,
+        selected_child_offsets_by_level=selected_child_offsets_by_level,
+        scores_are_cumulative=True,
+    )
+
+    assert cpu_closure == full_cpu
+    for cpu_closure_entry, full_cpu_entry in zip(
+        cpu_closure, full_cpu, strict=True
+    ):
+        assert (
+            cpu_closure_entry.as_array_view().selected_token_ids.tolist()
+            == full_cpu_entry.as_array_view().selected_token_ids.tolist()
+        )
+
+
+def test_propose_tree_runtime_dynamic_tree_static_topk_kernel_matches_full_cpu(
+    monkeypatch,
+):
+    proposer = _create_proposer(
+        "eagle",
+        6,
+        attention_backend="TREE_ATTN",
+        speculative_token_tree=[
+            (0,),
+            (1,),
+            (0, 0),
+            (0, 1),
+            (1, 0),
+            (1, 1),
+        ],
+        enable_dynamic_draft_tree=True,
+        dynamic_draft_tree_max_draft_tokens=2,
+        enable_dynamic_tree_target_mask=True,
+    )
+
+    all_tokens_by_level = [
+        torch.tensor([[10, 20], [30, 40]], device=DEVICE_TYPE),
+        torch.tensor([[11, 12, 21, 22], [31, 32, 41, 42]], device=DEVICE_TYPE),
+    ]
+    all_scores_by_level = [
+        torch.tensor([[0.9, 0.7], [0.6, 0.8]], device=DEVICE_TYPE),
+        torch.tensor(
+            [[0.81, 0.63, 0.42, 0.35], [0.24, 0.18, 0.72, 0.64]],
+            device=DEVICE_TYPE,
+        ),
+    ]
+    selected_child_offsets_by_level = [
+        torch.tensor([[0, 1], [0, 1]], device=DEVICE_TYPE),
+        torch.tensor([[0, 0, 1, 1], [0, 0, 1, 1]], device=DEVICE_TYPE),
+    ]
+
+    monkeypatch.setenv("VLLM_DYNAMIC_TREE_STATIC_TOPK_METADATA_KERNEL", "1")
+    monkeypatch.delenv("VLLM_DYNAMIC_TREE_FULL_CPU_SELECT", raising=False)
+    static_topk = proposer._build_runtime_dynamic_tree_metadata(
+        batch_size=2,
+        all_tokens_by_level=all_tokens_by_level,
+        all_scores_by_level=all_scores_by_level,
+        selected_child_offsets_by_level=selected_child_offsets_by_level,
+        scores_are_cumulative=True,
+    )
+
+    monkeypatch.setenv("VLLM_DYNAMIC_TREE_FULL_CPU_SELECT", "1")
+    full_cpu = proposer._build_runtime_dynamic_tree_metadata(
+        batch_size=2,
+        all_tokens_by_level=all_tokens_by_level,
+        all_scores_by_level=all_scores_by_level,
+        selected_child_offsets_by_level=selected_child_offsets_by_level,
+        scores_are_cumulative=True,
+    )
+
+    assert static_topk == full_cpu
+    for static_topk_entry, full_cpu_entry in zip(
+        static_topk, full_cpu, strict=True
+    ):
+        assert (
+            static_topk_entry.as_array_view().selected_token_ids.tolist()
+            == full_cpu_entry.as_array_view().selected_token_ids.tolist()
+        )
+
+
+def test_propose_tree_runtime_dynamic_tree_selected_bool_kernel_matches_full_cpu(
+    monkeypatch,
+):
+    proposer = _create_proposer(
+        "eagle",
+        6,
+        attention_backend="TREE_ATTN",
+        speculative_token_tree=[
+            (0,),
+            (1,),
+            (0, 0),
+            (0, 1),
+            (1, 0),
+            (1, 1),
+        ],
+        enable_dynamic_draft_tree=True,
+        dynamic_draft_tree_max_draft_tokens=2,
+        enable_dynamic_tree_target_mask=True,
+    )
+
+    all_tokens_by_level = [
+        torch.tensor([[10, 20], [30, 40]], device=DEVICE_TYPE),
+        torch.tensor([[11, 12, 21, 22], [31, 32, 41, 42]], device=DEVICE_TYPE),
+    ]
+    all_scores_by_level = [
+        torch.tensor([[0.9, 0.7], [0.6, 0.8]], device=DEVICE_TYPE),
+        torch.tensor(
+            [[0.81, 0.63, 0.42, 0.35], [0.24, 0.18, 0.72, 0.64]],
+            device=DEVICE_TYPE,
+        ),
+    ]
+    selected_child_offsets_by_level = [
+        torch.tensor([[0, 1], [0, 1]], device=DEVICE_TYPE),
+        torch.tensor([[0, 0, 1, 1], [0, 0, 1, 1]], device=DEVICE_TYPE),
+    ]
+
+    monkeypatch.setenv("VLLM_DYNAMIC_TREE_SELECTED_BOOL_METADATA_KERNEL", "1")
+    monkeypatch.delenv("VLLM_DYNAMIC_TREE_FULL_CPU_SELECT", raising=False)
+    monkeypatch.delenv("VLLM_DYNAMIC_TREE_STATIC_TOPK_METADATA_KERNEL", raising=False)
+    selected_bool = proposer._build_runtime_dynamic_tree_metadata(
+        batch_size=2,
+        all_tokens_by_level=all_tokens_by_level,
+        all_scores_by_level=all_scores_by_level,
+        selected_child_offsets_by_level=selected_child_offsets_by_level,
+        scores_are_cumulative=True,
+    )
+
+    monkeypatch.setenv("VLLM_DYNAMIC_TREE_FULL_CPU_SELECT", "1")
+    full_cpu = proposer._build_runtime_dynamic_tree_metadata(
+        batch_size=2,
+        all_tokens_by_level=all_tokens_by_level,
+        all_scores_by_level=all_scores_by_level,
+        selected_child_offsets_by_level=selected_child_offsets_by_level,
+        scores_are_cumulative=True,
+    )
+
+    assert selected_bool == full_cpu
+    for selected_bool_entry, full_cpu_entry in zip(
+        selected_bool, full_cpu, strict=True
+    ):
+        assert (
+            selected_bool_entry.as_array_view().selected_token_ids.tolist()
+            == full_cpu_entry.as_array_view().selected_token_ids.tolist()
+        )
+
+
+def test_propose_tree_runtime_dynamic_tree_device_handle_matches_full_cpu(
+    monkeypatch,
+):
+    proposer = _create_proposer(
+        "eagle",
+        6,
+        attention_backend="TREE_ATTN",
+        speculative_token_tree=[
+            (0,),
+            (1,),
+            (0, 0),
+            (0, 1),
+            (1, 0),
+            (1, 1),
+        ],
+        enable_dynamic_draft_tree=True,
+        dynamic_draft_tree_max_draft_tokens=2,
+        enable_dynamic_tree_target_mask=True,
+        dynamic_draft_tree_runtime_mode="branching",
+        enable_tree_spec_decode_kv_relocation=True,
+    )
+
+    all_tokens_by_level = [
+        torch.tensor([[10, 20], [30, 40]], device=DEVICE_TYPE),
+        torch.tensor([[11, 12, 21, 22], [31, 32, 41, 42]], device=DEVICE_TYPE),
+    ]
+    all_scores_by_level = [
+        torch.tensor([[0.9, 0.7], [0.6, 0.8]], device=DEVICE_TYPE),
+        torch.tensor(
+            [[0.81, 0.63, 0.42, 0.35], [0.24, 0.18, 0.72, 0.64]],
+            device=DEVICE_TYPE,
+        ),
+    ]
+    selected_child_offsets_by_level = [
+        torch.tensor([[0, 1], [0, 1]], device=DEVICE_TYPE),
+        torch.tensor([[0, 0, 1, 1], [0, 0, 1, 1]], device=DEVICE_TYPE),
+    ]
+
+    monkeypatch.setenv("VLLM_DYNAMIC_TREE_SELECTED_BOOL_METADATA_KERNEL", "1")
+    monkeypatch.setenv("VLLM_DYNAMIC_TREE_DEVICE_METADATA_HANDLE", "1")
+    monkeypatch.delenv("VLLM_DYNAMIC_TREE_FULL_CPU_SELECT", raising=False)
+    monkeypatch.delenv("VLLM_DYNAMIC_TREE_STATIC_TOPK_METADATA_KERNEL", raising=False)
+    handle = proposer._build_runtime_dynamic_tree_metadata(
+        batch_size=2,
+        all_tokens_by_level=all_tokens_by_level,
+        all_scores_by_level=all_scores_by_level,
+        selected_child_offsets_by_level=selected_child_offsets_by_level,
+        scores_are_cumulative=True,
+    )
+
+    monkeypatch.delenv("VLLM_DYNAMIC_TREE_DEVICE_METADATA_HANDLE", raising=False)
+    monkeypatch.setenv("VLLM_DYNAMIC_TREE_FULL_CPU_SELECT", "1")
+    full_cpu = proposer._build_runtime_dynamic_tree_metadata(
+        batch_size=2,
+        all_tokens_by_level=all_tokens_by_level,
+        all_scores_by_level=all_scores_by_level,
+        selected_child_offsets_by_level=selected_child_offsets_by_level,
+        scores_are_cumulative=True,
+    )
+
+    assert isinstance(handle, DynamicTreeDeviceMetadataHandle)
+    assert handle.req_ids == ("0", "1")
+    assert handle.num_nodes == tuple(
+        len(entry["retrieve_index"]) for entry in full_cpu
+    )
+    assert handle.num_spec_steps == tuple(
+        entry["num_spec_steps"] for entry in full_cpu
+    )
+    for req_idx, full_cpu_entry in enumerate(full_cpu):
+        num_nodes = len(full_cpu_entry["retrieve_index"])
+        selected_width = max(0, num_nodes - 1)
+        assert (
+            handle.selected_token_ids[req_idx, :selected_width].tolist()
+            == full_cpu_entry["selected_token_ids"]
+        )
+        assert (
+            handle.selected_static_nodes[req_idx, :selected_width].tolist()
+            == full_cpu_entry["selected_static_nodes"]
+        )
+        assert (
+            handle.retrieve_next_token[req_idx, :num_nodes].tolist()
+            == full_cpu_entry["retrieve_next_token"]
+        )
+        assert (
+            handle.retrieve_next_sibling[req_idx, :num_nodes].tolist()
+            == full_cpu_entry["retrieve_next_sibling"]
+        )
+        assert (
+            handle.position_offsets[req_idx, :num_nodes].tolist()
+            == full_cpu_entry["position_offsets"]
+        )
+
+
+def test_propose_tree_runtime_dynamic_tree_default_device_handle_matches_full_cpu(
+    monkeypatch,
+):
+    proposer = _create_proposer(
+        "eagle",
+        6,
+        attention_backend="TREE_ATTN",
+        speculative_token_tree=[
+            (0,),
+            (1,),
+            (0, 0),
+            (0, 1),
+            (1, 0),
+            (1, 1),
+        ],
+        enable_dynamic_draft_tree=True,
+        dynamic_draft_tree_max_draft_tokens=2,
+        enable_dynamic_tree_target_mask=True,
+        dynamic_draft_tree_runtime_mode="branching",
+        enable_tree_spec_decode_kv_relocation=True,
+    )
+
+    all_tokens_by_level = [
+        torch.tensor([[10, 20], [30, 40]], device=DEVICE_TYPE),
+        torch.tensor([[11, 12, 21, 22], [31, 32, 41, 42]], device=DEVICE_TYPE),
+    ]
+    all_scores_by_level = [
+        torch.tensor([[0.9, 0.7], [0.6, 0.8]], device=DEVICE_TYPE),
+        torch.tensor(
+            [[0.81, 0.63, 0.42, 0.35], [0.24, 0.18, 0.72, 0.64]],
+            device=DEVICE_TYPE,
+        ),
+    ]
+    selected_child_offsets_by_level = [
+        torch.tensor([[0, 1], [0, 1]], device=DEVICE_TYPE),
+        torch.tensor([[0, 0, 1, 1], [0, 0, 1, 1]], device=DEVICE_TYPE),
+    ]
+
+    monkeypatch.setenv("VLLM_DYNAMIC_TREE_DEVICE_METADATA_HANDLE", "1")
+    monkeypatch.delenv("VLLM_DYNAMIC_TREE_SELECTED_BOOL_METADATA_KERNEL", raising=False)
+    monkeypatch.delenv("VLLM_DYNAMIC_TREE_STATIC_TOPK_METADATA_KERNEL", raising=False)
+    monkeypatch.delenv("VLLM_DYNAMIC_TREE_FULL_CPU_SELECT", raising=False)
+    handle = proposer._build_runtime_dynamic_tree_metadata(
+        batch_size=2,
+        all_tokens_by_level=all_tokens_by_level,
+        all_scores_by_level=all_scores_by_level,
+        selected_child_offsets_by_level=selected_child_offsets_by_level,
+        scores_are_cumulative=True,
+    )
+
+    monkeypatch.delenv("VLLM_DYNAMIC_TREE_DEVICE_METADATA_HANDLE", raising=False)
+    monkeypatch.setenv("VLLM_DYNAMIC_TREE_FULL_CPU_SELECT", "1")
+    full_cpu = proposer._build_runtime_dynamic_tree_metadata(
+        batch_size=2,
+        all_tokens_by_level=all_tokens_by_level,
+        all_scores_by_level=all_scores_by_level,
+        selected_child_offsets_by_level=selected_child_offsets_by_level,
+        scores_are_cumulative=True,
+    )
+
+    assert isinstance(handle, DynamicTreeDeviceMetadataHandle)
+    assert handle.selected_token_ids_by_req == tuple(
+        tuple(entry["selected_token_ids"]) for entry in full_cpu
+    )
+    assert handle.num_nodes == tuple(
+        len(entry["retrieve_index"]) for entry in full_cpu
+    )
+    assert handle.num_spec_steps == tuple(
+        entry["num_spec_steps"] for entry in full_cpu
+    )
+    for req_idx, full_cpu_entry in enumerate(full_cpu):
+        num_nodes = len(full_cpu_entry["retrieve_index"])
+        assert (
+            handle.retrieve_next_token[req_idx, :num_nodes].tolist()
+            == full_cpu_entry["retrieve_next_token"]
+        )
+        assert (
+            handle.retrieve_next_sibling[req_idx, :num_nodes].tolist()
+            == full_cpu_entry["retrieve_next_sibling"]
+        )
+        assert (
+            handle.target_mask[req_idx, :num_nodes].tolist()
+            == full_cpu_entry["target_mask"]
+        )
+
+
+def test_propose_tree_runtime_dynamic_tree_accepts_cumulative_scores():
+    proposer = _create_proposer(
+        "eagle",
+        4,
+        attention_backend="TREE_ATTN",
+        speculative_token_tree=[(0,), (1,), (0, 0), (0, 1)],
+        enable_dynamic_draft_tree=True,
+        dynamic_draft_tree_max_draft_tokens=3,
+        enable_dynamic_tree_target_mask=True,
+    )
+
+    all_tokens_by_level = [
+        torch.tensor([[10, 20]], device=DEVICE_TYPE),
+        torch.tensor([[11, 12]], device=DEVICE_TYPE),
+    ]
+    root_scores = torch.tensor([[0.9, 0.1]], device=DEVICE_TYPE)
+    local_child_scores = torch.tensor([[0.8, 0.7]], device=DEVICE_TYPE)
+    cumulative_child_scores = torch.tensor([[0.72, 0.63]], device=DEVICE_TYPE)
+    selected_child_offsets_by_level = [
+        torch.tensor([[0, 1]], device=DEVICE_TYPE),
+        torch.tensor([[0, 0]], device=DEVICE_TYPE),
+    ]
+
+    reference = proposer._build_runtime_dynamic_tree_metadata(
+        batch_size=1,
+        all_tokens_by_level=all_tokens_by_level,
+        all_scores_by_level=[root_scores, local_child_scores],
+        selected_child_offsets_by_level=selected_child_offsets_by_level,
+    )
+    cumulative = proposer._build_runtime_dynamic_tree_metadata(
+        batch_size=1,
+        all_tokens_by_level=all_tokens_by_level,
+        all_scores_by_level=[root_scores, cumulative_child_scores],
+        selected_child_offsets_by_level=selected_child_offsets_by_level,
+        scores_are_cumulative=True,
+    )
+
+    assert cumulative[0] == reference[0]
+    assert cumulative[0].as_array_view().selected_token_ids.tolist() == reference[
+        0
+    ].as_array_view().selected_token_ids.tolist()
+
+
+def test_dynamic_tree_template_matches_static_topk_compact_oracle():
+    proposer = _create_proposer(
+        "eagle",
+        6,
+        attention_backend="TREE_ATTN",
+        speculative_token_tree=[
+            (0,),
+            (1,),
+            (0, 0),
+            (0, 1),
+            (1, 0),
+            (1, 1),
+        ],
+        enable_dynamic_draft_tree=True,
+        enable_dynamic_tree_target_mask=True,
+    )
+
+    static_parent = torch.tensor(
+        proposer._tree_static_parent_indices, dtype=torch.int64, device=DEVICE_TYPE
+    )
+    static_position_offsets = torch.tensor(
+        proposer._tree_static_position_offsets,
+        dtype=torch.int64,
+        device=DEVICE_TYPE,
+    )
+    static_tokens = torch.tensor([[0, 11, 12, 13, 14, 15, 16]], dtype=torch.int64)
+    topk_static_nodes = torch.tensor([[5, 4]], dtype=torch.int64)
+    valid_topk = torch.tensor([[True, True]])
+
+    oracle = build_static_topk_compact_metadata(
+        topk_static_nodes,
+        valid_topk,
+        static_tokens,
+        static_parent,
+        static_position_offsets,
+        max_tree_nodes=6,
+    )
+    template = proposer._get_dynamic_tree_metadata_template([1, 2, 4, 5])
+    num_nodes = int(oracle.num_nodes[0].item())
+
+    assert len(template.retrieve_index) == num_nodes
+    assert template.retrieve_index == oracle.retrieve_index[0, :num_nodes].tolist()
+    assert (
+        template.retrieve_next_token
+        == oracle.retrieve_next_token[0, :num_nodes].tolist()
+    )
+    assert (
+        template.retrieve_next_sibling
+        == oracle.retrieve_next_sibling[0, :num_nodes].tolist()
+    )
+    assert template.parent == oracle.parent[0, :num_nodes].tolist()
+    assert template.target_mask == oracle.target_mask[0, :num_nodes].tolist()
+    assert template.position_offsets == oracle.position_offsets[
+        0, :num_nodes
+    ].tolist()
+    assert template.selected_static_nodes == [1, 2, 4, 5]
+    assert template.num_spec_steps == int(oracle.num_spec_steps[0].item())
+    assert oracle.selected_static_nodes[0].tolist()[:4] == [1, 2, 4, 5]
+    assert oracle.selected_token_ids[0].tolist()[:4] == [11, 12, 14, 15]
 
 
 def test_propose_tree_runtime_dynamic_tree_prefix_only_selects_linear_path():
@@ -1379,8 +2001,12 @@ def test_propose_tree_runtime_dynamic_tree_branching_keeps_siblings():
     assert metadata[0]["selected_static_nodes"] == [1, 2]
     assert metadata[0]["retrieve_next_token"] == [1, -1, -1]
     assert metadata[0]["retrieve_next_sibling"] == [-1, 2, -1]
-    assert metadata[0]["tree_attn_mask"][1][2] == 0
-    assert metadata[0]["tree_attn_mask"][2][1] == 0
+    assert metadata[0]["tree_attn_mask"] is None
+    derived_mask = metadata[0].as_array_view().tree_attn_mask_or_derive(
+        len(metadata[0]["retrieve_index"])
+    )
+    assert not derived_mask[1][2]
+    assert not derived_mask[2][1]
 
 
 def test_set_inputs_first_pass_dflash():

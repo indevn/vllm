@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING
@@ -12,7 +13,7 @@ import torch
 import torch.nn as nn
 
 from vllm.logger import init_logger
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors, SamplerOutput
 from vllm.v1.sample.logits_processor.builtin import MinTokensLogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -20,9 +21,12 @@ from vllm.v1.sample.ops.bad_words import apply_bad_words_with_drafts
 from vllm.v1.sample.ops.penalties import apply_all_penalties
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.sample.sampler import Sampler
-from vllm.v1.spec_decode.dynamic_tree import verify_dynamic_tree_greedy
+from vllm.v1.spec_decode.dynamic_tree import (
+    verify_dynamic_tree_greedy,
+)
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
+from vllm.v1.utils import record_function_or_nullcontext
 
 if TYPE_CHECKING:
     from vllm.config.speculative import SpeculativeConfig
@@ -34,6 +38,15 @@ GREEDY_TEMPERATURE: tl.constexpr = 0
 # Maximum number of speculative draft tokens allowed per request in a single
 # step. This value is chosen to be large enough to handle typical use cases.
 MAX_SPEC_LEN = 128
+
+
+def _tree_verify_kernel_enabled(logits: torch.Tensor) -> bool:
+    return (
+        os.environ.get("VLLM_TREE_ATTN_VERIFY_KERNEL") == "1"
+        and logits.device.type == "cuda"
+        and HAS_TRITON
+        and not os.environ.get("VLLM_TREE_SPEC_TRACE_PATH")
+    )
 
 
 class RejectionSampler(nn.Module):
@@ -85,6 +98,41 @@ class RejectionSampler(nn.Module):
                 device=device,
             )
         self.synthetic_mode = self.synthetic_conditional_rates is not None
+        self.tree_sample_stage_profile_enabled = (
+            os.environ.get("VLLM_TREE_ATTN_SAMPLE_STAGE_PROFILE") == "1"
+        )
+        self.tree_sample_stage_profile_sync = (
+            os.environ.get("VLLM_TREE_ATTN_SAMPLE_STAGE_PROFILE_SYNC") == "1"
+        )
+        self.tree_sample_last_stage_ms: dict[str, float] | None = None
+
+    def _tree_sample_now(self, logits: torch.Tensor | None = None) -> float:
+        if (
+            self.tree_sample_stage_profile_sync
+            and logits is not None
+            and logits.device.type == "cuda"
+        ):
+            torch.cuda.synchronize(logits.device)
+        return time.perf_counter()
+
+    def _tree_sample_elapsed_ms(
+        self,
+        start: float,
+        logits: torch.Tensor | None = None,
+    ) -> float:
+        return (self._tree_sample_now(logits) - start) * 1000.0
+
+    def _tree_sample_profile_record(
+        self,
+        stage_ms: dict[str, float] | None,
+        name: str,
+        start: float,
+        logits: torch.Tensor | None = None,
+    ) -> None:
+        if stage_ms is not None:
+            stage_ms[name] = stage_ms.get(name, 0.0) + (
+                self._tree_sample_elapsed_ms(start, logits)
+            )
 
     def forward(
         self,
@@ -118,6 +166,7 @@ class RejectionSampler(nn.Module):
                 requested.
         """
         assert metadata.max_spec_len <= MAX_SPEC_LEN
+        self.tree_sample_last_stage_ms = None
         if metadata.has_tree_metadata:
             if not sampling_metadata.all_greedy:
                 raise NotImplementedError(
@@ -152,11 +201,22 @@ class RejectionSampler(nn.Module):
                     "Dynamic Draft Tree verification does not support "
                     "sampling constraints or logits processors yet."
                 )
+            tree_sample_stage_ms: dict[str, float] | None = (
+                {} if self.tree_sample_stage_profile_enabled else None
+            )
             output_token_ids, accept_indices = tree_rejection_greedy_sample(
                 metadata,
                 logits,
                 sampling_metadata,
+                sample_stage_ms=tree_sample_stage_ms,
+                sample_stage_now=self._tree_sample_now
+                if tree_sample_stage_ms is not None
+                else None,
+                sample_stage_record=self._tree_sample_profile_record
+                if tree_sample_stage_ms is not None
+                else None,
             )
+            self.tree_sample_last_stage_ms = tree_sample_stage_ms
             return SamplerOutput(
                 sampled_token_ids=output_token_ids,
                 logprobs_tensors=None,
@@ -586,6 +646,9 @@ def tree_rejection_greedy_sample(
     # [num_model_logits, vocab_size]
     logits: torch.Tensor,
     sampling_metadata: SamplingMetadata,
+    sample_stage_ms: dict[str, float] | None = None,
+    sample_stage_now=None,
+    sample_stage_record=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Greedy tree-aware verification for Dynamic Draft Tree metadata.
 
@@ -616,6 +679,7 @@ def tree_rejection_greedy_sample(
     tree_num_spec_steps = metadata.tree_num_spec_steps
     tree_valid = metadata.tree_valid
 
+    stage_start = sample_stage_now(logits) if sample_stage_now is not None else 0.0
     if tree_logits_indices.ndim != 2:
         raise ValueError(
             f"tree_target_logits_indices must be 2D, got {tree_logits_indices.shape}"
@@ -650,7 +714,15 @@ def tree_rejection_greedy_sample(
             "tree_num_spec_steps must fit the sampler output width, got "
             f"{tree_num_spec_steps} for max_spec_len={metadata.max_spec_len}"
         )
+    if sample_stage_record is not None:
+        sample_stage_record(
+            sample_stage_ms,
+            "tree_validate_ms",
+            stage_start,
+            logits,
+        )
 
+    stage_start = sample_stage_now(logits) if sample_stage_now is not None else 0.0
     if metadata.force_reject_all and metadata.force_root_only_forward:
         if logits.shape[0] != batch_size:
             raise ValueError(
@@ -664,7 +736,22 @@ def tree_rejection_greedy_sample(
     else:
         tree_logits = logits[tree_logits_indices.to(torch.long)].to(torch.float32)
     target_predict = tree_logits.argmax(dim=-1)
+    if sample_stage_record is not None:
+        sample_stage_record(
+            sample_stage_ms,
+            "tree_logits_gather_argmax_ms",
+            stage_start,
+            logits,
+        )
+    stage_start = sample_stage_now(logits) if sample_stage_now is not None else 0.0
     candidates = _padded_tree_candidates(metadata.draft_token_ids, metadata)
+    if sample_stage_record is not None:
+        sample_stage_record(
+            sample_stage_ms,
+            "tree_candidates_ms",
+            stage_start,
+            logits,
+        )
     if metadata.force_reject_all:
         output_token_ids = torch.full(
             (batch_size, metadata.max_spec_len + 1),
@@ -695,17 +782,52 @@ def tree_rejection_greedy_sample(
             )
         return output_token_ids, accept_indices
 
-    verify = verify_dynamic_tree_greedy(
-        candidates,
-        retrieve_index,
-        retrieve_next_token,
-        retrieve_next_sibling,
-        target_predict,
-        num_spec_steps=tree_num_spec_steps,
-        tree_valid=tree_valid,
-        linear_kv_safe=metadata.tree_linear_kv_safe,
-        target_mask=tree_target_mask,
-    )
+    use_verify_kernel = _tree_verify_kernel_enabled(logits)
+    if use_verify_kernel:
+        stage_start = sample_stage_now(logits) if sample_stage_now is not None else 0.0
+        with record_function_or_nullcontext("tree_attn: verifier_kernel"):
+            output_token_ids, accept_indices = _tree_rejection_greedy_sample_kernel(
+                candidates,
+                retrieve_index,
+                retrieve_next_token,
+                retrieve_next_sibling,
+                target_predict,
+                logits,
+                metadata,
+            )
+        if sample_stage_record is not None:
+            sample_stage_record(
+                sample_stage_ms,
+                "tree_verify_ms",
+                stage_start,
+                logits,
+            )
+            sample_stage_ms["tree_output_write_ms"] = (
+                sample_stage_ms.get("tree_output_write_ms", 0.0) + 0.0
+            )
+        return output_token_ids, accept_indices
+
+    stage_start = sample_stage_now(logits) if sample_stage_now is not None else 0.0
+    with record_function_or_nullcontext("tree_attn: verifier_reference"):
+        verify = verify_dynamic_tree_greedy(
+            candidates,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            target_predict,
+            num_spec_steps=tree_num_spec_steps,
+            tree_valid=tree_valid,
+            linear_kv_safe=metadata.tree_linear_kv_safe,
+            target_mask=tree_target_mask,
+        )
+    if sample_stage_record is not None:
+        sample_stage_record(
+            sample_stage_ms,
+            "tree_verify_ms",
+            stage_start,
+            logits,
+        )
+    stage_start = sample_stage_now(logits) if sample_stage_now is not None else 0.0
     if os.environ.get("VLLM_TREE_SPEC_TRACE_PATH"):
         metadata.tree_accept_trace = _build_tree_accept_trace(
             metadata,
@@ -716,7 +838,15 @@ def tree_rejection_greedy_sample(
             tree_valid,
             tree_target_mask,
         )
+    if sample_stage_record is not None:
+        sample_stage_record(
+            sample_stage_ms,
+            "tree_accept_trace_ms",
+            stage_start,
+            logits,
+        )
 
+    stage_start = sample_stage_now(logits) if sample_stage_now is not None else 0.0
     output_token_ids = torch.full(
         (batch_size, metadata.max_spec_len + 1),
         PLACEHOLDER_TOKEN_ID,
@@ -750,6 +880,251 @@ def tree_rejection_greedy_sample(
     accept_indices[:, :tree_num_spec_steps][valid_mask] = verify.accept_index.to(
         torch.int32
     )[valid_mask]
+    if sample_stage_record is not None:
+        sample_stage_record(
+            sample_stage_ms,
+            "tree_output_write_ms",
+            stage_start,
+            logits,
+        )
+    return output_token_ids, accept_indices
+
+
+@triton.jit(do_not_specialize=["max_spec_len"])
+def _tree_rejection_greedy_sample_triton_kernel(
+    output_token_ids_ptr,
+    accept_indices_ptr,
+    candidates_ptr,
+    retrieve_index_ptr,
+    retrieve_next_token_ptr,
+    retrieve_next_sibling_ptr,
+    target_predict_ptr,
+    tree_valid_ptr,
+    target_mask_ptr,
+    cu_num_draft_tokens_ptr,
+    bonus_argmax_ptr,
+    batch_size: tl.constexpr,
+    max_spec_len,
+    candidates_stride_b: tl.constexpr,
+    candidates_stride_w: tl.constexpr,
+    retrieve_index_stride_b: tl.constexpr,
+    retrieve_index_stride_w: tl.constexpr,
+    retrieve_next_token_stride_b: tl.constexpr,
+    retrieve_next_token_stride_w: tl.constexpr,
+    retrieve_next_sibling_stride_b: tl.constexpr,
+    retrieve_next_sibling_stride_w: tl.constexpr,
+    target_predict_stride_b: tl.constexpr,
+    target_predict_stride_w: tl.constexpr,
+    tree_valid_stride: tl.constexpr,
+    target_mask_stride_b: tl.constexpr,
+    target_mask_stride_w: tl.constexpr,
+    TREE_NUM_SPEC_STEPS: tl.constexpr,
+    MAX_TREE_NODES: tl.constexpr,
+    MAX_OUTPUT_SLOTS: tl.constexpr,
+    PLACEHOLDER_ID: tl.constexpr,
+    HAS_TARGET_MASK: tl.constexpr,
+    LINEAR_KV_SAFE: tl.constexpr,
+):
+    req_idx = tl.program_id(0)
+    if req_idx >= batch_size:
+        return
+
+    for output_idx in range(MAX_OUTPUT_SLOTS):
+        if output_idx <= max_spec_len:
+            output_offset = req_idx * (max_spec_len + 1) + output_idx
+            tl.store(output_token_ids_ptr + output_offset, PLACEHOLDER_ID)
+            tl.store(accept_indices_ptr + output_offset, PLACEHOLDER_ID)
+
+    tree_valid = tl.load(tree_valid_ptr + req_idx * tree_valid_stride)
+    end_idx = tl.load(cu_num_draft_tokens_ptr + req_idx)
+    start_idx = tl.where(
+        req_idx == 0,
+        0,
+        tl.load(cu_num_draft_tokens_ptr + req_idx - 1),
+    )
+    num_draft_tokens = end_idx - start_idx
+    fallback_row = (num_draft_tokens == 0) | (~tree_valid)
+    if fallback_row:
+        token_id = tl.load(bonus_argmax_ptr + req_idx)
+        tl.store(output_token_ids_ptr + req_idx * (max_spec_len + 1), token_id)
+        tl.store(accept_indices_ptr + req_idx * (max_spec_len + 1), 0)
+        return
+
+    last_accepted = tl.load(
+        retrieve_index_ptr + req_idx * retrieve_index_stride_b
+    ).to(tl.int64)
+    active = tl.full((), True, tl.int1)
+    cur_index = tl.full((), 0, tl.int64)
+    num_accepted = tl.full((), 0, tl.int64)
+    root_token = tl.load(
+        target_predict_ptr
+        + req_idx * target_predict_stride_b
+        + last_accepted * target_predict_stride_w
+    )
+    tl.store(output_token_ids_ptr + req_idx * (max_spec_len + 1), root_token)
+    tl.store(accept_indices_ptr + req_idx * (max_spec_len + 1), last_accepted)
+
+    for output_idx in range(1, TREE_NUM_SPEC_STEPS):
+        safe_cur_index = tl.maximum(cur_index, 0)
+        next_child = tl.load(
+            retrieve_next_token_ptr
+            + req_idx * retrieve_next_token_stride_b
+            + safe_cur_index * retrieve_next_token_stride_w
+        ).to(tl.int64)
+        cur_index = tl.where(active, next_child, cur_index)
+        found = tl.full((), False, tl.int1)
+        accepted_local_idx = tl.full((), 0, tl.int64)
+        next_cur_index = cur_index
+
+        for _ in range(MAX_TREE_NODES):
+            sibling_active = active & (~found) & (next_cur_index >= 0)
+            safe_sibling_idx = tl.maximum(next_cur_index, 0)
+            draft_local_idx = tl.load(
+                retrieve_index_ptr
+                + req_idx * retrieve_index_stride_b
+                + safe_sibling_idx * retrieve_index_stride_w,
+                mask=sibling_active,
+                other=0,
+            ).to(tl.int64)
+            draft_token_id = tl.load(
+                candidates_ptr
+                + req_idx * candidates_stride_b
+                + safe_sibling_idx * candidates_stride_w,
+                mask=sibling_active,
+                other=-1,
+            )
+            target_token_id = tl.load(
+                target_predict_ptr
+                + req_idx * target_predict_stride_b
+                + last_accepted * target_predict_stride_w
+            )
+            if HAS_TARGET_MASK:
+                allowed_by_mask = tl.load(
+                    target_mask_ptr
+                    + req_idx * target_mask_stride_b
+                    + safe_sibling_idx * target_mask_stride_w,
+                    mask=sibling_active,
+                    other=0,
+                ) != 0
+            else:
+                allowed_by_mask = tl.full((), True, tl.int1)
+            if LINEAR_KV_SAFE:
+                next_linear_local_idx = num_accepted + 1
+                kv_slot_is_linear_prefix = (
+                    (draft_local_idx == next_linear_local_idx)
+                    & (safe_sibling_idx == next_linear_local_idx)
+                )
+            else:
+                kv_slot_is_linear_prefix = tl.full((), True, tl.int1)
+            match = (
+                sibling_active
+                & (draft_token_id == target_token_id)
+                & allowed_by_mask
+                & kv_slot_is_linear_prefix
+            )
+            accepted_local_idx = tl.where(
+                match,
+                draft_local_idx,
+                accepted_local_idx,
+            )
+            next_sibling = tl.load(
+                retrieve_next_sibling_ptr
+                + req_idx * retrieve_next_sibling_stride_b
+                + safe_sibling_idx * retrieve_next_sibling_stride_w,
+                mask=sibling_active,
+                other=next_cur_index,
+            ).to(tl.int64)
+            next_cur_index = tl.where(
+                match,
+                safe_sibling_idx,
+                tl.where(sibling_active, next_sibling, next_cur_index),
+            )
+            found = found | match
+
+        if found:
+            num_accepted += 1
+            token_id = tl.load(
+                target_predict_ptr
+                + req_idx * target_predict_stride_b
+                + accepted_local_idx * target_predict_stride_w
+            )
+            tl.store(
+                output_token_ids_ptr
+                + req_idx * (max_spec_len + 1)
+                + output_idx,
+                token_id,
+                mask=output_idx <= max_spec_len,
+            )
+            tl.store(
+                accept_indices_ptr + req_idx * (max_spec_len + 1) + output_idx,
+                accepted_local_idx,
+                mask=output_idx <= max_spec_len,
+            )
+            last_accepted = accepted_local_idx
+            cur_index = next_cur_index
+        active = active & found
+
+
+def _tree_rejection_greedy_sample_kernel(
+    candidates: torch.Tensor,
+    retrieve_index: torch.Tensor,
+    retrieve_next_token: torch.Tensor,
+    retrieve_next_sibling: torch.Tensor,
+    target_predict: torch.Tensor,
+    logits: torch.Tensor,
+    metadata: SpecDecodeMetadata,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    assert metadata.tree_num_spec_steps is not None
+    batch_size = len(metadata.num_draft_tokens)
+    tree_num_spec_steps = metadata.tree_num_spec_steps
+    output_token_ids = torch.empty(
+        (batch_size, metadata.max_spec_len + 1),
+        dtype=torch.int32,
+        device=logits.device,
+    )
+    accept_indices = torch.empty_like(output_token_ids)
+    tree_valid = metadata.tree_valid
+    if tree_valid is None:
+        tree_valid = torch.ones(batch_size, dtype=torch.bool, device=logits.device)
+    tree_target_mask = metadata.tree_target_mask
+    target_mask_arg = tree_target_mask if tree_target_mask is not None else candidates
+    bonus_argmax = logits[
+        metadata.bonus_logits_indices.to(torch.long)
+    ].argmax(dim=-1).to(torch.int32)
+    _tree_rejection_greedy_sample_triton_kernel[(batch_size,)](
+        output_token_ids,
+        accept_indices,
+        candidates,
+        retrieve_index,
+        retrieve_next_token,
+        retrieve_next_sibling,
+        target_predict,
+        tree_valid,
+        target_mask_arg,
+        metadata.cu_num_draft_tokens,
+        bonus_argmax,
+        batch_size=batch_size,
+        max_spec_len=metadata.max_spec_len,
+        candidates_stride_b=candidates.stride(0),
+        candidates_stride_w=candidates.stride(1),
+        retrieve_index_stride_b=retrieve_index.stride(0),
+        retrieve_index_stride_w=retrieve_index.stride(1),
+        retrieve_next_token_stride_b=retrieve_next_token.stride(0),
+        retrieve_next_token_stride_w=retrieve_next_token.stride(1),
+        retrieve_next_sibling_stride_b=retrieve_next_sibling.stride(0),
+        retrieve_next_sibling_stride_w=retrieve_next_sibling.stride(1),
+        target_predict_stride_b=target_predict.stride(0),
+        target_predict_stride_w=target_predict.stride(1),
+        tree_valid_stride=tree_valid.stride(0),
+        target_mask_stride_b=target_mask_arg.stride(0),
+        target_mask_stride_w=target_mask_arg.stride(1),
+        TREE_NUM_SPEC_STEPS=tree_num_spec_steps,
+        MAX_TREE_NODES=candidates.shape[1],
+        MAX_OUTPUT_SLOTS=metadata.max_spec_len + 1,
+        PLACEHOLDER_ID=PLACEHOLDER_TOKEN_ID,
+        HAS_TARGET_MASK=tree_target_mask is not None,
+        LINEAR_KV_SAFE=metadata.tree_linear_kv_safe,
+    )
     return output_token_ids, accept_indices
 
 

@@ -17,6 +17,10 @@ if TYPE_CHECKING:
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
     from vllm.v1.request import Request
+    from vllm.v1.spec_decode.metadata import (
+        DynamicTreeCompactMetadata,
+        DynamicTreeDeviceMetadataHandle,
+    )
 else:
     ECConnectorMetadata = object
     KVConnectorMetadata = object
@@ -25,6 +29,8 @@ else:
     PoolingParams = object
     SamplingParams = object
     Request = object
+    DynamicTreeCompactMetadata = object
+    DynamicTreeDeviceMetadataHandle = object
 
 
 @dataclass
@@ -228,9 +234,11 @@ class SchedulerOutput:
 
     # Used for adjusting acceptance rate calculation.
     num_invalid_spec_tokens: dict[str, int] | None = None
-    # req_id -> tree metadata for scheduled speculative tokens.
+    # Request-local tree metadata aligned with the scheduled speculative
+    # token order. The worker consumes this by request position.
     scheduled_spec_decode_tree_metadata: (
-        dict[str, dict[str, list[int] | list[list[int]] | int | bool]] | None
+        list[DynamicTreeCompactMetadata | None] | None
+        | DynamicTreeDeviceMetadataHandle
     ) = None
 
     # KV Cache Connector metadata.

@@ -15,6 +15,7 @@ from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import (
     AttentionBackend,
+    AttentionCGSupport,
     AttentionImpl,
     AttentionMetadataBuilder,
     AttentionType,
@@ -98,6 +99,10 @@ class TreeAttentionMetadata:
     use_tree_decode_bias: bool = False
     tree_target_mask: torch.Tensor | None = None
     runtime_tree_attn_bias: torch.Tensor | None = None
+    tree_retrieve_next_token: torch.Tensor | None = None
+    tree_retrieve_next_sibling: torch.Tensor | None = None
+    tree_parent: torch.Tensor | None = None
+    use_tree_compact_bias_kernel: bool = False
     tree_root_only: bool = False
     expand_linear_chain_decode_as_q1: bool = False
 
@@ -197,6 +202,28 @@ class TreeAttentionMetadata:
             runtime_tree_attn_bias=self.runtime_tree_attn_bias[: self.num_decodes]
             if self.runtime_tree_attn_bias is not None
             else None,
+            tree_retrieve_next_token=self.tree_retrieve_next_token[
+                : self.num_decodes
+            ]
+            if self.tree_retrieve_next_token is not None
+            else None,
+            tree_retrieve_next_sibling=self.tree_retrieve_next_sibling[
+                : self.num_decodes
+            ]
+            if self.tree_retrieve_next_sibling is not None
+            else None,
+            tree_parent=self.tree_parent[: self.num_decodes]
+            if self.tree_parent is not None
+            else None,
+            use_tree_compact_bias_kernel=(
+                not self.tree_root_only
+                and os.environ.get("VLLM_TREE_ATTN_DYNAMIC_MASK_KERNEL") == "1"
+                and self.tree_parent is not None
+                and self._can_use_tree_compact_bias_kernel(
+                    q_seqlens,
+                    self.tree_parent.shape[-1],
+                )
+            ),
             tree_root_only=self.tree_root_only,
         )
         return self._cached_decode_metadata
@@ -204,7 +231,20 @@ class TreeAttentionMetadata:
     def _decode_tree_attn_bias(self, q_seqlens: torch.Tensor) -> torch.Tensor | None:
         if self.tree_root_only:
             return None
-        if not self.use_tree_decode_bias or self.tree_attn_bias is None:
+        if not self.use_tree_decode_bias or (
+            self.tree_attn_bias is None
+            and self.tree_retrieve_next_token is None
+            and self.tree_parent is None
+        ):
+            return None
+        if (
+            os.environ.get("VLLM_TREE_ATTN_DYNAMIC_MASK_KERNEL") == "1"
+            and self.tree_parent is not None
+        ):
+            tree_width = self.tree_parent.shape[-1]
+            if self._can_use_tree_compact_bias_kernel(q_seqlens, tree_width):
+                return None
+        if self.tree_attn_bias is None:
             return None
         if self.runtime_tree_attn_bias is not None:
             tree_width = self.runtime_tree_attn_bias.shape[-1]
@@ -229,8 +269,29 @@ class TreeAttentionMetadata:
             return self.tree_attn_bias
         return _apply_tree_target_mask(self.tree_attn_bias, self.tree_target_mask)
 
+    @staticmethod
+    def _can_use_tree_compact_bias_kernel(
+        q_seqlens: torch.Tensor,
+        tree_width: int,
+    ) -> bool:
+        # The compact kernel consumes per-row qlen from query_start_loc and
+        # uses tree_width only as the maximum local index space.  This covers
+        # mixed batches such as q1/no-draft rows beside full-tree rows as long
+        # as every row fits inside the padded runtime tree metadata.
+        return bool(torch.all((q_seqlens > 0) & (q_seqlens <= tree_width)).item())
+
 
 class TreeAttentionMetadataBuilder(AttentionMetadataBuilder[TreeAttentionMetadata]):
+    @classmethod
+    def get_cudagraph_support(
+        cls,
+        vllm_config: VllmConfig,
+        kv_cache_spec: AttentionSpec,
+    ) -> AttentionCGSupport:
+        if os.environ.get("VLLM_TREE_ATTN_CUDAGRAPH_PROBE") == "1":
+            return AttentionCGSupport.UNIFORM_BATCH
+        return AttentionCGSupport.NEVER
+
     def __init__(
         self,
         kv_cache_spec: AttentionSpec,
@@ -278,7 +339,17 @@ class TreeAttentionMetadataBuilder(AttentionMetadataBuilder[TreeAttentionMetadat
     ) -> TreeAttentionMetadata:
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
             split_decodes_and_prefills(
-                common_attn_metadata, decode_threshold=self.decode_threshold
+                common_attn_metadata,
+                decode_threshold=self.decode_threshold,
+                # Branching TREE_ATTN raises the decode threshold to the tree
+                # width so full-tree verify rows stay on the decode path.  A
+                # mixed batch can also contain short prefill rows with no draft
+                # tokens; applying the tree qq-bias to those ordinary prompt
+                # rows corrupts their causal prefill attention.
+                treat_short_extends_as_decodes=(
+                    not self.use_tree_decode_bias
+                    or common_attn_metadata.is_prefilling is None
+                ),
             )
         )
 
@@ -291,6 +362,9 @@ class TreeAttentionMetadataBuilder(AttentionMetadataBuilder[TreeAttentionMetadat
         slot_mapping = common_attn_metadata.slot_mapping
         tree_target_mask = common_attn_metadata.tree_target_mask
         runtime_tree_attn_bias = common_attn_metadata.tree_attn_bias
+        tree_retrieve_next_token = common_attn_metadata.tree_retrieve_next_token
+        tree_retrieve_next_sibling = common_attn_metadata.tree_retrieve_next_sibling
+        tree_parent = common_attn_metadata.tree_parent
 
         return TreeAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
@@ -308,6 +382,9 @@ class TreeAttentionMetadataBuilder(AttentionMetadataBuilder[TreeAttentionMetadat
             use_tree_decode_bias=self.use_tree_decode_bias,
             tree_target_mask=tree_target_mask,
             runtime_tree_attn_bias=runtime_tree_attn_bias,
+            tree_retrieve_next_token=tree_retrieve_next_token,
+            tree_retrieve_next_sibling=tree_retrieve_next_sibling,
+            tree_parent=tree_parent,
             tree_root_only=common_attn_metadata.tree_root_only,
             expand_linear_chain_decode_as_q1=(
                 self.is_linear_chain and self.enable_linear_chain_verify
@@ -431,6 +508,149 @@ def _apply_tree_target_mask(
     disabled[:, 0] = False
     masked_bias.masked_fill_(disabled[:, None, :], -torch.inf)
     return masked_bias.contiguous()
+
+
+def materialize_tree_attn_bias_from_retrieve_metadata(
+    tree_retrieve_next_token: torch.Tensor,
+    tree_retrieve_next_sibling: torch.Tensor,
+    tree_target_mask: torch.Tensor | None,
+    dtype: torch.dtype | None,
+    device: torch.device | None,
+) -> torch.Tensor:
+    """Materialize TREE_ATTN qq-bias from compact child/sibling metadata.
+
+    This is the correctness oracle for the compact metadata contract. The
+    current decode switch still returns a dense qq-bias for ``unified_attention``;
+    a future kernel can consume the same compact tensors directly.
+    """
+
+    if tree_retrieve_next_token.ndim != 2:
+        raise ValueError(
+            "tree_retrieve_next_token must be 2D, got "
+            f"{tree_retrieve_next_token.shape}"
+        )
+    if tree_retrieve_next_sibling.shape != tree_retrieve_next_token.shape:
+        raise ValueError(
+            "tree_retrieve_next_sibling shape must match "
+            "tree_retrieve_next_token, got "
+            f"{tree_retrieve_next_sibling.shape} and "
+            f"{tree_retrieve_next_token.shape}"
+        )
+
+    batch_size, tree_width = tree_retrieve_next_token.shape
+    device = device if device is not None else tree_retrieve_next_token.device
+    if dtype is None:
+        dtype = torch.float32
+    next_token = tree_retrieve_next_token.to(device=device, dtype=torch.long)
+    next_sibling = tree_retrieve_next_sibling.to(device=device, dtype=torch.long)
+    batch_indices = torch.arange(batch_size, dtype=torch.long, device=device)
+
+    parent_by_child = torch.full(
+        (batch_size, tree_width),
+        -1,
+        dtype=torch.long,
+        device=device,
+    )
+    for parent_idx in range(tree_width):
+        child_idx = next_token[:, parent_idx]
+        visited = torch.zeros(
+            (batch_size, tree_width),
+            dtype=torch.bool,
+            device=device,
+        )
+        for _ in range(tree_width):
+            safe_child_idx = child_idx.clamp(0, tree_width - 1)
+            valid = (
+                (child_idx >= 0)
+                & (child_idx < tree_width)
+                & ~visited[batch_indices, safe_child_idx]
+            )
+
+            current_parent = parent_by_child.gather(
+                1, safe_child_idx[:, None]
+            ).squeeze(1)
+            updated_parent = torch.where(
+                valid,
+                torch.full_like(current_parent, parent_idx),
+                current_parent,
+            )
+            parent_by_child.scatter_(
+                1,
+                safe_child_idx[:, None],
+                updated_parent[:, None],
+            )
+
+            current_visited = visited.gather(1, safe_child_idx[:, None]).squeeze(1)
+            updated_visited = current_visited | valid
+            visited.scatter_(1, safe_child_idx[:, None], updated_visited[:, None])
+
+            next_child = next_sibling.gather(1, safe_child_idx[:, None]).squeeze(1)
+            child_idx = torch.where(valid, next_child, torch.full_like(child_idx, -1))
+
+    reachable = torch.zeros(
+        (batch_size, tree_width),
+        dtype=torch.bool,
+        device=device,
+    )
+    reachable[:, 0] = True
+    parent_valid = parent_by_child >= 0
+    safe_parent = parent_by_child.clamp(0, tree_width - 1)
+    for _ in range(tree_width):
+        reachable |= parent_valid & reachable.gather(1, safe_parent)
+
+    visible = torch.zeros(
+        (batch_size, tree_width, tree_width),
+        dtype=torch.bool,
+        device=device,
+    )
+    for local_idx in range(tree_width):
+        cur_idx = torch.full(
+            (batch_size,),
+            local_idx,
+            dtype=torch.long,
+            device=device,
+        )
+        active = reachable[:, local_idx]
+        visited = torch.zeros(
+            (batch_size, tree_width),
+            dtype=torch.bool,
+            device=device,
+        )
+        row = visible[:, local_idx, :]
+        for _ in range(tree_width):
+            safe_cur_idx = cur_idx.clamp(0, tree_width - 1)
+            valid = (
+                active
+                & (cur_idx >= 0)
+                & (cur_idx < tree_width)
+                & ~visited[batch_indices, safe_cur_idx]
+            )
+
+            current_visible = row.gather(1, safe_cur_idx[:, None]).squeeze(1)
+            row.scatter_(1, safe_cur_idx[:, None], (current_visible | valid)[:, None])
+
+            current_visited = visited.gather(1, safe_cur_idx[:, None]).squeeze(1)
+            visited.scatter_(
+                1,
+                safe_cur_idx[:, None],
+                (current_visited | valid)[:, None],
+            )
+
+            next_cur = parent_by_child.gather(1, safe_cur_idx[:, None]).squeeze(1)
+            cur_idx = torch.where(valid, next_cur, torch.full_like(cur_idx, -1))
+            active = valid & (next_cur >= 0)
+
+    tree_attn_bias = torch.full(
+        (batch_size, tree_width, tree_width),
+        -torch.inf,
+        dtype=dtype,
+        device=device,
+    )
+    tree_attn_bias.masked_fill_(visible, 0)
+    if tree_target_mask is not None:
+        tree_target_mask = tree_target_mask.to(device=device)
+        tree_attn_bias = _apply_tree_target_mask(tree_attn_bias, tree_target_mask)
+    return tree_attn_bias.contiguous()
 
 
 def build_static_tree_retrieve_metadata(
@@ -621,7 +841,10 @@ class TreeAttentionImpl(AttentionImpl):
             run_flash_attn(prefill_meta, num_decode_tokens)
 
         if decode_meta := attn_metadata.decode_metadata:
-            if decode_meta.tree_attn_bias is None:
+            if (
+                decode_meta.tree_attn_bias is None
+                and not decode_meta.use_tree_compact_bias_kernel
+            ):
                 run_flash_attn(decode_meta, 0)
                 return output
 
@@ -639,6 +862,18 @@ class TreeAttentionImpl(AttentionImpl):
                 causal=True,
                 alibi_slopes=self.alibi_slopes,
                 qq_bias=decode_meta.tree_attn_bias,
+                tree_retrieve_next_token=decode_meta.tree_retrieve_next_token
+                if decode_meta.use_tree_compact_bias_kernel
+                else None,
+                tree_retrieve_next_sibling=decode_meta.tree_retrieve_next_sibling
+                if decode_meta.use_tree_compact_bias_kernel
+                else None,
+                tree_parent=decode_meta.tree_parent
+                if decode_meta.use_tree_compact_bias_kernel
+                else None,
+                tree_target_mask=decode_meta.tree_target_mask
+                if decode_meta.use_tree_compact_bias_kernel
+                else None,
                 window_size=self.sliding_window,
                 block_table=decode_meta.block_table,
                 softcap=self.logits_soft_cap,

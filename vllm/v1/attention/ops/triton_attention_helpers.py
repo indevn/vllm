@@ -359,6 +359,73 @@ def load_qq_bias_tile(
 
 
 @triton.jit
+def load_tree_compact_bias_tile(
+    tree_parent_ptr,
+    tree_target_mask_ptr,
+    seq_idx,
+    query_pos,
+    seq_offset,
+    context_len,
+    parent_stride_0: tl.int64,
+    parent_stride_1: tl.int64,
+    target_mask_stride_0: tl.int64,
+    target_mask_stride_1: tl.int64,
+    TREE_WIDTH: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    TILE_SIZE: tl.constexpr,
+    USE_TREE_TARGET_MASK: tl.constexpr,
+):
+    """Build TREE_ATTN query-query bias from compact runtime metadata.
+
+    Prefix KV columns keep zero bias.  Columns inside the current query tree
+    are visible only when the key local index is the query row itself or one of
+    its ancestors, and the runtime target mask keeps that key enabled.  Root
+    local index 0 is always target-visible to match the dense oracle path.
+    """
+
+    key_rel_pos = seq_offset - context_len
+    is_query_key = (key_rel_pos >= 0) & (key_rel_pos < TREE_WIDTH)
+    query_local = query_pos[:, None]
+    key_local = key_rel_pos[None, :]
+    query_in_tree = (query_local >= 0) & (query_local < TREE_WIDTH)
+
+    visible = tl.full((BLOCK_M, TILE_SIZE), False, tl.int1)
+    active = query_in_tree
+    cur_local = query_local
+
+    for _ in range(TREE_WIDTH):
+        safe_cur = tl.maximum(0, tl.minimum(cur_local, TREE_WIDTH - 1))
+        step_valid = active & (cur_local >= 0) & (cur_local < TREE_WIDTH)
+        visible |= step_valid & (safe_cur == key_local)
+
+        parent = tl.load(
+            tree_parent_ptr + seq_idx * parent_stride_0 + safe_cur * parent_stride_1,
+            mask=step_valid,
+            other=-1,
+        )
+        active = step_valid & (safe_cur != 0) & (parent >= 0)
+        cur_local = parent
+
+    if USE_TREE_TARGET_MASK:
+        safe_key = tl.maximum(0, tl.minimum(key_rel_pos, TREE_WIDTH - 1))
+        target_visible = (
+            tl.load(
+                tree_target_mask_ptr
+                + seq_idx * target_mask_stride_0
+                + safe_key * target_mask_stride_1,
+                mask=is_query_key,
+                other=0,
+            )
+            != 0
+        )
+        # Root remains visible even if malformed runtime metadata clears it.
+        target_visible |= key_rel_pos == 0
+        visible &= target_visible[None, :]
+
+    return tl.where(is_query_key[None, :] & ~visible, float("-inf"), 0.0)
+
+
+@triton.jit
 def softmax_step(S, M, L):
     """Online softmax update for one tile.
 

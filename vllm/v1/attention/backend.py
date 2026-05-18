@@ -410,6 +410,18 @@ class CommonAttentionMetadata:
     """Optional root-inclusive per-request TREE_ATTN qq-bias override.
     Shape is (batch_size, tree_width, tree_width)."""
 
+    tree_retrieve_next_token: torch.Tensor | None = None
+    """Optional compact TREE_ATTN child-list metadata.
+    Shape is (batch_size, tree_width)."""
+
+    tree_retrieve_next_sibling: torch.Tensor | None = None
+    """Optional compact TREE_ATTN sibling-list metadata.
+    Shape is (batch_size, tree_width)."""
+
+    tree_parent: torch.Tensor | None = None
+    """Optional compact TREE_ATTN parent metadata derived from child/sibling
+    lists. Shape is (batch_size, tree_width)."""
+
     tree_root_only: bool = False
     """When true, TREE_ATTN metadata is present for tracing/verifier state, but
     target attention should compute the scheduled tokens as ordinary causal
@@ -505,6 +517,13 @@ class CommonAttentionMetadata:
             is_prefilling=maybe_slice_reqs(self.is_prefilling),
             tree_target_mask=maybe_slice_reqs(self.tree_target_mask),
             tree_attn_bias=maybe_slice_reqs(self.tree_attn_bias),
+            tree_retrieve_next_token=maybe_slice_reqs(
+                self.tree_retrieve_next_token
+            ),
+            tree_retrieve_next_sibling=maybe_slice_reqs(
+                self.tree_retrieve_next_sibling
+            ),
+            tree_parent=maybe_slice_reqs(self.tree_parent),
             tree_root_only=self.tree_root_only,
         )
 

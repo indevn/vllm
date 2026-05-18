@@ -17,10 +17,16 @@ if TYPE_CHECKING:
         KVConnectorWorkerMetadata,
     )
     from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+    from vllm.v1.spec_decode.metadata import (
+        DynamicTreeCompactMetadata,
+        DynamicTreeDeviceMetadataHandle,
+    )
 else:
     KVConnectorStats = object
     KVConnectorWorkerMetadata = object
     KVConnectorKVEvents = object
+    DynamicTreeCompactMetadata = object
+    DynamicTreeDeviceMetadataHandle = object
 
 
 class LogprobsLists(NamedTuple):
@@ -227,11 +233,14 @@ class DraftTokenIds:
     req_ids: list[str]
     # num_reqs x num_draft_tokens
     draft_token_ids: list[list[int]]
-    # Optional request-local dynamic/tree verification metadata.
-    # The scheduler keeps this with the draft tokens until the next target
-    # verification step.
+    # Optional request-local dynamic/tree verification metadata aligned with
+    # ``req_ids``. The scheduler keeps this sequence with the draft tokens
+    # until the next target verification step.
     tree_metadata: (
-        dict[str, dict[str, list[int] | list[list[int]] | int | bool]] | None
+        list[DynamicTreeCompactMetadata | None]
+        | DynamicTreeDeviceMetadataHandle
+        | dict[str, DynamicTreeCompactMetadata]
+        | None
     ) = None
 
 

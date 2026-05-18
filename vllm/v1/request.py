@@ -27,6 +27,10 @@ from vllm.v1.utils import ConstantList
 if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
     from vllm.v1.core.kv_cache_utils import BlockHash
+    from vllm.v1.spec_decode.metadata import (
+        DynamicTreeCompactMetadata,
+        DynamicTreeDeviceMetadataHandle,
+    )
 
 
 @dataclass
@@ -143,7 +147,7 @@ class Request:
 
         self.spec_token_ids: list[int] = []
         self.spec_token_tree_metadata: (
-            dict[str, list[int] | list[list[int]] | int | bool] | None
+            DynamicTreeCompactMetadata | DynamicTreeDeviceMetadataHandle | None
         ) = None
         self.num_computed_tokens = 0
         self.cache_salt: str | None = cache_salt

@@ -24,6 +24,7 @@ from vllm.v1.attention.ops.triton_attention_helpers import (
     find_seq_idx,
     init_softmax_M,
     load_qq_bias_tile,
+    load_tree_compact_bias_tile,
     resolve_seq_and_query_len,
     softmax_step,
     store_segm_reduce_scalars,
@@ -73,6 +74,8 @@ def kernel_unified_attention(
     seq_lens_ptr,
     alibi_slopes_ptr,
     qq_bias_ptr,
+    tree_parent_ptr,
+    tree_target_mask_ptr,
     # Per-(token, head) scale caches (used iff KV_QUANT_MODE in {2, 3}).
     # For other modes callers may pass any non-null pointer.
     k_scale_cache_ptr,
@@ -94,6 +97,11 @@ def kernel_unified_attention(
     qq_bias_stride_1: tl.int64,  # int
     qq_bias_stride_2: tl.int64,  # int
     qq_bias_width: tl.constexpr,  # int
+    tree_parent_stride_0: tl.int64,  # int
+    tree_parent_stride_1: tl.int64,  # int
+    tree_target_mask_stride_0: tl.int64,  # int
+    tree_target_mask_stride_1: tl.int64,  # int
+    tree_compact_width: tl.constexpr,  # int
     BLOCK_SIZE: tl.constexpr,  # int
     TILE_SIZE: tl.constexpr,  # int must be power of 2
     HEAD_SIZE: tl.constexpr,  # int
@@ -101,6 +109,8 @@ def kernel_unified_attention(
     USE_ALIBI_SLOPES: tl.constexpr,  # bool
     USE_ALIBI_SQRT: tl.constexpr,  # bool
     USE_QQ_BIAS: tl.constexpr,  # bool
+    USE_TREE_COMPACT_BIAS: tl.constexpr,  # bool
+    USE_TREE_TARGET_MASK: tl.constexpr,  # bool
     USE_SOFTCAP: tl.constexpr,  # bool
     USE_SINKS: tl.constexpr,  # bool
     SLIDING_WINDOW: tl.constexpr,  # int
@@ -334,6 +344,23 @@ def kernel_unified_attention(
                 qq_bias_stride_2,
                 qq_bias_width,
             )
+        if USE_TREE_COMPACT_BIAS:
+            S += load_tree_compact_bias_tile(
+                tree_parent_ptr,
+                tree_target_mask_ptr,
+                seq_idx,
+                query_pos,
+                seq_offset,
+                context_len,
+                tree_parent_stride_0,
+                tree_parent_stride_1,
+                tree_target_mask_stride_0,
+                tree_target_mask_stride_1,
+                tree_compact_width,
+                BLOCK_M,
+                TILE_SIZE,
+                USE_TREE_TARGET_MASK,
+            )
 
         M, L, P, alpha = softmax_step(S, M, L)
         acc = acc * alpha[:, None]
@@ -540,6 +567,10 @@ def unified_attention(
     alibi_slopes=None,
     output_scale=None,
     qq_bias=None,
+    tree_retrieve_next_token=None,
+    tree_retrieve_next_sibling=None,
+    tree_parent=None,
+    tree_target_mask=None,
     # Optional tensor for sinks
     sinks=None,
     # Optional tensor for prefix lengths (PrefixLM support)
@@ -581,6 +612,15 @@ def unified_attention(
     use_alibi_slopes = alibi_slopes is not None
     use_qq_bias = qq_bias is not None
     qq_bias_batched = bool(use_qq_bias and qq_bias.ndim == 3)
+    use_tree_compact_bias = tree_parent is not None
+    if use_tree_compact_bias:
+        assert not use_qq_bias, (
+            "compact TREE_ATTN bias and dense qq_bias are mutually exclusive"
+        )
+        assert tree_parent.ndim == 2
+        if tree_target_mask is not None:
+            assert tree_target_mask.shape == tree_parent.shape
+    use_tree_target_mask = use_tree_compact_bias and tree_target_mask is not None
 
     block_size = v.shape[1]
     num_seqs = len(seqused_k)
@@ -685,6 +725,8 @@ def unified_attention(
         seq_lens_ptr=seqused_k,
         alibi_slopes_ptr=alibi_slopes,
         qq_bias_ptr=qq_bias,
+        tree_parent_ptr=tree_parent if use_tree_compact_bias else block_table,
+        tree_target_mask_ptr=tree_target_mask if use_tree_target_mask else block_table,
         k_scale_cache_ptr=k_scale_ptr,
         v_scale_cache_ptr=v_scale_ptr,
         scale=softmax_scale,
@@ -703,6 +745,15 @@ def unified_attention(
         qq_bias_stride_1=qq_bias.stride(-2) if use_qq_bias else 0,
         qq_bias_stride_2=qq_bias.stride(-1) if use_qq_bias else 0,
         qq_bias_width=qq_bias.shape[-1] if use_qq_bias else 0,
+        tree_parent_stride_0=tree_parent.stride(0) if use_tree_compact_bias else 0,
+        tree_parent_stride_1=tree_parent.stride(1) if use_tree_compact_bias else 0,
+        tree_target_mask_stride_0=tree_target_mask.stride(0)
+        if use_tree_target_mask
+        else 0,
+        tree_target_mask_stride_1=tree_target_mask.stride(1)
+        if use_tree_target_mask
+        else 0,
+        tree_compact_width=tree_parent.shape[-1] if use_tree_compact_bias else 0,
         BLOCK_SIZE=block_size,
         TILE_SIZE=tile_size,
         HEAD_SIZE=head_size,
@@ -710,6 +761,8 @@ def unified_attention(
         USE_ALIBI_SLOPES=use_alibi_slopes,
         USE_ALIBI_SQRT=use_alibi_sqrt,
         USE_QQ_BIAS=use_qq_bias,
+        USE_TREE_COMPACT_BIAS=use_tree_compact_bias,
+        USE_TREE_TARGET_MASK=use_tree_target_mask,
         USE_SOFTCAP=(softcap > 0),
         USE_SINKS=(sinks is not None),
         USE_MM_PREFIX=use_mm_prefix,

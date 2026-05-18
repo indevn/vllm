@@ -38,6 +38,14 @@ def load_jsonl(path: str) -> list[dict[str, Any]]:
     return records
 
 
+def token_trace_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        record
+        for record in records
+        if isinstance(record.get("output_token_ids"), list)
+    ]
+
+
 def best_trace_offset(case_tokens: list[int], trace_outputs: list[int]) -> int:
     best_len = -1
     best_offset = 0
@@ -57,7 +65,7 @@ def best_trace_offset(case_tokens: list[int], trace_outputs: list[int]) -> int:
 
 def trace_match_score(case_tokens: list[int], traces: list[dict[str, Any]]) -> int:
     trace_outputs: list[int] = []
-    for record in traces:
+    for record in token_trace_records(traces):
         trace_outputs.extend(int(token_id) for token_id in record["output_token_ids"])
     offset = best_trace_offset(case_tokens, trace_outputs)
     matched = 0
@@ -74,7 +82,7 @@ def group_traces_by_request(
     traces: list[dict[str, Any]],
 ) -> list[tuple[str | None, list[dict[str, Any]]]]:
     trace_groups: dict[str | None, list[dict[str, Any]]] = {}
-    for record in traces:
+    for record in token_trace_records(traces):
         trace_groups.setdefault(record.get("request_id"), []).append(record)
     return list(trace_groups.items())
 
@@ -116,6 +124,7 @@ def summarize_prompt(
     first_token_diff: int | None,
     traces: list[dict[str, Any]],
 ) -> dict[str, Any]:
+    traces = token_trace_records(traces)
     trace_outputs: list[int] = []
     for record in traces:
         trace_outputs.extend(int(token_id) for token_id in record["output_token_ids"])

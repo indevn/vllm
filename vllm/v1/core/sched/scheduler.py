@@ -57,6 +57,10 @@ from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+from vllm.v1.spec_decode.metadata import (
+    DynamicTreeCompactMetadata,
+    DynamicTreeDeviceMetadataHandle,
+)
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
@@ -378,8 +382,9 @@ class Scheduler(SchedulerInterface):
         encoder_compute_budget = self.max_num_encoder_input_tokens
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
-        scheduled_spec_decode_tree_metadata: dict[
-            str, dict[str, list[int] | list[list[int]] | int | bool]
+        scheduled_spec_decode_tree_metadata_by_req: dict[
+            str,
+            DynamicTreeCompactMetadata | DynamicTreeDeviceMetadataHandle | None,
         ] = {}
 
         # For logging.
@@ -491,7 +496,7 @@ class Scheduler(SchedulerInterface):
                             token_budget += num_scheduled_tokens.pop(preempted_req_id)
                             req_to_new_blocks.pop(preempted_req_id)
                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
-                            scheduled_spec_decode_tree_metadata.pop(
+                            scheduled_spec_decode_tree_metadata_by_req.pop(
                                 preempted_req_id, None
                             )
                             preempted_encoder_inputs = scheduled_encoder_inputs.pop(
@@ -540,10 +545,9 @@ class Scheduler(SchedulerInterface):
                     if len(spec_token_ids) > num_scheduled_spec_tokens:
                         spec_token_ids = spec_token_ids[:num_scheduled_spec_tokens]
                     scheduled_spec_decode_tokens[request.request_id] = spec_token_ids
-                    if request.spec_token_tree_metadata is not None:
-                        scheduled_spec_decode_tree_metadata[request.request_id] = (
-                            request.spec_token_tree_metadata
-                        )
+                    scheduled_spec_decode_tree_metadata_by_req[request_id] = (
+                        request.spec_token_tree_metadata
+                    )
 
                 # New spec tokens will be set in `update_draft_token_ids` before the
                 # next step when applicable.
@@ -907,6 +911,24 @@ class Scheduler(SchedulerInterface):
                 scheduled_spec_decode_tokens,
                 req_to_new_blocks,
             )
+
+        scheduled_spec_decode_tree_metadata: (
+            list[
+                DynamicTreeCompactMetadata | DynamicTreeDeviceMetadataHandle | None
+            ]
+            | None
+        ) = None
+        if any(
+            metadata is not None
+            for metadata in scheduled_spec_decode_tree_metadata_by_req.values()
+        ):
+            # Align with scheduled_spec_decode_tokens insertion order. The
+            # worker attaches rows to its post-condense/reorder batch by
+            # zipping this list with scheduled_spec_decode_tokens keys.
+            scheduled_spec_decode_tree_metadata = [
+                scheduled_spec_decode_tree_metadata_by_req.get(req_id)
+                for req_id in scheduled_spec_decode_tokens
+            ]
 
         # Record the request ids that were scheduled in this step.
         self.prev_step_scheduled_req_ids.clear()
@@ -1674,11 +1696,29 @@ class Scheduler(SchedulerInterface):
                 self.encoder_cache_manager.free_encoder_input(request, input_id)
 
     def update_draft_token_ids(self, draft_token_ids: DraftTokenIds) -> None:
-        tree_metadata = draft_token_ids.tree_metadata or {}
-        for req_id, spec_token_ids in zip(
-            draft_token_ids.req_ids,
-            draft_token_ids.draft_token_ids,
+        tree_metadata = draft_token_ids.tree_metadata
+        tree_metadata_by_req = (
+            {
+                req_id: tree_metadata
+                for req_id in tree_metadata.req_ids
+            }
+            if isinstance(tree_metadata, DynamicTreeDeviceMetadataHandle)
+            else None
+        )
+        for req_idx, (req_id, spec_token_ids) in enumerate(
+            zip(
+                draft_token_ids.req_ids,
+                draft_token_ids.draft_token_ids,
+            )
         ):
+            if tree_metadata_by_req is not None:
+                tree_metadata_for_req = tree_metadata_by_req.get(req_id)
+            elif isinstance(tree_metadata, dict):
+                tree_metadata_for_req = tree_metadata.get(req_id)
+            elif tree_metadata is not None and req_idx < len(tree_metadata):
+                tree_metadata_for_req = tree_metadata[req_idx]
+            else:
+                tree_metadata_for_req = None
             request = self.requests.get(req_id)
             if request is None or request.is_finished():
                 # The request may have been finished. Skip.
@@ -1697,7 +1737,17 @@ class Scheduler(SchedulerInterface):
                 spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)  # type: ignore[union-attr]
                 request.spec_token_tree_metadata = None
             else:
-                request.spec_token_tree_metadata = tree_metadata.get(req_id)
+                spec_token_tree_metadata = tree_metadata_for_req
+                if spec_token_tree_metadata is not None and not isinstance(
+                    spec_token_tree_metadata,
+                    (DynamicTreeCompactMetadata, DynamicTreeDeviceMetadataHandle),
+                ):
+                    spec_token_tree_metadata = (
+                        DynamicTreeCompactMetadata.from_mapping(
+                            spec_token_tree_metadata
+                        )
+                    )
+                request.spec_token_tree_metadata = spec_token_tree_metadata
             request.spec_token_ids = spec_token_ids
 
     def update_draft_token_ids_in_output(
@@ -1706,6 +1756,15 @@ class Scheduler(SchedulerInterface):
         num_invalid_spec_tokens: dict[str, int] = {}
 
         sched_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        tree_metadata = scheduler_output.scheduled_spec_decode_tree_metadata
+        tree_metadata_req_index = (
+            {
+                req_id: req_idx
+                for req_idx, req_id in enumerate(sched_spec_tokens)
+            }
+            if tree_metadata
+            else {}
+        )
         for req_id, spec_token_ids in zip(
             draft_token_ids.req_ids,
             draft_token_ids.draft_token_ids,
@@ -1728,10 +1787,12 @@ class Scheduler(SchedulerInterface):
                 metadata = request.structured_output_request
                 assert metadata is not None and metadata.grammar is not None
                 spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)
-                if scheduler_output.scheduled_spec_decode_tree_metadata:
-                    scheduler_output.scheduled_spec_decode_tree_metadata.pop(
-                        req_id, None
-                    )
+                if tree_metadata:
+                    # SchedulerOutput tree metadata rows are aligned with
+                    # scheduled_spec_decode_tokens insertion order.
+                    req_idx = tree_metadata_req_index.get(req_id)
+                    if req_idx is not None and req_idx < len(tree_metadata):
+                        tree_metadata[req_idx] = None
             # Pad to original number of spec tokens.
             num_invalid_tokens = orig_num_spec_tokens - len(spec_token_ids)
             if num_invalid_tokens:

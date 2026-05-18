@@ -170,10 +170,23 @@ from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID, RejectionSamp
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
+from vllm.v1.spec_decode.dynamic_tree_relocation import (
+    clear_dynamic_tree_relocation_cache,
+    dynamic_tree_relocation_index_tensors,
+    dynamic_tree_relocation_local_tensors,
+    dynamic_tree_relocation_pairs,
+    dynamic_tree_sample_relocation_index_tensors,
+    dynamic_tree_sample_relocation_pairs,
+)
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
-from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.spec_decode.metadata import (
+    DynamicTreeCompactArrayView,
+    DynamicTreeCompactMetadata,
+    DynamicTreeDeviceMetadataHandle,
+    SpecDecodeMetadata,
+)
 from vllm.v1.spec_decode.ngram_proposer_gpu import (
     NgramProposerGPU,
     copy_num_valid_draft_tokens,
@@ -619,6 +632,20 @@ class GPUModelRunner(
         self.spec_verify_state_trace_path = os.environ.get(
             "VLLM_SPEC_VERIFY_STATE_TRACE_PATH"
         )
+        self.tree_attn_stage_profile = (
+            os.environ.get("VLLM_TREE_ATTN_STAGE_PROFILE") == "1"
+        )
+        self.tree_attn_stage_profile_sync = (
+            os.environ.get("VLLM_TREE_ATTN_STAGE_PROFILE_SYNC") == "1"
+        )
+        self._tree_attn_stage_profile_step = 0
+        self.tree_attn_trace_sample_every = int(
+            os.environ.get("VLLM_TREE_ATTN_TRACE_SAMPLE_EVERY", "1")
+        )
+        if self.tree_attn_trace_sample_every < 1:
+            raise ValueError("VLLM_TREE_ATTN_TRACE_SAMPLE_EVERY must be >= 1")
+        self._tree_attn_trace_step = 0
+        self._tree_attn_trace_dump_current_step = True
         self.force_tree_attn_serial_q1_replay = (
             os.environ.get("VLLM_TREE_ATTN_FORCE_SERIAL_Q1_REPLAY") == "1"
         )
@@ -632,6 +659,33 @@ class GPUModelRunner(
         )
         self.tree_attn_serial_accepted_state_repair = (
             os.environ.get("VLLM_TREE_ATTN_SERIAL_ACCEPTED_STATE_REPAIR") == "1"
+        )
+        self.tree_attn_serial_accepted_state_repair_batch_by_depth = (
+            os.environ.get(
+                "VLLM_TREE_ATTN_SERIAL_ACCEPTED_STATE_REPAIR_BATCH_BY_DEPTH"
+            )
+            == "1"
+        )
+        self.tree_attn_serial_accepted_state_repair_scope = os.environ.get(
+            "VLLM_TREE_ATTN_SERIAL_ACCEPTED_STATE_REPAIR_SCOPE",
+            "all",
+        ).lower()
+        self.tree_attn_tensor_relocation_indices = (
+            os.environ.get("VLLM_TREE_ATTN_TENSOR_RELOCATION_INDICES") == "1"
+        )
+        if self.tree_attn_serial_accepted_state_repair_scope not in {
+            "all",
+            "nonprefix",
+            "fallback_req",
+            "fallback_or_nonprefix",
+        }:
+            raise ValueError(
+                "VLLM_TREE_ATTN_SERIAL_ACCEPTED_STATE_REPAIR_SCOPE must be one "
+                "of all, nonprefix, fallback_req, fallback_or_nonprefix; got "
+                f"{self.tree_attn_serial_accepted_state_repair_scope!r}"
+            )
+        self.tree_attn_cudagraph_probe = (
+            os.environ.get("VLLM_TREE_ATTN_CUDAGRAPH_PROBE") == "1"
         )
         self.enable_tree_attn_linear_chain_multi_token_verify = (
             os.environ.get("VLLM_TREE_ATTN_ENABLE_LINEAR_CHAIN_MULTI_TOKEN_VERIFY")
@@ -789,6 +843,95 @@ class GPUModelRunner(
         self.num_accepted_tokens = self._make_buffer(
             self.max_num_reqs, dtype=torch.int32
         )
+        self._tree_cudagraph_metadata_width = (
+            self.num_spec_tokens + 1 if self.num_spec_tokens > 0 else 0
+        )
+        if self._tree_cudagraph_metadata_width > 0:
+            tree_shape = (self.max_num_reqs, self._tree_cudagraph_metadata_width)
+            self._tree_cg_target_logits_indices = torch.empty(
+                tree_shape, dtype=torch.int32, device=self.device
+            )
+            self._tree_cg_retrieve_index = torch.empty(
+                tree_shape, dtype=torch.int32, device=self.device
+            )
+            self._tree_cg_retrieve_next_token = torch.empty(
+                tree_shape, dtype=torch.int32, device=self.device
+            )
+            self._tree_cg_retrieve_next_sibling = torch.empty(
+                tree_shape, dtype=torch.int32, device=self.device
+            )
+            self._tree_cg_parent = torch.empty(
+                tree_shape, dtype=torch.int32, device=self.device
+            )
+            self._tree_cg_target_mask = torch.empty(
+                tree_shape, dtype=torch.int32, device=self.device
+            )
+            self._tree_cg_position_offsets = torch.empty(
+                tree_shape, dtype=torch.int64, device=self.device
+            )
+            self._tree_cg_valid = torch.empty(
+                self.max_num_reqs, dtype=torch.bool, device=self.device
+            )
+            self._tree_cg_attn_bias = torch.empty(
+                (
+                    self.max_num_reqs,
+                    self._tree_cudagraph_metadata_width,
+                    self._tree_cudagraph_metadata_width,
+                ),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            self._tree_runtime_target_logits_indices_buffer = self._make_buffer(
+                *tree_shape, dtype=torch.int32
+            )
+            self._tree_runtime_retrieve_index_buffer = self._make_buffer(
+                *tree_shape, dtype=torch.int32
+            )
+            self._tree_runtime_retrieve_next_token_buffer = self._make_buffer(
+                *tree_shape, dtype=torch.int32
+            )
+            self._tree_runtime_retrieve_next_sibling_buffer = self._make_buffer(
+                *tree_shape, dtype=torch.int32
+            )
+            self._tree_runtime_parent_buffer = self._make_buffer(
+                *tree_shape, dtype=torch.int32
+            )
+            self._tree_runtime_target_mask_buffer = self._make_buffer(
+                *tree_shape, dtype=torch.int32
+            )
+            self._tree_runtime_position_offsets_buffer = self._make_buffer(
+                *tree_shape, dtype=torch.int64
+            )
+            self._tree_runtime_valid_buffer = self._make_buffer(
+                self.max_num_reqs, dtype=torch.bool
+            )
+            self._tree_runtime_attn_bias_buffer = self._make_buffer(
+                self.max_num_reqs,
+                self._tree_cudagraph_metadata_width,
+                self._tree_cudagraph_metadata_width,
+                dtype=torch.float32,
+            )
+            self._tree_runtime_target_logits_indices = (
+                self._tree_runtime_target_logits_indices_buffer.gpu
+            )
+            self._tree_runtime_retrieve_index = (
+                self._tree_runtime_retrieve_index_buffer.gpu
+            )
+            self._tree_runtime_retrieve_next_token = (
+                self._tree_runtime_retrieve_next_token_buffer.gpu
+            )
+            self._tree_runtime_retrieve_next_sibling = (
+                self._tree_runtime_retrieve_next_sibling_buffer.gpu
+            )
+            self._tree_runtime_parent = self._tree_runtime_parent_buffer.gpu
+            self._tree_runtime_target_mask = (
+                self._tree_runtime_target_mask_buffer.gpu
+            )
+            self._tree_runtime_position_offsets = (
+                self._tree_runtime_position_offsets_buffer.gpu
+            )
+            self._tree_runtime_valid = self._tree_runtime_valid_buffer.gpu
+            self._tree_runtime_attn_bias = self._tree_runtime_attn_bias_buffer.gpu
 
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
         if self.uses_mrope:
@@ -2275,6 +2418,18 @@ class GPUModelRunner(
             if spec_decode_metadata is not None
             and spec_decode_metadata.has_tree_metadata
             else None,
+            tree_retrieve_next_token=spec_decode_metadata.tree_retrieve_next_token
+            if spec_decode_metadata is not None
+            and spec_decode_metadata.has_tree_metadata
+            else None,
+            tree_retrieve_next_sibling=spec_decode_metadata.tree_retrieve_next_sibling
+            if spec_decode_metadata is not None
+            and spec_decode_metadata.has_tree_metadata
+            else None,
+            tree_parent=spec_decode_metadata.tree_parent
+            if spec_decode_metadata is not None
+            and spec_decode_metadata.has_tree_metadata
+            else None,
             tree_root_only=spec_decode_metadata.force_reject_all
             if spec_decode_metadata is not None
             and spec_decode_metadata.has_tree_metadata
@@ -2699,7 +2854,7 @@ class GPUModelRunner(
         # Step 1.
         # cu_num_sampled_tokens: [4, 5, 8, 9, 11]
         # _arange_scratch[:11]: [0, 1, 2, 3, 0, 0, 1, 2, 0, 0, 1]
-        cu_num_sampled_tokens = self._get_cumsum_and_arange(
+        cu_num_sampled_tokens_np = self._get_cumsum_and_arange(
             num_sampled_tokens, self._arange_scratch, cumsum_dtype=np.int32
         )
         # Step 2. [0, 0, 0, 0, 103, 104, 104, 104, 206, 207, 207]
@@ -2707,10 +2862,10 @@ class GPUModelRunner(
             cu_num_scheduled_tokens - num_sampled_tokens, num_sampled_tokens
         )
         # Step 3. [0, 1, 2, 3, 103, 104, 105, 106, 206, 207, 208]
-        logits_indices += self._arange_scratch[: cu_num_sampled_tokens[-1]]
+        logits_indices += self._arange_scratch[: cu_num_sampled_tokens_np[-1]]
 
         # Compute the bonus logits indices.
-        bonus_logits_indices = cu_num_sampled_tokens - 1
+        bonus_logits_indices = cu_num_sampled_tokens_np - 1
 
         # Compute the draft logits indices.
         # cu_num_draft_tokens: [3, 3, 5, 5, 6]
@@ -2720,7 +2875,7 @@ class GPUModelRunner(
         )
         # [0, 0, 0, 5, 5, 9]
         target_logits_indices = np.repeat(
-            cu_num_sampled_tokens - num_sampled_tokens, num_draft_tokens
+            cu_num_sampled_tokens_np - num_sampled_tokens, num_draft_tokens
         )
         # [0, 1, 2, 5, 6, 9]
         target_logits_indices += self._arange_scratch[: cu_num_draft_tokens[-1]]
@@ -2729,7 +2884,7 @@ class GPUModelRunner(
         cu_num_draft_tokens = torch.from_numpy(cu_num_draft_tokens).to(
             self.device, non_blocking=True
         )
-        cu_num_sampled_tokens = torch.from_numpy(cu_num_sampled_tokens).to(
+        cu_num_sampled_tokens = torch.from_numpy(cu_num_sampled_tokens_np).to(
             self.device, non_blocking=True
         )
         logits_indices = torch.from_numpy(logits_indices).to(
@@ -2763,7 +2918,7 @@ class GPUModelRunner(
             self._attach_tree_spec_decode_metadata(
                 metadata,
                 scheduler_output,
-                cu_num_sampled_tokens,
+                cu_num_sampled_tokens_np,
                 num_draft_tokens,
             )
         if (
@@ -2870,6 +3025,242 @@ class GPUModelRunner(
                 cur_idx = parent_by_child[cur_idx]
         return tree_attn_mask
 
+    @staticmethod
+    def _tree_metadata_to_typed_view(
+        tree_metadata: DynamicTreeCompactMetadata | dict,
+    ) -> tuple[DynamicTreeCompactMetadata, DynamicTreeCompactArrayView]:
+        if not isinstance(tree_metadata, DynamicTreeCompactMetadata):
+            tree_metadata = DynamicTreeCompactMetadata.from_mapping(tree_metadata)
+        return tree_metadata, tree_metadata.as_array_view()
+
+    @staticmethod
+    def _tree_handle_row_to_typed_metadata(
+        tree_metadata: DynamicTreeDeviceMetadataHandle,
+        req_id: str,
+    ) -> DynamicTreeCompactMetadata | None:
+        try:
+            req_idx = tree_metadata.req_ids.index(req_id)
+        except ValueError:
+            return None
+        if req_idx >= len(tree_metadata.num_nodes):
+            return None
+        num_nodes = int(tree_metadata.num_nodes[req_idx])
+        if num_nodes <= 0:
+            return None
+        selected_width = max(0, num_nodes - 1)
+        selected_token_ids = (
+            tree_metadata.selected_token_ids[req_idx, :selected_width]
+            .detach()
+            .cpu()
+            .tolist()
+        )
+        selected_static_nodes = (
+            tree_metadata.selected_static_nodes[req_idx, :selected_width]
+            .detach()
+            .cpu()
+            .tolist()
+        )
+        metadata = DynamicTreeCompactMetadata(
+            retrieve_index=tree_metadata.retrieve_index[
+                req_idx, :num_nodes
+            ].detach().cpu().tolist(),
+            retrieve_next_token=tree_metadata.retrieve_next_token[
+                req_idx, :num_nodes
+            ].detach().cpu().tolist(),
+            retrieve_next_sibling=tree_metadata.retrieve_next_sibling[
+                req_idx, :num_nodes
+            ].detach().cpu().tolist(),
+            parent=tree_metadata.parent[req_idx, :num_nodes]
+            .detach()
+            .cpu()
+            .tolist(),
+            target_mask=tree_metadata.target_mask[req_idx, :num_nodes]
+            .detach()
+            .cpu()
+            .tolist(),
+            position_offsets=tree_metadata.position_offsets[
+                req_idx, :num_nodes
+            ].detach().cpu().tolist(),
+            tree_attn_mask=None,
+            selected_token_ids=[int(token_id) for token_id in selected_token_ids],
+            selected_static_nodes=[
+                int(static_idx) for static_idx in selected_static_nodes
+            ],
+            target_mask_enabled=tree_metadata.target_mask_enabled,
+            num_spec_steps=int(tree_metadata.num_spec_steps[req_idx]),
+            tree_valid=bool(tree_metadata.tree_valid[req_idx].item()),
+            is_dynamic_tree=tree_metadata.is_dynamic_tree,
+            is_linear_chain=tree_metadata.is_linear_chain,
+            select_vectorized=tree_metadata.select_vectorized,
+        )
+        metadata.as_array_view()
+        return metadata
+
+    def _attach_tree_device_metadata_handle(
+        self,
+        metadata: SpecDecodeMetadata,
+        tree_metadata: DynamicTreeDeviceMetadataHandle,
+        req_ids: list[str],
+        cu_num_sampled_tokens: np.ndarray,
+        num_draft_tokens: np.ndarray,
+        max_tree_nodes: int,
+    ) -> bool:
+        if os.environ.get("VLLM_TREE_ATTN_DYNAMIC_MASK_KERNEL") != "1":
+            return False
+        batch_size = len(req_ids)
+        nonzero_req_indices = [
+            req_idx
+            for req_idx, draft_len in enumerate(num_draft_tokens[:batch_size])
+            if int(draft_len) > 0
+        ]
+        if not nonzero_req_indices:
+            return False
+        handle_row_by_req = {
+            req_id: row_idx for row_idx, req_id in enumerate(tree_metadata.req_ids)
+        }
+        try:
+            handle_row_indices = [
+                handle_row_by_req[req_ids[req_idx]]
+                for req_idx in nonzero_req_indices
+            ]
+        except KeyError:
+            return False
+        if any(
+            row_idx >= len(tree_metadata.num_nodes)
+            for row_idx in handle_row_indices
+        ):
+            return False
+        if any(
+            int(tree_metadata.num_nodes[row_idx])
+            != int(num_draft_tokens[req_idx]) + 1
+            for req_idx, row_idx in zip(nonzero_req_indices, handle_row_indices)
+        ):
+            return False
+
+        device = tree_metadata.retrieve_index.device
+        tree_slice = slice(0, max_tree_nodes)
+        row_starts = np.zeros(batch_size, dtype=np.int32)
+        if len(req_ids) > 1:
+            row_starts[1:] = cu_num_sampled_tokens[: len(req_ids) - 1]
+        tree_target_logits_indices = torch.zeros(
+            (batch_size, max_tree_nodes),
+            dtype=torch.int32,
+            device=device,
+        )
+        for req_idx, draft_len in enumerate(num_draft_tokens[:batch_size]):
+            num_nodes = int(draft_len) + 1
+            if num_nodes <= 1:
+                continue
+            tree_target_logits_indices[req_idx, :num_nodes] = (
+                torch.arange(num_nodes, dtype=torch.int32, device=device)
+                + int(row_starts[req_idx])
+            )
+
+        metadata.tree_target_logits_indices = tree_target_logits_indices
+        req_row_indices = torch.tensor(
+            nonzero_req_indices, dtype=torch.long, device=device
+        )
+        handle_row_indices_tensor = torch.tensor(
+            handle_row_indices, dtype=torch.long, device=device
+        )
+        metadata.tree_retrieve_index = torch.zeros(
+            (batch_size, max_tree_nodes),
+            dtype=torch.int32,
+            device=device,
+        )
+        metadata.tree_retrieve_next_token = torch.full(
+            (batch_size, max_tree_nodes),
+            -1,
+            dtype=torch.int32,
+            device=device,
+        )
+        metadata.tree_retrieve_next_sibling = torch.full(
+            (batch_size, max_tree_nodes),
+            -1,
+            dtype=torch.int32,
+            device=device,
+        )
+        metadata.tree_parent = torch.full(
+            (batch_size, max_tree_nodes),
+            -1,
+            dtype=torch.int32,
+            device=device,
+        )
+        metadata.tree_retrieve_index[req_row_indices, :] = (
+            tree_metadata.retrieve_index[handle_row_indices_tensor, tree_slice]
+        )
+        metadata.tree_retrieve_next_token[req_row_indices, :] = (
+            tree_metadata.retrieve_next_token[
+                handle_row_indices_tensor, tree_slice
+            ]
+        )
+        metadata.tree_retrieve_next_sibling[req_row_indices, :] = (
+            tree_metadata.retrieve_next_sibling[
+                handle_row_indices_tensor, tree_slice
+            ]
+        )
+        metadata.tree_parent[req_row_indices, :] = tree_metadata.parent[
+            handle_row_indices_tensor, tree_slice
+        ]
+        metadata.tree_target_mask = torch.zeros(
+            (batch_size, max_tree_nodes),
+            dtype=torch.int32,
+            device=device,
+        )
+        if tree_metadata.target_mask_enabled:
+            metadata.tree_target_mask[req_row_indices, :] = (
+                tree_metadata.target_mask[handle_row_indices_tensor, tree_slice]
+            )
+        else:
+            for req_idx in nonzero_req_indices:
+                num_nodes = int(num_draft_tokens[req_idx]) + 1
+                metadata.tree_target_mask[req_idx, :num_nodes] = 1
+        metadata.tree_attn_bias = None
+        metadata.tree_position_offsets = torch.zeros(
+            (batch_size, max_tree_nodes),
+            dtype=torch.int64,
+            device=device,
+        )
+        metadata.tree_position_offsets[req_row_indices, :] = (
+            tree_metadata.position_offsets[handle_row_indices_tensor, tree_slice]
+        )
+        nonzero_num_spec_steps = [
+            int(tree_metadata.num_spec_steps[row_idx])
+            for row_idx in handle_row_indices
+        ]
+        metadata.tree_num_spec_steps = max(nonzero_num_spec_steps)
+        tree_valid = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        tree_valid[req_row_indices] = tree_metadata.tree_valid[
+            handle_row_indices_tensor
+        ]
+        metadata.tree_valid = tree_valid
+        metadata.tree_metadata_host_staged = False
+        metadata.tree_metadata_device_buffered = True
+        metadata.tree_metadata_device_buffer_reason = None
+        metadata.tree_metadata_typed_view = True
+        metadata.tree_dynamic_select_vectorized = bool(
+            tree_metadata.is_dynamic_tree
+            and tree_metadata.select_vectorized
+        )
+        self._maybe_buffer_tree_cudagraph_metadata(metadata)
+        if tree_metadata.is_dynamic_tree:
+            runtime_mode = getattr(
+                self, "dynamic_draft_tree_runtime_mode", "root_only"
+            )
+            metadata.tree_runtime_mode = runtime_mode
+            metadata.tree_linear_kv_safe = (
+                runtime_mode != "branching"
+                or not self.enable_dynamic_tree_kv_relocation
+            )
+            metadata.tree_near_tie_q1_fallback_threshold = getattr(
+                self,
+                "tree_attn_near_tie_q1_fallback_threshold",
+                None,
+            )
+        else:
+            metadata.tree_linear_kv_safe = not self.enable_dynamic_tree_kv_relocation
+        return True
+
     def _attach_tree_spec_decode_metadata(
         self,
         metadata: SpecDecodeMetadata,
@@ -2877,39 +3268,169 @@ class GPUModelRunner(
         cu_num_sampled_tokens: np.ndarray,
         num_draft_tokens: np.ndarray,
     ) -> None:
-        tree_metadata_by_req = scheduler_output.scheduled_spec_decode_tree_metadata
-        if not tree_metadata_by_req:
+        tree_metadata_by_req_or_pos = (
+            scheduler_output.scheduled_spec_decode_tree_metadata
+        )
+        if not tree_metadata_by_req_or_pos:
             return
+        if isinstance(
+            tree_metadata_by_req_or_pos, DynamicTreeDeviceMetadataHandle
+        ):
+            tree_metadata_by_req = {
+                req_id: tree_metadata_by_req_or_pos
+                for req_id in tree_metadata_by_req_or_pos.req_ids
+            }
+        elif isinstance(tree_metadata_by_req_or_pos, dict):
+            tree_metadata_by_req = tree_metadata_by_req_or_pos
+        else:
+            tree_metadata_by_req = {
+                req_id: tree_metadata
+                for req_id, tree_metadata in zip(
+                    scheduler_output.scheduled_spec_decode_tokens,
+                    tree_metadata_by_req_or_pos,
+                )
+                if tree_metadata is not None
+            }
+            if not tree_metadata_by_req:
+                return
 
         batch_size = len(metadata.num_draft_tokens)
         req_ids = self.input_batch.req_ids[:batch_size]
         max_tree_nodes = int(num_draft_tokens.max(initial=0)) + 1
         if max_tree_nodes <= 1:
             return
+        compact_bias_requested = (
+            os.environ.get("VLLM_TREE_ATTN_DYNAMIC_MASK_KERNEL") == "1"
+        )
+        handle_for_direct_attach = (
+            tree_metadata_by_req_or_pos
+            if isinstance(
+                tree_metadata_by_req_or_pos,
+                DynamicTreeDeviceMetadataHandle,
+            )
+            else None
+        )
+        if handle_for_direct_attach is None and tree_metadata_by_req:
+            unique_handles = {
+                id(entry): entry
+                for entry in tree_metadata_by_req.values()
+                if isinstance(entry, DynamicTreeDeviceMetadataHandle)
+            }
+            if len(unique_handles) == 1:
+                handle_for_direct_attach = next(iter(unique_handles.values()))
+        if (
+            handle_for_direct_attach is not None
+            and self._attach_tree_device_metadata_handle(
+                metadata,
+                handle_for_direct_attach,
+                req_ids,
+                cu_num_sampled_tokens,
+                num_draft_tokens,
+                max_tree_nodes,
+            )
+        ):
+            return
+        persistent_width = getattr(self, "_tree_cudagraph_metadata_width", 0)
+        runtime_buffer_attrs = (
+            "_tree_runtime_target_logits_indices_buffer",
+            "_tree_runtime_retrieve_index_buffer",
+            "_tree_runtime_retrieve_next_token_buffer",
+            "_tree_runtime_retrieve_next_sibling_buffer",
+            "_tree_runtime_parent_buffer",
+            "_tree_runtime_target_mask_buffer",
+            "_tree_runtime_position_offsets_buffer",
+            "_tree_runtime_valid_buffer",
+        )
+        use_persistent_tree_buffers = (
+            persistent_width >= max_tree_nodes
+            and all(hasattr(self, attr) for attr in runtime_buffer_attrs)
+        )
+        device_buffer_reason = None
+        if not use_persistent_tree_buffers:
+            if persistent_width < max_tree_nodes:
+                device_buffer_reason = f"tree_width>{persistent_width}"
+            else:
+                device_buffer_reason = "runtime_buffers_unavailable"
 
-        tree_target_logits_indices = torch.zeros(
-            (batch_size, max_tree_nodes), dtype=torch.int32, device=self.device
-        )
-        tree_retrieve_index = torch.zeros(
-            (batch_size, max_tree_nodes), dtype=torch.int32, device=self.device
-        )
-        tree_retrieve_next_token = torch.full(
-            (batch_size, max_tree_nodes), -1, dtype=torch.int32, device=self.device
-        )
-        tree_retrieve_next_sibling = torch.full(
-            (batch_size, max_tree_nodes), -1, dtype=torch.int32, device=self.device
-        )
-        tree_target_mask = torch.zeros(
-            (batch_size, max_tree_nodes), dtype=torch.int32, device=self.device
-        )
+        if use_persistent_tree_buffers:
+            req_slice = slice(0, batch_size)
+            tree_slice = slice(0, max_tree_nodes)
+            tree_target_logits_indices_buffer = (
+                self._tree_runtime_target_logits_indices_buffer
+            )
+            tree_retrieve_index_buffer = self._tree_runtime_retrieve_index_buffer
+            tree_retrieve_next_token_buffer = (
+                self._tree_runtime_retrieve_next_token_buffer
+            )
+            tree_retrieve_next_sibling_buffer = (
+                self._tree_runtime_retrieve_next_sibling_buffer
+            )
+            tree_parent_buffer = self._tree_runtime_parent_buffer
+            tree_target_mask_buffer = self._tree_runtime_target_mask_buffer
+            tree_position_offsets_buffer = (
+                self._tree_runtime_position_offsets_buffer
+            )
+            tree_valid_buffer = self._tree_runtime_valid_buffer
+            tree_target_logits_indices_buffer.cpu[req_slice, tree_slice].zero_()
+            tree_retrieve_index_buffer.cpu[req_slice, tree_slice].zero_()
+            tree_retrieve_next_token_buffer.cpu[
+                req_slice, tree_slice
+            ].fill_(-1)
+            tree_retrieve_next_sibling_buffer.cpu[
+                req_slice, tree_slice
+            ].fill_(-1)
+            tree_parent_buffer.cpu[req_slice, tree_slice].fill_(-1)
+            tree_target_mask_buffer.cpu[req_slice, tree_slice].zero_()
+            tree_position_offsets_buffer.cpu[req_slice, tree_slice].zero_()
+            tree_valid_buffer.cpu[req_slice].zero_()
+            tree_target_logits_indices_np = tree_target_logits_indices_buffer.np
+            tree_retrieve_index_np = tree_retrieve_index_buffer.np
+            tree_retrieve_next_token_np = tree_retrieve_next_token_buffer.np
+            tree_retrieve_next_sibling_np = tree_retrieve_next_sibling_buffer.np
+            tree_parent_np = tree_parent_buffer.np
+            tree_target_mask_np = tree_target_mask_buffer.np
+            tree_position_offsets_np = tree_position_offsets_buffer.np
+            tree_valid_np = tree_valid_buffer.np
+        else:
+            tree_target_logits_indices = torch.zeros(
+                (batch_size, max_tree_nodes), dtype=torch.int32, device=self.device
+            )
+            tree_retrieve_index = torch.zeros(
+                (batch_size, max_tree_nodes), dtype=torch.int32, device=self.device
+            )
+            tree_retrieve_next_token = torch.full(
+                (batch_size, max_tree_nodes), -1, dtype=torch.int32, device=self.device
+            )
+            tree_retrieve_next_sibling = torch.full(
+                (batch_size, max_tree_nodes), -1, dtype=torch.int32, device=self.device
+            )
+            tree_parent = torch.full(
+                (batch_size, max_tree_nodes), -1, dtype=torch.int32, device=self.device
+            )
+            tree_target_mask = torch.zeros(
+                (batch_size, max_tree_nodes), dtype=torch.int32, device=self.device
+            )
+            tree_position_offsets = torch.zeros(
+                (batch_size, max_tree_nodes), dtype=torch.int64, device=self.device
+            )
+            tree_valid = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
+            tree_target_logits_indices_np = None
+            tree_retrieve_index_np = None
+            tree_retrieve_next_token_np = None
+            tree_retrieve_next_sibling_np = None
+            tree_parent_np = None
+            tree_target_mask_np = None
+            tree_position_offsets_np = None
+            tree_valid_np = None
         tree_attn_bias: torch.Tensor | None = None
-        tree_position_offsets = torch.zeros(
-            (batch_size, max_tree_nodes), dtype=torch.int64, device=self.device
-        )
-        tree_valid = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
+        tree_attn_bias_buffer: CpuGpuBuffer | None = None
+        tree_attn_bias_np: np.ndarray | None = None
         tree_num_spec_steps = 0
         all_tree_rows_are_linear_chain = True
         has_dynamic_tree_metadata = False
+        all_parent_from_metadata = True
+        all_dynamic_select_vectorized = True
+        all_typed_view_metadata = True
 
         for req_idx, req_id in enumerate(req_ids):
             num_nodes = int(num_draft_tokens[req_idx]) + 1
@@ -2918,127 +3439,273 @@ class GPUModelRunner(
             tree_metadata = tree_metadata_by_req.get(req_id)
             if tree_metadata is None:
                 continue
+            try:
+                if isinstance(tree_metadata, DynamicTreeDeviceMetadataHandle):
+                    row_metadata = self._tree_handle_row_to_typed_metadata(
+                        tree_metadata, req_id
+                    )
+                    if row_metadata is None:
+                        all_typed_view_metadata = False
+                        continue
+                    tree_metadata, tree_metadata_view = (
+                        self._tree_metadata_to_typed_view(row_metadata)
+                    )
+                else:
+                    tree_metadata, tree_metadata_view = (
+                        self._tree_metadata_to_typed_view(tree_metadata)
+                    )
+            except (TypeError, ValueError):
+                all_typed_view_metadata = False
+                continue
             has_dynamic_tree_metadata = has_dynamic_tree_metadata or bool(
                 tree_metadata.get("is_dynamic_tree", False)
+            )
+            all_dynamic_select_vectorized = (
+                all_dynamic_select_vectorized
+                and bool(tree_metadata.get("select_vectorized", True))
             )
             all_tree_rows_are_linear_chain = (
                 all_tree_rows_are_linear_chain
                 and bool(tree_metadata.get("is_linear_chain", False))
             )
-            retrieve_index = tree_metadata["retrieve_index"]
-            retrieve_next_token = tree_metadata["retrieve_next_token"]
-            retrieve_next_sibling = tree_metadata["retrieve_next_sibling"]
-            target_mask = tree_metadata.get("target_mask")
-            tree_attn_mask = tree_metadata.get("tree_attn_mask")
-            position_offsets = tree_metadata.get("position_offsets")
             num_spec_steps = int(tree_metadata["num_spec_steps"])
-            if (
-                not isinstance(retrieve_index, list)
-                or not isinstance(retrieve_next_token, list)
-                or not isinstance(retrieve_next_sibling, list)
-                or len(retrieve_index) < num_nodes
-                or len(retrieve_next_token) < num_nodes
-                or len(retrieve_next_sibling) < num_nodes
-            ):
+            if not tree_metadata_view.has_required_width(num_nodes):
+                all_typed_view_metadata = False
                 continue
+            retrieve_index = tree_metadata_view.retrieve_index[:num_nodes]
+            retrieve_next_token = tree_metadata_view.retrieve_next_token[:num_nodes]
+            retrieve_next_sibling = (
+                tree_metadata_view.retrieve_next_sibling[:num_nodes]
+            )
+            target_mask = tree_metadata_view.target_mask
+            position_offsets = tree_metadata_view.position_offsets
             if target_mask is not None and (
-                not isinstance(target_mask, list) or len(target_mask) < num_nodes
+                target_mask.ndim != 1 or target_mask.shape[0] < num_nodes
             ):
+                all_typed_view_metadata = False
                 continue
             if position_offsets is not None and (
-                not isinstance(position_offsets, list)
-                or len(position_offsets) < num_nodes
+                position_offsets.ndim != 1 or position_offsets.shape[0] < num_nodes
             ):
-                continue
-            if tree_attn_mask is not None and (
-                not isinstance(tree_attn_mask, list)
-                or len(tree_attn_mask) < num_nodes
-                or any(
-                    not isinstance(row, list) or len(row) < num_nodes
-                    for row in tree_attn_mask[:num_nodes]
-                )
-            ):
+                all_typed_view_metadata = False
                 continue
 
             row_start = 0 if req_idx == 0 else int(cu_num_sampled_tokens[req_idx - 1])
-            row_indices = torch.arange(
-                row_start,
-                row_start + num_nodes,
-                dtype=torch.int32,
-                device=self.device,
+            parent_by_child, parent_from_metadata = (
+                tree_metadata_view.parent_or_derive(num_nodes)
             )
-            tree_target_logits_indices[req_idx, :num_nodes] = row_indices
-            tree_retrieve_index[req_idx, :num_nodes] = torch.tensor(
-                retrieve_index[:num_nodes], dtype=torch.int32, device=self.device
-            )
-            tree_retrieve_next_token[req_idx, :num_nodes] = torch.tensor(
-                retrieve_next_token[:num_nodes],
-                dtype=torch.int32,
-                device=self.device,
-            )
-            tree_retrieve_next_sibling[req_idx, :num_nodes] = torch.tensor(
-                retrieve_next_sibling[:num_nodes],
-                dtype=torch.int32,
-                device=self.device,
-            )
-            if target_mask is not None and tree_metadata.get(
-                "target_mask_enabled", True
-            ):
-                tree_target_mask[req_idx, :num_nodes] = torch.tensor(
-                    target_mask[:num_nodes], dtype=torch.int32, device=self.device
+            if not parent_from_metadata:
+                all_parent_from_metadata = False
+
+            if use_persistent_tree_buffers:
+                assert tree_target_logits_indices_np is not None
+                assert tree_retrieve_index_np is not None
+                assert tree_retrieve_next_token_np is not None
+                assert tree_retrieve_next_sibling_np is not None
+                assert tree_parent_np is not None
+                assert tree_target_mask_np is not None
+                assert tree_position_offsets_np is not None
+                assert tree_valid_np is not None
+                tree_target_logits_indices_np[req_idx, :num_nodes] = np.arange(
+                    row_start,
+                    row_start + num_nodes,
+                    dtype=np.int32,
                 )
-            else:
-                tree_target_mask[req_idx, :num_nodes] = 1
-            if tree_attn_mask is None:
-                tree_attn_mask = self._tree_attn_mask_from_retrieve_metadata(
-                    retrieve_next_token,
-                    retrieve_next_sibling,
-                    num_nodes,
+                tree_retrieve_index_np[req_idx, :num_nodes] = retrieve_index
+                tree_retrieve_next_token_np[req_idx, :num_nodes] = (
+                    retrieve_next_token
                 )
-            if tree_attn_mask is not None:
-                if tree_attn_bias is None:
-                    tree_attn_bias = torch.full(
-                        (batch_size, max_tree_nodes, max_tree_nodes),
-                        -torch.inf,
-                        dtype=torch.float32,
-                        device=self.device,
+                tree_retrieve_next_sibling_np[req_idx, :num_nodes] = (
+                    retrieve_next_sibling
+                )
+                tree_parent_np[req_idx, :num_nodes] = parent_by_child
+                if target_mask is not None and tree_metadata.get(
+                    "target_mask_enabled", True
+                ):
+                    tree_target_mask_np[req_idx, :num_nodes] = target_mask[:num_nodes]
+                else:
+                    tree_target_mask_np[req_idx, :num_nodes] = 1
+                if position_offsets is not None:
+                    tree_position_offsets_np[req_idx, :num_nodes] = (
+                        position_offsets[:num_nodes]
                     )
-                tree_attn_mask_tensor = torch.tensor(
-                    [row[:num_nodes] for row in tree_attn_mask[:num_nodes]],
-                    dtype=torch.bool,
+                else:
+                    tree_position_offsets_np[req_idx, :num_nodes] = np.arange(
+                        num_nodes, dtype=np.int64
+                    )
+                tree_valid_np[req_idx] = bool(tree_metadata.get("tree_valid", True))
+            else:
+                row_indices = torch.arange(
+                    row_start,
+                    row_start + num_nodes,
+                    dtype=torch.int32,
                     device=self.device,
                 )
-                tree_attn_bias[req_idx, :num_nodes, :num_nodes] = torch.where(
-                    tree_attn_mask_tensor,
-                    torch.zeros((), dtype=torch.float32, device=self.device),
-                    torch.full((), -torch.inf, dtype=torch.float32, device=self.device),
+                tree_target_logits_indices[req_idx, :num_nodes] = row_indices
+                tree_retrieve_index[req_idx, :num_nodes] = torch.tensor(
+                    retrieve_index, dtype=torch.int32, device=self.device
                 )
-            if position_offsets is not None:
-                tree_position_offsets[req_idx, :num_nodes] = torch.tensor(
-                    position_offsets[:num_nodes], dtype=torch.int64, device=self.device
+                tree_retrieve_next_token[req_idx, :num_nodes] = torch.tensor(
+                    retrieve_next_token,
+                    dtype=torch.int32,
+                    device=self.device,
                 )
-            else:
-                tree_position_offsets[req_idx, :num_nodes] = torch.arange(
-                    num_nodes, dtype=torch.int64, device=self.device
+                tree_retrieve_next_sibling[req_idx, :num_nodes] = torch.tensor(
+                    retrieve_next_sibling,
+                    dtype=torch.int32,
+                    device=self.device,
                 )
-            tree_valid[req_idx] = bool(tree_metadata.get("tree_valid", True))
+                tree_parent[req_idx, :num_nodes] = torch.tensor(
+                    parent_by_child, dtype=torch.int32, device=self.device
+                )
+                if target_mask is not None and tree_metadata.get(
+                    "target_mask_enabled", True
+                ):
+                    tree_target_mask[req_idx, :num_nodes] = torch.tensor(
+                        target_mask[:num_nodes],
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                else:
+                    tree_target_mask[req_idx, :num_nodes] = 1
+                if position_offsets is not None:
+                    tree_position_offsets[req_idx, :num_nodes] = torch.tensor(
+                        position_offsets[:num_nodes],
+                        dtype=torch.int64,
+                        device=self.device,
+                    )
+                else:
+                    tree_position_offsets[req_idx, :num_nodes] = torch.arange(
+                        num_nodes, dtype=torch.int64, device=self.device
+                    )
+                tree_valid[req_idx] = bool(tree_metadata.get("tree_valid", True))
+
+            if not compact_bias_requested:
+                tree_attn_mask_np = tree_metadata_view.tree_attn_mask_or_derive(
+                    num_nodes
+                )
+                if use_persistent_tree_buffers:
+                    if tree_attn_bias_np is None:
+                        tree_attn_bias_buffer = self._tree_runtime_attn_bias_buffer
+                        tree_attn_bias_buffer.cpu[
+                            req_slice,
+                            tree_slice,
+                            tree_slice,
+                        ].fill_(float("-inf"))
+                        tree_attn_bias_np = tree_attn_bias_buffer.np
+                    tree_attn_bias_np[
+                        req_idx,
+                        :num_nodes,
+                        :num_nodes,
+                    ] = np.where(tree_attn_mask_np, 0.0, -np.inf)
+                else:
+                    if tree_attn_bias is None:
+                        tree_attn_bias = torch.full(
+                            (batch_size, max_tree_nodes, max_tree_nodes),
+                            -torch.inf,
+                            dtype=torch.float32,
+                            device=self.device,
+                        )
+                    tree_attn_mask_tensor = torch.tensor(
+                        tree_attn_mask_np,
+                        dtype=torch.bool,
+                        device=self.device,
+                    )
+                    tree_attn_bias[req_idx, :num_nodes, :num_nodes] = (
+                        torch.where(
+                            tree_attn_mask_tensor,
+                            torch.zeros(
+                                (),
+                                dtype=torch.float32,
+                                device=self.device,
+                            ),
+                            torch.full(
+                                (),
+                                -torch.inf,
+                                dtype=torch.float32,
+                                device=self.device,
+                            )
+                        )
+                    )
             tree_num_spec_steps = max(tree_num_spec_steps, num_spec_steps)
 
         if tree_num_spec_steps == 0:
             return
-        if tree_attn_bias is not None:
+        if use_persistent_tree_buffers:
+            if tree_attn_bias_np is not None:
+                for req_idx, draft_len in enumerate(num_draft_tokens[:batch_size]):
+                    if int(draft_len) == 0:
+                        tree_attn_bias_np[req_idx, 0, 0] = 0.0
+            tree_target_logits_indices_buffer.copy_to_gpu(batch_size)
+            tree_retrieve_index_buffer.copy_to_gpu(batch_size)
+            tree_retrieve_next_token_buffer.copy_to_gpu(batch_size)
+            tree_retrieve_next_sibling_buffer.copy_to_gpu(batch_size)
+            tree_parent_buffer.copy_to_gpu(batch_size)
+            tree_target_mask_buffer.copy_to_gpu(batch_size)
+            tree_position_offsets_buffer.copy_to_gpu(batch_size)
+            tree_valid_buffer.copy_to_gpu(batch_size)
+            if tree_attn_bias_buffer is not None:
+                tree_attn_bias_buffer.copy_to_gpu(batch_size)
+                tree_attn_bias = tree_attn_bias_buffer.gpu[
+                    req_slice,
+                    tree_slice,
+                    tree_slice,
+                ]
+            tree_target_logits_indices = tree_target_logits_indices_buffer.gpu[
+                req_slice,
+                tree_slice,
+            ]
+            tree_retrieve_index = tree_retrieve_index_buffer.gpu[
+                req_slice,
+                tree_slice,
+            ]
+            tree_retrieve_next_token = tree_retrieve_next_token_buffer.gpu[
+                req_slice,
+                tree_slice,
+            ]
+            tree_retrieve_next_sibling = tree_retrieve_next_sibling_buffer.gpu[
+                req_slice,
+                tree_slice,
+            ]
+            tree_parent = tree_parent_buffer.gpu[req_slice, tree_slice]
+            tree_target_mask = tree_target_mask_buffer.gpu[req_slice, tree_slice]
+            tree_position_offsets = tree_position_offsets_buffer.gpu[
+                req_slice,
+                tree_slice,
+            ]
+            tree_valid = tree_valid_buffer.gpu[req_slice]
+            metadata.tree_metadata_host_staged = True
+            metadata.tree_metadata_device_buffered = True
+            metadata.tree_metadata_device_buffer_reason = None
+        elif tree_attn_bias is not None:
             for req_idx, draft_len in enumerate(num_draft_tokens[:batch_size]):
                 if int(draft_len) == 0:
                     tree_attn_bias[req_idx, 0, 0] = 0
+            metadata.tree_metadata_device_buffered = False
+            metadata.tree_metadata_host_staged = False
+            metadata.tree_metadata_device_buffer_reason = device_buffer_reason
+        else:
+            metadata.tree_metadata_device_buffered = False
+            metadata.tree_metadata_host_staged = False
+            metadata.tree_metadata_device_buffer_reason = device_buffer_reason
         metadata.tree_target_logits_indices = tree_target_logits_indices
         metadata.tree_retrieve_index = tree_retrieve_index
         metadata.tree_retrieve_next_token = tree_retrieve_next_token
         metadata.tree_retrieve_next_sibling = tree_retrieve_next_sibling
+        metadata.tree_parent = tree_parent
         metadata.tree_target_mask = tree_target_mask
         metadata.tree_attn_bias = tree_attn_bias
         metadata.tree_position_offsets = tree_position_offsets
         metadata.tree_num_spec_steps = tree_num_spec_steps
         metadata.tree_valid = tree_valid
+        metadata.tree_dynamic_select_vectorized = (
+            has_dynamic_tree_metadata
+            and use_persistent_tree_buffers
+            and all_parent_from_metadata
+            and all_dynamic_select_vectorized
+        )
+        metadata.tree_metadata_typed_view = all_typed_view_metadata
+        self._maybe_buffer_tree_cudagraph_metadata(metadata)
         if has_dynamic_tree_metadata:
             runtime_mode = getattr(
                 self, "dynamic_draft_tree_runtime_mode", "root_only"
@@ -3067,6 +3734,181 @@ class GPUModelRunner(
         ):
             metadata.tree_force_single_row_logits = True
             metadata.tree_force_serial_q1_forward = True
+
+    def _maybe_buffer_tree_cudagraph_metadata(
+        self,
+        metadata: SpecDecodeMetadata,
+    ) -> None:
+        if (
+            not getattr(self, "tree_attn_cudagraph_probe", False)
+            or not metadata.has_tree_metadata
+            or metadata.tree_parent is None
+            or self._tree_cudagraph_metadata_width <= 0
+        ):
+            return
+
+        batch_size, tree_width = metadata.tree_parent.shape
+        if batch_size > self.max_num_reqs:
+            metadata.tree_cudagraph_metadata_buffered = False
+            metadata.tree_cudagraph_metadata_buffer_reason = (
+                f"batch_size>{self.max_num_reqs}"
+            )
+            return
+        if tree_width > self._tree_cudagraph_metadata_width:
+            metadata.tree_cudagraph_metadata_buffered = False
+            metadata.tree_cudagraph_metadata_buffer_reason = (
+                f"tree_width>{self._tree_cudagraph_metadata_width}"
+            )
+            return
+
+        req_slice = slice(0, batch_size)
+        tree_slice = slice(0, tree_width)
+        self._tree_cg_target_logits_indices[req_slice, tree_slice].copy_(
+            metadata.tree_target_logits_indices
+        )
+        self._tree_cg_retrieve_index[req_slice, tree_slice].copy_(
+            metadata.tree_retrieve_index
+        )
+        self._tree_cg_retrieve_next_token[req_slice, tree_slice].copy_(
+            metadata.tree_retrieve_next_token
+        )
+        self._tree_cg_retrieve_next_sibling[req_slice, tree_slice].copy_(
+            metadata.tree_retrieve_next_sibling
+        )
+        self._tree_cg_parent[req_slice, tree_slice].copy_(metadata.tree_parent)
+        self._tree_cg_target_mask[req_slice, tree_slice].copy_(
+            metadata.tree_target_mask
+        )
+        if metadata.tree_position_offsets is not None:
+            self._tree_cg_position_offsets[req_slice, tree_slice].copy_(
+                metadata.tree_position_offsets
+            )
+        if metadata.tree_valid is not None:
+            self._tree_cg_valid[req_slice].copy_(metadata.tree_valid)
+        if metadata.tree_attn_bias is not None:
+            self._tree_cg_attn_bias[
+                req_slice,
+                tree_slice,
+                tree_slice,
+            ].copy_(metadata.tree_attn_bias)
+            metadata.tree_attn_bias = self._tree_cg_attn_bias[
+                req_slice,
+                tree_slice,
+                tree_slice,
+            ]
+
+        metadata.tree_target_logits_indices = self._tree_cg_target_logits_indices[
+            req_slice, tree_slice
+        ]
+        metadata.tree_retrieve_index = self._tree_cg_retrieve_index[
+            req_slice, tree_slice
+        ]
+        metadata.tree_retrieve_next_token = self._tree_cg_retrieve_next_token[
+            req_slice, tree_slice
+        ]
+        metadata.tree_retrieve_next_sibling = self._tree_cg_retrieve_next_sibling[
+            req_slice, tree_slice
+        ]
+        metadata.tree_parent = self._tree_cg_parent[req_slice, tree_slice]
+        metadata.tree_target_mask = self._tree_cg_target_mask[req_slice, tree_slice]
+        if metadata.tree_position_offsets is not None:
+            metadata.tree_position_offsets = self._tree_cg_position_offsets[
+                req_slice, tree_slice
+            ]
+        if metadata.tree_valid is not None:
+            metadata.tree_valid = self._tree_cg_valid[req_slice]
+
+        metadata.tree_cudagraph_metadata_buffered = True
+        metadata.tree_cudagraph_metadata_buffer_reason = None
+
+    def _annotate_tree_cudagraph_runtime(
+        self,
+        *,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+        cudagraph_mode: CUDAGraphMode,
+        batch_desc: BatchDescriptor,
+        num_reqs: int,
+        num_tokens_unpadded: int,
+        num_tokens_padded: int,
+        forward_num_scheduled_tokens_np: np.ndarray,
+    ) -> None:
+        if (
+            spec_decode_metadata is None
+            or not spec_decode_metadata.has_tree_metadata
+        ):
+            return
+
+        tree_width = (
+            int(spec_decode_metadata.tree_parent.shape[-1])
+            if spec_decode_metadata.tree_parent is not None
+            else None
+        )
+        q_lens = [
+            int(query_len)
+            for query_len in forward_num_scheduled_tokens_np[:num_reqs].tolist()
+        ]
+        compact_kernel_requested = (
+            os.environ.get("VLLM_TREE_ATTN_DYNAMIC_MASK_KERNEL") == "1"
+        )
+        metadata_buffered = bool(
+            spec_decode_metadata.tree_cudagraph_metadata_buffered
+        )
+        fallback_reason = spec_decode_metadata.tree_cudagraph_metadata_buffer_reason
+        if cudagraph_mode == CUDAGraphMode.NONE:
+            fallback_reason = fallback_reason or "cudagraph_mode_none"
+        elif not metadata_buffered and getattr(
+            self, "tree_attn_cudagraph_probe", False
+        ):
+            fallback_reason = fallback_reason or "metadata_not_buffered"
+
+        spec_decode_metadata.tree_cudagraph_key = {
+            "runtime_mode": spec_decode_metadata.tree_runtime_mode,
+            "tree_width": tree_width,
+            "q_lens": q_lens,
+            "max_query_len": max(q_lens) if q_lens else 0,
+            "num_reqs": int(num_reqs),
+            "num_draft_tokens": [
+                int(num_tokens)
+                for num_tokens in spec_decode_metadata.num_draft_tokens[:num_reqs]
+            ],
+            "dynamic_mask_kernel": compact_kernel_requested,
+            "near_tie_threshold": (
+                spec_decode_metadata.tree_near_tie_q1_fallback_threshold
+            ),
+            "serial_repair_enabled": bool(
+                self.tree_attn_serial_accepted_state_repair
+            ),
+            "serial_repair_scope": (
+                self.tree_attn_serial_accepted_state_repair_scope
+            ),
+            "metadata_buffer_capacity": self._tree_cudagraph_metadata_width,
+        }
+        spec_decode_metadata.tree_cudagraph_runtime = {
+            "probe_enabled": bool(getattr(self, "tree_attn_cudagraph_probe", False)),
+            "mode": str(cudagraph_mode),
+            "dispatch_hit": cudagraph_mode != CUDAGraphMode.NONE,
+            "eager_fallback": cudagraph_mode == CUDAGraphMode.NONE,
+            "num_tokens_unpadded": int(num_tokens_unpadded),
+            "num_tokens_padded": int(num_tokens_padded),
+            "num_paddings": int(num_tokens_padded - num_tokens_unpadded),
+            "batch_descriptor": {
+                "num_tokens": int(batch_desc.num_tokens),
+                "num_reqs": (
+                    None if batch_desc.num_reqs is None else int(batch_desc.num_reqs)
+                ),
+                "uniform": bool(batch_desc.uniform),
+                "has_lora": bool(batch_desc.has_lora),
+                "num_active_loras": int(batch_desc.num_active_loras),
+            },
+            "metadata_buffered": metadata_buffered,
+            "fallback_reason": fallback_reason,
+            "capture_count_total_at_dispatch": int(
+                compilation_counter.num_cudagraph_captured
+            ),
+            "replay_count_total_at_dispatch": int(
+                compilation_counter.num_cudagraph_replayed
+            ),
+        }
 
     def _maybe_apply_tree_position_offsets(
         self,
@@ -3274,6 +4116,7 @@ class GPUModelRunner(
     ) -> None:
         if (
             not self.tree_spec_trace_path
+            or not getattr(self, "_tree_attn_trace_dump_current_step", True)
             or spec_decode_metadata is None
             or not spec_decode_metadata.has_tree_metadata
             or sampler_output.spec_decode_accept_trace is None
@@ -3294,6 +4137,232 @@ class GPUModelRunner(
         with open(self.tree_spec_trace_path, "a", encoding="utf-8") as f:
             for record in records:
                 f.write(json.dumps(record, sort_keys=True) + "\n")
+
+    def _tree_stage_now(self) -> float:
+        if self.tree_attn_stage_profile_sync and self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        return time.perf_counter()
+
+    def _tree_stage_elapsed_ms(self, start: float) -> float:
+        return (self._tree_stage_now() - start) * 1000.0
+
+    def _tree_stage_profile_enabled(
+        self,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> bool:
+        return bool(
+            self.tree_attn_stage_profile
+            and spec_decode_metadata is not None
+            and spec_decode_metadata.has_tree_metadata
+        )
+
+    def _tree_trace_dump_enabled_for_step(self) -> bool:
+        self._tree_attn_trace_step += 1
+        sample_every = getattr(self, "tree_attn_trace_sample_every", 1)
+        return sample_every <= 1 or (
+            (self._tree_attn_trace_step - 1) % sample_every == 0
+        )
+
+    @staticmethod
+    def _tree_stage_num_output_tokens(
+        sampler_output: SamplerOutput | None,
+    ) -> int:
+        if sampler_output is None or sampler_output.sampled_token_ids is None:
+            return 0
+        return int((sampler_output.sampled_token_ids >= 0).sum().item())
+
+    def _make_tree_stage_profile_record(
+        self,
+        *,
+        scheduler_output: SchedulerOutput,
+        spec_decode_metadata: SpecDecodeMetadata,
+        sampler_output: SamplerOutput | None,
+        stage_ms: dict[str, float],
+    ) -> dict[str, object]:
+        num_reqs = len(spec_decode_metadata.num_draft_tokens)
+        scheduled_spec_tokens = sum(
+            len(tokens)
+            for req_id, tokens in scheduler_output.scheduled_spec_decode_tokens.items()
+            if req_id in self.input_batch.req_ids[:num_reqs]
+        )
+        output_tokens = self._tree_stage_num_output_tokens(sampler_output)
+        accepted_tokens = max(0, output_tokens - num_reqs)
+        relocation_pairs = 0
+        if sampler_output is not None:
+            relocation_pairs = len(
+                self._dynamic_tree_relocation_pairs(
+                    sampler_output,
+                    spec_decode_metadata,
+                )
+            )
+        compact_requested = os.environ.get("VLLM_TREE_ATTN_DYNAMIC_MASK_KERNEL") == "1"
+        compact_used = False
+        if spec_decode_metadata.tree_parent is not None:
+            tree_width = int(spec_decode_metadata.tree_parent.shape[-1])
+            query_start_loc = self._tensor_trace_list(self.query_start_loc.gpu[
+                : num_reqs + 1
+            ])
+            if query_start_loc and not spec_decode_metadata.force_root_only_forward:
+                query_lens = [
+                    int(query_start_loc[i + 1]) - int(query_start_loc[i])
+                    for i in range(num_reqs)
+                ]
+                decode_query_lens: list[int] = []
+                for query_len in query_lens:
+                    if query_len > tree_width:
+                        break
+                    decode_query_lens.append(query_len)
+                compact_used = (
+                    compact_requested
+                    and bool(decode_query_lens)
+                    and all(
+                        0 < query_len <= tree_width
+                        for query_len in decode_query_lens
+                    )
+                )
+        tree_cudagraph_runtime = None
+        if spec_decode_metadata.tree_cudagraph_runtime is not None:
+            tree_cudagraph_runtime = dict(spec_decode_metadata.tree_cudagraph_runtime)
+            capture_count_at_dispatch = int(
+                tree_cudagraph_runtime.get("capture_count_total_at_dispatch") or 0
+            )
+            replay_count_at_dispatch = int(
+                tree_cudagraph_runtime.get("replay_count_total_at_dispatch") or 0
+            )
+            tree_cudagraph_runtime["capture_count_total_at_record"] = int(
+                compilation_counter.num_cudagraph_captured
+            )
+            tree_cudagraph_runtime["replay_count_total_at_record"] = int(
+                compilation_counter.num_cudagraph_replayed
+            )
+            tree_cudagraph_runtime["capture_count_delta"] = max(
+                0,
+                tree_cudagraph_runtime["capture_count_total_at_record"]
+                - capture_count_at_dispatch,
+            )
+            tree_cudagraph_runtime["replay_count_delta"] = max(
+                0,
+                tree_cudagraph_runtime["replay_count_total_at_record"]
+                - replay_count_at_dispatch,
+            )
+        serial_repair_records = (
+            spec_decode_metadata.tree_serial_accepted_state_repair_applied or []
+        )
+        serial_repair_nonprefix_rows = sum(
+            int(record.get("is_nonprefix") or 0)
+            for record in serial_repair_records
+        )
+        serial_repair_near_tie_rows = sum(
+            int(record.get("has_near_tie_fallback") or 0)
+            for record in serial_repair_records
+        )
+
+        self._tree_attn_stage_profile_step += 1
+        return {
+            "trace_kind": "tree_attn_stage_profile",
+            "step": self._tree_attn_stage_profile_step,
+            "num_reqs": num_reqs,
+            "num_draft_tokens": [
+                int(num_tokens)
+                for num_tokens in spec_decode_metadata.num_draft_tokens
+            ],
+            "scheduled_spec_decode_tokens": scheduled_spec_tokens,
+            "output_tokens": output_tokens,
+            "accepted_tokens": accepted_tokens,
+            "relocation_pairs": relocation_pairs,
+            "tree_runtime_mode": spec_decode_metadata.tree_runtime_mode,
+            "tree_linear_kv_safe": spec_decode_metadata.tree_linear_kv_safe,
+            "tree_compact_bias_kernel_requested": compact_requested,
+            "tree_compact_bias_kernel_used": compact_used,
+            "tree_cudagraph_key": spec_decode_metadata.tree_cudagraph_key,
+            "tree_cudagraph_runtime": tree_cudagraph_runtime,
+            "tree_cudagraph_metadata_buffered": (
+                spec_decode_metadata.tree_cudagraph_metadata_buffered
+            ),
+            "tree_cudagraph_metadata_buffer_reason": (
+                spec_decode_metadata.tree_cudagraph_metadata_buffer_reason
+            ),
+            "tree_metadata_host_staged": (
+                spec_decode_metadata.tree_metadata_host_staged
+            ),
+            "tree_metadata_device_buffered": (
+                spec_decode_metadata.tree_metadata_device_buffered
+            ),
+            "tree_metadata_device_buffer_reason": (
+                spec_decode_metadata.tree_metadata_device_buffer_reason
+            ),
+            "tree_metadata_typed_view": (
+                spec_decode_metadata.tree_metadata_typed_view
+            ),
+            "tree_dynamic_select_vectorized": (
+                spec_decode_metadata.tree_dynamic_select_vectorized
+            ),
+            "near_tie_fallback_rows": len(
+                spec_decode_metadata.tree_near_tie_q1_fallback_applied or []
+            ),
+            "serial_repair_rows": len(serial_repair_records),
+            "serial_repair_prefix_rows": (
+                len(serial_repair_records) - serial_repair_nonprefix_rows
+            ),
+            "serial_repair_nonprefix_rows": serial_repair_nonprefix_rows,
+            "serial_repair_near_tie_rows": serial_repair_near_tie_rows,
+            "serial_repair_scope": (
+                self.tree_attn_serial_accepted_state_repair_scope
+            ),
+            "serial_repair_batch_by_depth": bool(
+                getattr(
+                    self,
+                    "tree_attn_serial_accepted_state_repair_batch_by_depth",
+                    False,
+                )
+            ),
+            "draft_stage_ms": dict(
+                getattr(self.drafter, "_tree_draft_last_stage_ms", None) or {}
+            ),
+            "dynamic_metadata_stage_ms": dict(
+                getattr(
+                    self.drafter,
+                    "_dynamic_tree_metadata_last_stage_ms",
+                    None,
+                )
+                or {}
+            ),
+            "sample_stage_ms": dict(
+                getattr(
+                    self.rejection_sampler,
+                    "tree_sample_last_stage_ms",
+                    None,
+                )
+                or {}
+            ),
+            "stage_ms": stage_ms,
+            "stage_total_ms": sum(stage_ms.values()),
+            "sync": self.tree_attn_stage_profile_sync,
+        }
+
+    def _maybe_dump_tree_stage_profile(
+        self,
+        *,
+        scheduler_output: SchedulerOutput,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+        sampler_output: SamplerOutput | None,
+        stage_ms: dict[str, float],
+    ) -> None:
+        if (
+            not self._tree_stage_profile_enabled(spec_decode_metadata)
+            or not self.spec_verify_state_trace_path
+            or spec_decode_metadata is None
+            or not getattr(self, "_tree_attn_trace_dump_current_step", True)
+        ):
+            return
+        record = self._make_tree_stage_profile_record(
+            scheduler_output=scheduler_output,
+            spec_decode_metadata=spec_decode_metadata,
+            sampler_output=sampler_output,
+            stage_ms=stage_ms,
+        )
+        with open(self.spec_verify_state_trace_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, sort_keys=True) + "\n")
 
     @staticmethod
     def _tensor_trace_list(
@@ -3343,77 +4412,72 @@ class GPUModelRunner(
         sampler_output: SamplerOutput,
         spec_decode_metadata: SpecDecodeMetadata | None,
     ) -> list[dict[str, int]]:
-        if (
-            spec_decode_metadata is None
-            or not spec_decode_metadata.has_tree_metadata
-            or spec_decode_metadata.tree_linear_kv_safe
-        ):
-            return []
-        accept_indices = sampler_output.spec_decode_accept_indices
-        if accept_indices is None or accept_indices.shape[-1] <= 1:
-            return []
-
-        num_reqs = min(self.input_batch.num_reqs, accept_indices.shape[0])
-        if num_reqs == 0:
-            return []
-
-        query_start_loc = self.query_start_loc.gpu
-        pairs: list[dict[str, int]] = []
-        for req_idx in range(num_reqs):
-            row_start = int(query_start_loc[req_idx].item())
-            row_end = int(query_start_loc[req_idx + 1].item())
-            row_width = row_end - row_start
-            if row_width <= 1:
-                continue
-            max_outputs = min(accept_indices.shape[1], row_width)
-            for out_pos in range(1, max_outputs):
-                src_local = int(accept_indices[req_idx, out_pos].item())
-                if src_local < 0 or src_local >= row_width:
-                    continue
-                dst_local = out_pos
-                if src_local == dst_local:
-                    continue
-                pairs.append(
-                    {
-                        "req_idx": req_idx,
-                        "src_local": src_local,
-                        "dst_local": dst_local,
-                        "src_index": row_start + src_local,
-                        "dst_index": row_start + dst_local,
-                    }
-                )
-        return pairs
+        return dynamic_tree_relocation_pairs(
+            sampler_output=sampler_output,
+            spec_decode_metadata=spec_decode_metadata,
+            num_reqs=self.input_batch.num_reqs,
+            query_start_loc=self.query_start_loc.gpu,
+        )
 
     def _dynamic_tree_sample_relocation_pairs(
         self,
         pairs: Sequence[dict[str, int]],
         spec_decode_metadata: SpecDecodeMetadata | None,
     ) -> list[dict[str, int]]:
-        if (
-            spec_decode_metadata is None
-            or spec_decode_metadata.tree_target_logits_indices is None
-            or not pairs
-        ):
-            return []
-        sample_pairs: list[dict[str, int]] = []
-        tree_indices = spec_decode_metadata.tree_target_logits_indices.detach().cpu()
-        for pair in pairs:
-            req_idx = pair["req_idx"]
-            if req_idx >= tree_indices.shape[0]:
-                continue
-            if (
-                pair["src_local"] >= tree_indices.shape[1]
-                or pair["dst_local"] >= tree_indices.shape[1]
-            ):
-                continue
-            sample_pairs.append(
-                {
-                    **pair,
-                    "src_index": int(tree_indices[req_idx, pair["src_local"]].item()),
-                    "dst_index": int(tree_indices[req_idx, pair["dst_local"]].item()),
-                }
-            )
-        return sample_pairs
+        return dynamic_tree_sample_relocation_pairs(
+            pairs=pairs,
+            spec_decode_metadata=spec_decode_metadata,
+        )
+
+    @staticmethod
+    def _clear_dynamic_tree_relocation_cache(
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> None:
+        clear_dynamic_tree_relocation_cache(spec_decode_metadata)
+
+    def _dynamic_tree_relocation_local_tensors(
+        self,
+        sampler_output: SamplerOutput,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        return dynamic_tree_relocation_local_tensors(
+            sampler_output=sampler_output,
+            spec_decode_metadata=spec_decode_metadata,
+            num_reqs=self.input_batch.num_reqs,
+            query_start_loc=self.query_start_loc.gpu,
+        )
+
+    def _dynamic_tree_relocation_index_tensors(
+        self,
+        sampler_output: SamplerOutput,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, int] | None:
+        return dynamic_tree_relocation_index_tensors(
+            sampler_output=sampler_output,
+            spec_decode_metadata=spec_decode_metadata,
+            num_reqs=self.input_batch.num_reqs,
+            query_start_loc=self.query_start_loc.gpu,
+            device=self.device,
+            use_tensor_indices=getattr(
+                self, "tree_attn_tensor_relocation_indices", False
+            ),
+        )
+
+    def _dynamic_tree_sample_relocation_index_tensors(
+        self,
+        sampler_output: SamplerOutput,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, int] | None:
+        return dynamic_tree_sample_relocation_index_tensors(
+            sampler_output=sampler_output,
+            spec_decode_metadata=spec_decode_metadata,
+            num_reqs=self.input_batch.num_reqs,
+            query_start_loc=self.query_start_loc.gpu,
+            device=self.device,
+            use_tensor_indices=getattr(
+                self, "tree_attn_tensor_relocation_indices", False
+            ),
+        )
 
     def _dynamic_tree_relocation_trace_by_req(
         self,
@@ -3450,6 +4514,8 @@ class GPUModelRunner(
         spec_decode_common_attn_metadata: CommonAttentionMetadata | None,
     ) -> None:
         if not self.spec_verify_state_trace_path:
+            return
+        if not getattr(self, "_tree_attn_trace_dump_current_step", True):
             return
 
         num_reqs = self.input_batch.num_reqs
@@ -3530,6 +4596,7 @@ class GPUModelRunner(
         tree_target_mask = None
         tree_position_offsets = None
         tree_attn_bias_mask = None
+        tree_parent = None
         tree_valid = None
         cu_num_draft_tokens = None
         cu_num_sampled_tokens = None
@@ -3547,7 +4614,23 @@ class GPUModelRunner(
         near_tie_q1_fallback_threshold = None
         near_tie_q1_fallback_by_req: dict[int, list[dict[str, Any]]] = {}
         serial_repair_by_req: dict[int, list[dict[str, Any]]] = {}
+        tree_compact_bias_kernel_requested = (
+            os.environ.get("VLLM_TREE_ATTN_DYNAMIC_MASK_KERNEL") == "1"
+        )
+        tree_compact_bias_kernel_used = False
+        tree_cudagraph_key = None
+        tree_cudagraph_runtime = None
+        tree_cudagraph_metadata_buffered = False
+        tree_cudagraph_metadata_buffer_reason = None
         if spec_decode_metadata is not None:
+            tree_cudagraph_key = spec_decode_metadata.tree_cudagraph_key
+            tree_cudagraph_runtime = spec_decode_metadata.tree_cudagraph_runtime
+            tree_cudagraph_metadata_buffered = (
+                spec_decode_metadata.tree_cudagraph_metadata_buffered
+            )
+            tree_cudagraph_metadata_buffer_reason = (
+                spec_decode_metadata.tree_cudagraph_metadata_buffer_reason
+            )
             near_tie_q1_fallback_threshold = (
                 spec_decode_metadata.tree_near_tie_q1_fallback_threshold
             )
@@ -3588,6 +4671,29 @@ class GPUModelRunner(
                 tree_position_offsets = (
                     spec_decode_metadata.tree_position_offsets.detach().cpu().tolist()
                 )
+            if spec_decode_metadata.tree_parent is not None:
+                tree_parent = (
+                    spec_decode_metadata.tree_parent.detach().cpu().tolist()
+                )
+                if query_start_loc and not spec_decode_metadata.force_root_only_forward:
+                    tree_width = spec_decode_metadata.tree_parent.shape[-1]
+                    query_lens = [
+                        int(query_start_loc[i + 1]) - int(query_start_loc[i])
+                        for i in range(num_reqs)
+                    ]
+                    decode_query_lens: list[int] = []
+                    for query_len in query_lens:
+                        if query_len > tree_width:
+                            break
+                        decode_query_lens.append(query_len)
+                    tree_compact_bias_kernel_used = (
+                        tree_compact_bias_kernel_requested
+                        and bool(decode_query_lens)
+                        and all(
+                            0 < query_len <= tree_width
+                            for query_len in decode_query_lens
+                        )
+                    )
             if spec_decode_metadata.tree_attn_bias is not None:
                 tree_attn_bias_mask = (
                     torch.isfinite(spec_decode_metadata.tree_attn_bias)
@@ -3797,6 +4903,35 @@ class GPUModelRunner(
                             spec_decode_metadata.tree_serial_q1_forward_used
                         ),
                         "tree_runtime_mode": spec_decode_metadata.tree_runtime_mode,
+                        "tree_compact_bias_kernel_requested": (
+                            tree_compact_bias_kernel_requested
+                        ),
+                        "tree_compact_bias_kernel_used": (
+                            tree_compact_bias_kernel_used
+                        ),
+                        "tree_cudagraph_key": tree_cudagraph_key,
+                        "tree_cudagraph_runtime": tree_cudagraph_runtime,
+                        "tree_cudagraph_metadata_buffered": (
+                            tree_cudagraph_metadata_buffered
+                        ),
+                        "tree_cudagraph_metadata_buffer_reason": (
+                            tree_cudagraph_metadata_buffer_reason
+                        ),
+                        "tree_metadata_host_staged": (
+                            spec_decode_metadata.tree_metadata_host_staged
+                        ),
+                        "tree_metadata_device_buffered": (
+                            spec_decode_metadata.tree_metadata_device_buffered
+                        ),
+                        "tree_metadata_device_buffer_reason": (
+                            spec_decode_metadata.tree_metadata_device_buffer_reason
+                        ),
+                        "tree_metadata_typed_view": (
+                            spec_decode_metadata.tree_metadata_typed_view
+                        ),
+                        "tree_dynamic_select_vectorized": (
+                            spec_decode_metadata.tree_dynamic_select_vectorized
+                        ),
                         "tree_near_tie_q1_fallback_threshold": (
                             near_tie_q1_fallback_threshold
                         ),
@@ -3805,6 +4940,9 @@ class GPUModelRunner(
                         ),
                         "tree_serial_accepted_state_repair_applied": (
                             serial_repair_by_req.get(req_idx, [])
+                        ),
+                        "tree_serial_accepted_state_repair_scope": (
+                            self.tree_attn_serial_accepted_state_repair_scope
                         ),
                         "draft_token_ids_flat": draft_token_ids,
                         "draft_token_ids": draft_token_ids_by_req[req_idx]
@@ -3825,6 +4963,9 @@ class GPUModelRunner(
                         else None,
                         "tree_attn_bias_mask": tree_attn_bias_mask[req_idx]
                         if tree_attn_bias_mask is not None
+                        else None,
+                        "tree_parent": tree_parent[req_idx]
+                        if tree_parent is not None
                         else None,
                         "tree_valid": tree_valid[req_idx]
                         if tree_valid is not None
@@ -3888,11 +5029,12 @@ class GPUModelRunner(
             or not self.enable_dynamic_tree_kv_relocation
         ):
             return
-        pairs = self._dynamic_tree_relocation_pairs(
+        index_tensors = self._dynamic_tree_relocation_index_tensors(
             sampler_output, spec_decode_metadata
         )
-        if not pairs:
+        if index_tensors is None:
             return
+        src_indices, dst_indices, max_index = index_tensors
 
         for group in self._kv_cache_spec_attn_group_iterator():
             if not isinstance(group.kv_cache_spec, AttentionSpec):
@@ -3901,24 +5043,16 @@ class GPUModelRunner(
             block_table = self.input_batch.block_table[group_id]
             block_size = block_table.block_size
             slot_mapping = block_table.slot_mapping.gpu
-
-            src_slots: list[torch.Tensor] = []
-            dst_slots: list[torch.Tensor] = []
-            for pair in pairs:
-                src_slot = slot_mapping[pair["src_index"]]
-                dst_slot = slot_mapping[pair["dst_index"]]
-                if (
-                    int(src_slot.item()) == PAD_SLOT_ID
-                    or int(dst_slot.item()) == PAD_SLOT_ID
-                ):
-                    continue
-                src_slots.append(src_slot)
-                dst_slots.append(dst_slot)
-            if not src_slots:
+            if slot_mapping.shape[0] <= max_index:
                 continue
 
-            src_slot_ids = torch.stack(src_slots).to(torch.long)
-            dst_slot_ids = torch.stack(dst_slots).to(torch.long)
+            group_src_indices = src_indices.to(slot_mapping.device)
+            group_dst_indices = dst_indices.to(slot_mapping.device)
+            src_slot_ids = slot_mapping[group_src_indices].to(torch.long)
+            dst_slot_ids = slot_mapping[group_dst_indices].to(torch.long)
+            valid = (src_slot_ids != PAD_SLOT_ID) & (dst_slot_ids != PAD_SLOT_ID)
+            src_slot_ids = src_slot_ids[valid]
+            dst_slot_ids = dst_slot_ids[valid]
             src_blocks = torch.div(src_slot_ids, block_size, rounding_mode="floor")
             src_offsets = src_slot_ids % block_size
             dst_blocks = torch.div(dst_slot_ids, block_size, rounding_mode="floor")
@@ -3977,20 +5111,19 @@ class GPUModelRunner(
             or not tensors
         ):
             return
-        pairs = self._dynamic_tree_relocation_pairs(
+        index_tensors = self._dynamic_tree_relocation_index_tensors(
             sampler_output, spec_decode_metadata
         )
-        src_indices = [pair["src_index"] for pair in pairs]
-        dst_indices = [pair["dst_index"] for pair in pairs]
-        if not src_indices:
+        if index_tensors is None:
             return
+        src, dst, max_index = index_tensors
 
-        src = torch.tensor(src_indices, dtype=torch.long, device=self.device)
-        dst = torch.tensor(dst_indices, dtype=torch.long, device=self.device)
         for tensor in tensors:
-            if tensor.shape[0] <= int(max(max(src_indices), max(dst_indices))):
+            if tensor.shape[0] <= max_index:
                 continue
-            tensor[dst] = tensor[src].clone()
+            tensor_src = src if src.device == tensor.device else src.to(tensor.device)
+            tensor_dst = dst if dst.device == tensor.device else dst.to(tensor.device)
+            tensor[tensor_dst] = tensor[tensor_src].clone()
 
     def _maybe_relocate_dynamic_tree_sample_tensors(
         self,
@@ -4005,23 +5138,19 @@ class GPUModelRunner(
             or not tensors
         ):
             return
-        pairs = self._dynamic_tree_sample_relocation_pairs(
-            self._dynamic_tree_relocation_pairs(
-                sampler_output, spec_decode_metadata
-            ),
-            spec_decode_metadata,
+        index_tensors = self._dynamic_tree_sample_relocation_index_tensors(
+            sampler_output, spec_decode_metadata
         )
-        src_indices = [pair["src_index"] for pair in pairs]
-        dst_indices = [pair["dst_index"] for pair in pairs]
-        if not src_indices:
+        if index_tensors is None:
             return
+        src, dst, max_index = index_tensors
 
-        src = torch.tensor(src_indices, dtype=torch.long, device=self.device)
-        dst = torch.tensor(dst_indices, dtype=torch.long, device=self.device)
         for tensor in tensors:
-            if tensor.shape[0] <= int(max(max(src_indices), max(dst_indices))):
+            if tensor.shape[0] <= max_index:
                 continue
-            tensor[dst] = tensor[src].clone()
+            tensor_src = src if src.device == tensor.device else src.to(tensor.device)
+            tensor_dst = dst if dst.device == tensor.device else dst.to(tensor.device)
+            tensor[tensor_dst] = tensor[tensor_src].clone()
 
     def _relocate_dynamic_tree_kv_group(
         self,
@@ -5221,6 +6350,29 @@ class GPUModelRunner(
 
         return slot_mappings_by_gid, slot_mappings_by_layer
 
+    @staticmethod
+    def _materialize_lazy_attention_metadata(
+        attn_metadata: PerLayerAttnMetadata | None,
+    ) -> None:
+        """Resolve lazy metadata views before CUDA graph capture.
+
+        Some attention backends derive decode/prefill views lazily using scalar
+        tensor reads.  Those reads are fine during input prep, but not inside a
+        CUDA graph capture.  Touch the views before entering the graph-wrapped
+        model call so capture only sees already-materialized metadata.
+        """
+        if attn_metadata is None:
+            return
+        metadata_dicts = attn_metadata if isinstance(attn_metadata, list) else [
+            attn_metadata
+        ]
+        for metadata_by_layer in metadata_dicts:
+            for metadata in metadata_by_layer.values():
+                if hasattr(metadata, "prefill_metadata"):
+                    _ = metadata.prefill_metadata
+                if hasattr(metadata, "decode_metadata"):
+                    _ = metadata.decode_metadata
+
     def _is_all_reqs_chunked_prefill(self) -> bool:
         """Check if all scheduled requests are marked to discard sampled tokens.
 
@@ -5391,6 +6543,15 @@ class GPUModelRunner(
                 ubatch_slices,
                 ubatch_slices_padded,
             )
+            self._annotate_tree_cudagraph_runtime(
+                spec_decode_metadata=spec_decode_metadata,
+                cudagraph_mode=cudagraph_mode,
+                batch_desc=batch_desc,
+                num_reqs=num_reqs,
+                num_tokens_unpadded=num_tokens_unpadded,
+                num_tokens_padded=num_tokens_padded,
+                forward_num_scheduled_tokens_np=forward_num_scheduled_tokens_np,
+            )
 
             # True if any attention backend handles KV cache update separately
             # from forward() (i.e., forward_includes_kv_cache_update=False). When true,
@@ -5470,6 +6631,8 @@ class GPUModelRunner(
                     slot_mappings=slot_mappings_by_group,
                 )
             )
+            if cudagraph_mode != CUDAGraphMode.NONE:
+                self._materialize_lazy_attention_metadata(attn_metadata)
 
             (
                 input_ids,
@@ -5554,13 +6717,10 @@ class GPUModelRunner(
                 )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
-            if self.use_aux_hidden_state_outputs:
-                # True when EAGLE 3 is used.
-                hidden_states, aux_hidden_states = model_output
-            else:
-                # Common case.
-                hidden_states = model_output
-                aux_hidden_states = None
+            hidden_states, aux_hidden_states = self._split_model_output(
+                model_output,
+                self.use_aux_hidden_state_outputs,
+            )
 
             if not self.broadcast_pp_output:
                 # Common case.
@@ -5843,11 +7003,10 @@ class GPUModelRunner(
                 inputs_embeds=None,
                 **model_kwargs,
             )
-        if self.use_aux_hidden_state_outputs:
-            row_hidden, row_aux_hidden = row_output
-        else:
-            row_hidden = row_output
-            row_aux_hidden = None
+        row_hidden, row_aux_hidden = self._split_model_output(
+            row_output,
+            self.use_aux_hidden_state_outputs,
+        )
         return row_hidden, row_aux_hidden, self.model.compute_logits(row_hidden)
 
     def _tree_accepted_state_repair_rows(
@@ -5860,7 +7019,6 @@ class GPUModelRunner(
             spec_decode_metadata is None
             or spec_decode_common_attn_metadata is None
             or not spec_decode_metadata.has_tree_metadata
-            or spec_decode_metadata.tree_linear_kv_safe
             or spec_decode_metadata.tree_target_logits_indices is None
             or sampler_output.spec_decode_accept_indices is None
         ):
@@ -5870,6 +7028,15 @@ class GPUModelRunner(
         output_token_ids = sampler_output.sampled_token_ids
         tree_indices = spec_decode_metadata.tree_target_logits_indices
         query_start_loc_cpu = spec_decode_common_attn_metadata.query_start_loc_cpu
+        repair_scope = getattr(
+            self,
+            "tree_attn_serial_accepted_state_repair_scope",
+            "all",
+        )
+        fallback_req_indices = {
+            int(row["req_idx"])
+            for row in (spec_decode_metadata.tree_near_tie_q1_fallback_applied or [])
+        }
         rows: list[dict[str, int]] = []
         num_reqs = min(
             output_token_ids.shape[0],
@@ -5898,6 +7065,18 @@ class GPUModelRunner(
                 local_idx = int(accept_indices[req_idx, output_idx].item())
                 if local_idx < 0 or local_idx >= tree_indices.shape[1]:
                     break
+                is_nonprefix = local_idx != output_idx
+                has_fallback = req_idx in fallback_req_indices
+                if repair_scope == "nonprefix" and not is_nonprefix:
+                    continue
+                if repair_scope == "fallback_req" and not has_fallback:
+                    continue
+                if (
+                    repair_scope == "fallback_or_nonprefix"
+                    and not has_fallback
+                    and not is_nonprefix
+                ):
+                    continue
                 source_logits_idx = int(tree_indices[req_idx, local_idx].item())
                 if source_logits_idx < 0:
                     break
@@ -5908,6 +7087,8 @@ class GPUModelRunner(
                         "local_idx": local_idx,
                         "source_logits_idx": source_logits_idx,
                         "linear_input_idx": row_start + output_idx,
+                        "is_nonprefix": int(is_nonprefix),
+                        "has_near_tie_fallback": int(has_fallback),
                     }
                 )
         return rows
@@ -5969,11 +7150,10 @@ class GPUModelRunner(
                 inputs_embeds=None,
                 **model_kwargs,
             )
-        if self.use_aux_hidden_state_outputs:
-            row_hidden, row_aux_hidden = row_output
-        else:
-            row_hidden = row_output
-            row_aux_hidden = None
+        row_hidden, row_aux_hidden = self._split_model_output(
+            row_output,
+            self.use_aux_hidden_state_outputs,
+        )
         return row_hidden, row_aux_hidden
 
     def _maybe_apply_tree_serial_accepted_state_repair(
@@ -6010,13 +7190,30 @@ class GPUModelRunner(
             return
 
         # Later accepted rows attend to earlier accepted linear rows, so replay
-        # them in output order instead of batching the entire accepted path.
+        # them in output order.  Rows at the same output depth belong to
+        # different requests and can optionally be replayed together.
         applied: list[dict[str, int]] = []
-        for row in repair_rows:
+        if getattr(
+            self,
+            "tree_attn_serial_accepted_state_repair_batch_by_depth",
+            False,
+        ):
+            rows_by_output_idx: dict[int, list[dict[str, int]]] = defaultdict(list)
+            for row in repair_rows:
+                rows_by_output_idx[int(row["output_idx"])].append(row)
+            repair_batches = [
+                rows_by_output_idx[output_idx]
+                for output_idx in sorted(rows_by_output_idx)
+            ]
+        else:
+            repair_batches = [[row] for row in repair_rows]
+
+        for rows in repair_batches:
+            output_idx = int(rows[0]["output_idx"])
             row_hidden, row_aux_hidden = (
                 self._compute_serial_q1_outputs_for_global_indices(
-                    rows=[row],
-                    local_token_idx=int(row["output_idx"]),
+                    rows=rows,
+                    local_token_idx=output_idx,
                     spec_decode_common_attn_metadata=spec_decode_common_attn_metadata,
                     input_ids=input_ids,
                     positions=positions,
@@ -6028,15 +7225,61 @@ class GPUModelRunner(
                     has_encoder_input=has_encoder_input,
                 )
             )
-            input_idx = int(row["linear_input_idx"])
-            source_logits_idx = int(row["source_logits_idx"])
-            hidden_states[input_idx].copy_(row_hidden[0])
-            if source_logits_idx < sample_hidden_states.shape[0]:
-                sample_hidden_states[source_logits_idx].copy_(row_hidden[0])
-            if aux_hidden_states is not None and row_aux_hidden is not None:
-                for aux_hidden, aux_repair in zip(aux_hidden_states, row_aux_hidden):
-                    aux_hidden[input_idx].copy_(aux_repair[0])
-            applied.append(dict(row))
+            hidden_rows = [
+                (row_offset, int(row["linear_input_idx"]))
+                for row_offset, row in enumerate(rows)
+                if int(row["linear_input_idx"]) < hidden_states.shape[0]
+            ]
+            if hidden_rows:
+                row_offsets, input_indices = zip(*hidden_rows)
+                input_indices_tensor = torch.tensor(
+                    input_indices,
+                    dtype=torch.long,
+                    device=hidden_states.device,
+                )
+                row_offsets_tensor = torch.tensor(
+                    row_offsets,
+                    dtype=torch.long,
+                    device=row_hidden.device,
+                )
+                hidden_states[input_indices_tensor] = row_hidden[
+                    row_offsets_tensor
+                ].to(hidden_states.device)
+                if aux_hidden_states is not None and row_aux_hidden is not None:
+                    for aux_hidden, aux_repair in zip(
+                        aux_hidden_states, row_aux_hidden
+                    ):
+                        aux_indices_tensor = input_indices_tensor.to(
+                            aux_hidden.device
+                        )
+                        aux_offsets_tensor = row_offsets_tensor.to(
+                            aux_repair.device
+                        )
+                        aux_hidden[aux_indices_tensor] = aux_repair[
+                            aux_offsets_tensor
+                        ].to(aux_hidden.device)
+
+            sample_rows = [
+                (row_offset, int(row["source_logits_idx"]))
+                for row_offset, row in enumerate(rows)
+                if int(row["source_logits_idx"]) < sample_hidden_states.shape[0]
+            ]
+            if sample_rows:
+                row_offsets, sample_indices = zip(*sample_rows)
+                sample_indices_tensor = torch.tensor(
+                    sample_indices,
+                    dtype=torch.long,
+                    device=sample_hidden_states.device,
+                )
+                row_offsets_tensor = torch.tensor(
+                    row_offsets,
+                    dtype=torch.long,
+                    device=row_hidden.device,
+                )
+                sample_hidden_states[sample_indices_tensor] = row_hidden[
+                    row_offsets_tensor
+                ].to(sample_hidden_states.device)
+            applied.extend(dict(row) for row in rows)
 
         assert spec_decode_metadata is not None
         spec_decode_metadata.tree_serial_accepted_state_repair_applied = applied
@@ -6104,6 +7347,8 @@ class GPUModelRunner(
                 req_idx = int(candidate["req_idx"])
                 input_idx = int(logits_indices[logits_idx].item())
                 candidate["input_idx"] = input_idx
+                old_output = sampler_output.sampled_token_ids[req_idx]
+                truncated_tokens = int((old_output[1:] >= 0).sum().item())
                 logits[logits_idx].copy_(serial_logits[row_idx])
                 if hidden_states is not None and input_idx < hidden_states.shape[0]:
                     hidden_states[input_idx].copy_(serial_hidden_states[row_idx])
@@ -6147,6 +7392,11 @@ class GPUModelRunner(
                         else [],
                         "q1_top_values": q1_top_values[0] if q1_top_values else [],
                         "q1_margin": q1_top_margins[0] if q1_top_margins else None,
+                        "threshold": (
+                            spec_decode_metadata
+                            .tree_near_tie_q1_fallback_threshold
+                        ),
+                        "truncated_accepted_tokens": truncated_tokens,
                     }
                 )
 
@@ -6155,6 +7405,11 @@ class GPUModelRunner(
             if output_idx == 0:
                 continue
             req_idx = int(candidate["req_idx"])
+            truncated_tokens = int(
+                (sampler_output.sampled_token_ids[req_idx, output_idx:] >= 0)
+                .sum()
+                .item()
+            )
             sampler_output.sampled_token_ids[req_idx, output_idx:].fill_(
                 PLACEHOLDER_TOKEN_ID
             )
@@ -6162,7 +7417,16 @@ class GPUModelRunner(
                 sampler_output.spec_decode_accept_indices[req_idx, output_idx:].fill_(
                     PLACEHOLDER_TOKEN_ID
                 )
-            applied.append({**candidate, "fallback": "truncate_before_near_tie"})
+            applied.append(
+                {
+                    **candidate,
+                    "fallback": "truncate_before_near_tie",
+                    "threshold": (
+                        spec_decode_metadata.tree_near_tie_q1_fallback_threshold
+                    ),
+                    "truncated_accepted_tokens": truncated_tokens,
+                }
+            )
 
         if applied:
             spec_decode_metadata.tree_near_tie_q1_fallback_applied = applied
@@ -6467,8 +7731,12 @@ class GPUModelRunner(
                     inputs_embeds=None,
                     **model_kwargs,
                 )
+            row_hidden, row_aux = self._split_model_output(
+                row_output,
+                self.use_aux_hidden_state_outputs,
+            )
             if self.use_aux_hidden_state_outputs:
-                row_hidden, row_aux = row_output
+                assert row_aux is not None
                 for row_offset, global_token_idx in enumerate(global_token_indices):
                     hidden_rows[global_token_idx] = row_hidden[
                         row_offset : row_offset + 1
@@ -6485,7 +7753,7 @@ class GPUModelRunner(
                         ]
             else:
                 for row_offset, global_token_idx in enumerate(global_token_indices):
-                    hidden_rows[global_token_idx] = row_output[
+                    hidden_rows[global_token_idx] = row_hidden[
                         row_offset : row_offset + 1
                     ]
         if any(row is None for row in hidden_rows):
@@ -6555,8 +7823,18 @@ class GPUModelRunner(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
 
+        tree_stage_profile = self._tree_stage_profile_enabled(spec_decode_metadata)
+        tree_stage_ms: dict[str, float] = {}
+        tree_stage_start = self._tree_stage_now if tree_stage_profile else None
+
         with record_function_or_nullcontext("gpu_model_runner: sample"):
+            stage_start = tree_stage_start() if tree_stage_start else 0.0
             sampler_output = self._sample(logits, spec_decode_metadata)
+            if tree_stage_start:
+                tree_stage_ms["sample_ms"] = self._tree_stage_elapsed_ms(
+                    stage_start
+                )
+            stage_start = tree_stage_start() if tree_stage_start else 0.0
             sampler_output = self._maybe_apply_tree_near_tie_q1_fallback(
                 sampler_output=sampler_output,
                 logits=logits,
@@ -6575,7 +7853,16 @@ class GPUModelRunner(
                 slot_mappings_by_group=slot_mappings_by_group,
                 has_encoder_input=has_encoder_input,
             )
+            if tree_stage_start:
+                tree_stage_ms["near_tie_fallback_ms"] = (
+                    self._tree_stage_elapsed_ms(stage_start)
+                )
 
+        self._clear_dynamic_tree_relocation_cache(spec_decode_metadata)
+        self._tree_attn_trace_dump_current_step = (
+            self._tree_trace_dump_enabled_for_step()
+        )
+        stage_start = tree_stage_start() if tree_stage_start else 0.0
         self._maybe_dump_spec_verify_state_trace(
             scheduler_output=scheduler_output,
             sampler_output=sampler_output,
@@ -6585,6 +7872,9 @@ class GPUModelRunner(
             spec_decode_common_attn_metadata=spec_decode_common_attn_metadata,
         )
         self._maybe_dump_tree_spec_trace(sampler_output, spec_decode_metadata)
+        if tree_stage_start:
+            tree_stage_ms["trace_dump_ms"] = self._tree_stage_elapsed_ms(stage_start)
+        stage_start = tree_stage_start() if tree_stage_start else 0.0
         self._maybe_relocate_dynamic_tree_inputs(
             sampler_output,
             spec_decode_metadata,
@@ -6597,6 +7887,9 @@ class GPUModelRunner(
             aux_hidden_states,
         )
         self._maybe_relocate_dynamic_tree_kv(sampler_output, spec_decode_metadata)
+        if tree_stage_start:
+            tree_stage_ms["relocation_ms"] = self._tree_stage_elapsed_ms(stage_start)
+        stage_start = tree_stage_start() if tree_stage_start else 0.0
         self._maybe_apply_tree_serial_accepted_state_repair(
             sampler_output=sampler_output,
             spec_decode_metadata=spec_decode_metadata,
@@ -6613,6 +7906,11 @@ class GPUModelRunner(
             slot_mappings_by_group=slot_mappings_by_group,
             has_encoder_input=has_encoder_input,
         )
+        if tree_stage_start:
+            tree_stage_ms["serial_repair_ms"] = self._tree_stage_elapsed_ms(
+                stage_start
+            )
+        stage_start = tree_stage_start() if tree_stage_start else 0.0
         self._mark_tree_spec_recovery_after_reject(
             sampler_output,
             spec_decode_metadata,
@@ -6620,6 +7918,10 @@ class GPUModelRunner(
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
         )
+        if tree_stage_start:
+            tree_stage_ms["state_update_ms"] = self._tree_stage_elapsed_ms(
+                stage_start
+            )
         if self.use_async_scheduling:
             pp = get_pp_group()
             # For torchrun external_launcher PP mode with broadcast_pp_output=True,
@@ -6697,7 +7999,12 @@ class GPUModelRunner(
                 )
                 sampled_token_ids = sampler_output.sampled_token_ids
                 if input_fits_in_drafter:
+                    stage_start = tree_stage_start() if tree_stage_start else 0.0
                     propose_draft_token_ids(sampled_token_ids)
+                    if tree_stage_start:
+                        tree_stage_ms["draft_ms"] = self._tree_stage_elapsed_ms(
+                            stage_start
+                        )
                 elif self.valid_sampled_token_count_event is not None:
                     assert spec_decode_common_attn_metadata is not None
                     next_token_ids, valid_sampled_tokens_count = (
@@ -6718,7 +8025,12 @@ class GPUModelRunner(
                 assert isinstance(self.drafter, NgramProposerGPU)
                 sampled_token_ids = sampler_output.sampled_token_ids
                 if input_fits_in_drafter:
+                    stage_start = tree_stage_start() if tree_stage_start else 0.0
                     propose_draft_token_ids(sampled_token_ids)
+                    if tree_stage_start:
+                        tree_stage_ms["draft_ms"] = self._tree_stage_elapsed_ms(
+                            stage_start
+                        )
                 elif self.valid_sampled_token_count_event is not None:
                     assert spec_decode_common_attn_metadata is not None
                     next_token_ids, valid_sampled_tokens_count, _ = (
@@ -6748,6 +8060,7 @@ class GPUModelRunner(
                 self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
 
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
+            stage_start = tree_stage_start() if tree_stage_start else 0.0
             (
                 num_nans_in_logits,
                 logprobs_lists,
@@ -6763,11 +8076,26 @@ class GPUModelRunner(
                 hidden_states,
                 scheduler_output.total_num_scheduled_tokens,
             )
+            if tree_stage_start:
+                tree_stage_ms["bookkeeping_ms"] = self._tree_stage_elapsed_ms(
+                    stage_start
+                )
 
         if propose_drafts_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled
             # tokens on the CPU, so they are run after bookkeeping.
+            stage_start = tree_stage_start() if tree_stage_start else 0.0
             propose_draft_token_ids(valid_sampled_token_ids)
+            if tree_stage_start:
+                tree_stage_ms["draft_ms"] = self._tree_stage_elapsed_ms(stage_start)
+
+        if tree_stage_start:
+            self._maybe_dump_tree_stage_profile(
+                scheduler_output=scheduler_output,
+                spec_decode_metadata=spec_decode_metadata,
+                sampler_output=sampler_output,
+                stage_ms=tree_stage_ms,
+            )
 
         # Finalize KV connector (wait_for_save + clear metadata) after
         # draft model runs. Deferred from target model forward to allow
@@ -6883,18 +8211,86 @@ class GPUModelRunner(
         dynamic_tree_draft_token_ids = getattr(
             self.drafter, "_dynamic_tree_last_draft_token_ids", None
         )
-        if self.enable_dynamic_draft_tree and dynamic_tree_draft_token_ids is not None:
-            req_ids = self._draft_token_req_ids
-            tree_metadata = self._get_draft_tree_metadata(req_ids)
-            draft_token_ids = [
-                list(tokens)
-                for tokens in dynamic_tree_draft_token_ids[: len(req_ids)]
-            ]
-            draft_token_ids, tree_metadata = self._apply_tree_spec_recovery(
-                req_ids,
-                draft_token_ids,
-                tree_metadata,
-            )
+        req_ids = self._draft_token_req_ids
+        tree_metadata = (
+            self._get_draft_tree_metadata(req_ids)
+            if self.enable_dynamic_draft_tree
+            else None
+        )
+        if (
+            self.enable_dynamic_draft_tree
+            and (tree_metadata is not None or dynamic_tree_draft_token_ids is not None)
+        ):
+            if isinstance(tree_metadata, DynamicTreeDeviceMetadataHandle):
+                tree_metadata = replace(tree_metadata, req_ids=tuple(req_ids))
+                draft_token_rows = tree_metadata.selected_token_ids_by_req
+                if draft_token_rows is not None:
+                    draft_token_ids = [list(row) for row in draft_token_rows]
+                else:
+                    draft_token_ids = []
+                    for req_id in req_ids:
+                        row_metadata = self._tree_handle_row_to_typed_metadata(
+                            tree_metadata, req_id
+                        )
+                        if row_metadata is None or not row_metadata.tree_valid:
+                            draft_token_ids.append([])
+                        elif row_metadata.selected_token_ids is not None:
+                            draft_token_ids.append(
+                                list(row_metadata.selected_token_ids)
+                            )
+                        else:
+                            draft_token_ids.append([])
+            elif tree_metadata is not None:
+                draft_token_ids = []
+                for req_idx, tree_metadata_entry in enumerate(tree_metadata):
+                    if (
+                        tree_metadata_entry is None
+                        or not tree_metadata_entry.get("tree_valid", False)
+                    ):
+                        draft_token_ids.append([])
+                        continue
+                    selected_token_ids = tree_metadata_entry.get(
+                        "selected_token_ids", None
+                    )
+                    if selected_token_ids is not None:
+                        draft_token_ids.append(list(selected_token_ids))
+                    elif (
+                        dynamic_tree_draft_token_ids is not None
+                        and req_idx < len(dynamic_tree_draft_token_ids)
+                    ):
+                        draft_token_ids.append(
+                            list(dynamic_tree_draft_token_ids[req_idx])
+                        )
+                    else:
+                        draft_token_ids.append([])
+            elif dynamic_tree_draft_token_ids is not None:
+                draft_token_ids = [
+                    list(tokens)
+                    for tokens in dynamic_tree_draft_token_ids[: len(req_ids)]
+                ]
+            else:
+                draft_token_ids = [[] for _ in req_ids]
+            if isinstance(tree_metadata, DynamicTreeDeviceMetadataHandle):
+                recovery_req_ids = getattr(self, "_tree_spec_recovery_req_ids", set())
+                if recovery_req_ids:
+                    tree_metadata = [
+                        None if req_id in recovery_req_ids else tree_metadata
+                        for req_id in req_ids
+                    ]
+                    for req_idx, req_id in enumerate(req_ids):
+                        if req_id in recovery_req_ids:
+                            draft_token_ids[req_idx] = []
+                    recovery_req_ids.difference_update(req_ids)
+                    if tree_metadata is not None and not any(
+                        entry is not None for entry in tree_metadata
+                    ):
+                        tree_metadata = None
+            else:
+                draft_token_ids, tree_metadata = self._apply_tree_spec_recovery(
+                    req_ids,
+                    draft_token_ids,
+                    tree_metadata,
+                )
             return DraftTokenIds(
                 req_ids,
                 draft_token_ids,
@@ -6947,45 +8343,59 @@ class GPUModelRunner(
         self,
         req_ids: list[str],
         draft_token_ids: list[list[int]],
-        tree_metadata: dict[str, dict[str, list[int] | list[list[int]] | int | bool]]
-        | None,
+        tree_metadata: list[DynamicTreeCompactMetadata | None] | None,
     ) -> tuple[
         list[list[int]],
-        dict[str, dict[str, list[int] | list[list[int]] | int | bool]] | None,
+        list[DynamicTreeCompactMetadata | None] | None,
     ]:
         recovery_req_ids = getattr(self, "_tree_spec_recovery_req_ids", set())
         if not recovery_req_ids:
             return draft_token_ids, tree_metadata
-        tree_metadata = None if tree_metadata is None else tree_metadata.copy()
+        tree_metadata = None if tree_metadata is None else list(tree_metadata)
         for req_idx, req_id in enumerate(req_ids):
             if req_id not in recovery_req_ids:
                 continue
             draft_token_ids[req_idx] = []
             if tree_metadata is not None:
-                tree_metadata.pop(req_id, None)
+                tree_metadata[req_idx] = None
         recovery_req_ids.difference_update(req_ids)
-        return draft_token_ids, tree_metadata or None
+        if tree_metadata is not None and not any(
+            entry is not None for entry in tree_metadata
+        ):
+            return draft_token_ids, None
+        return draft_token_ids, tree_metadata
 
     def _get_draft_tree_metadata(
         self, req_ids: list[str]
-    ) -> dict[str, dict[str, list[int] | list[list[int]] | int | bool]] | None:
+    ) -> (
+        list[DynamicTreeCompactMetadata | None]
+        | DynamicTreeDeviceMetadataHandle
+        | None
+    ):
         if not isinstance(self.drafter, EagleProposer):
             return None
         dynamic_tree_metadata = getattr(
             self.drafter, "_dynamic_tree_last_metadata", None
         )
         if self.enable_dynamic_draft_tree and dynamic_tree_metadata is not None:
-            metadata_by_req: dict[
-                str, dict[str, list[int] | list[list[int]] | int | bool]
-            ] = {}
-            for req_id, tree_metadata in zip(req_ids, dynamic_tree_metadata):
+            if isinstance(dynamic_tree_metadata, DynamicTreeDeviceMetadataHandle):
+                return dynamic_tree_metadata
+            metadata_by_req: list[DynamicTreeCompactMetadata | None] = [None] * len(
+                req_ids
+            )
+            for req_idx, tree_metadata in enumerate(
+                dynamic_tree_metadata[: len(req_ids)]
+            ):
                 if tree_metadata is not None:
-                    metadata_by_req[req_id] = tree_metadata.copy()
-            return metadata_by_req
+                    metadata_by_req[req_idx] = tree_metadata.copy()
+            if any(entry is not None for entry in metadata_by_req):
+                return metadata_by_req
+            return None
         tree_metadata = getattr(self.drafter, "tree_retrieve_metadata", None)
         if tree_metadata is None:
             return None
-        return {req_id: tree_metadata.copy() for req_id in req_ids}
+        compact_metadata = DynamicTreeCompactMetadata.from_mapping(tree_metadata)
+        return [compact_metadata for _ in req_ids]
 
     def _copy_draft_token_ids_to_cpu(
         self, scheduler_output: "SchedulerOutput", zeros_only: bool = False
@@ -7002,6 +8412,16 @@ class GPUModelRunner(
 
         draft_token_ids: torch.Tensor = self._draft_token_ids
         if not torch.is_tensor(draft_token_ids):
+            return
+        if (
+            self.enable_dynamic_draft_tree
+            and not zeros_only
+            and getattr(self.drafter, "_dynamic_tree_last_metadata", None)
+            is not None
+        ):
+            # DDT scheduler tokens are derived from per-request compact
+            # metadata selected_token_ids. Avoid copying the full static
+            # tree draft tensor back to CPU when it is only a legacy fallback.
             return
         assert self.draft_token_ids_event is not None
         assert self.draft_token_ids_copy_stream is not None
@@ -7813,6 +9233,28 @@ class GPUModelRunner(
             )
         )
 
+    @staticmethod
+    def _split_model_output(
+        outputs: Any,
+        use_aux_hidden_state_outputs: bool,
+    ) -> tuple[Any, Any | None]:
+        if use_aux_hidden_state_outputs or isinstance(outputs, tuple):
+            hidden_states, _ = outputs
+            aux_hidden_states = outputs[1] if use_aux_hidden_state_outputs else None
+            return hidden_states, aux_hidden_states
+        return outputs, None
+
+    @staticmethod
+    def _unwrap_dummy_hidden_states(
+        outputs: Any,
+        use_aux_hidden_state_outputs: bool,
+    ) -> Any:
+        hidden_states, _ = GPUModelRunner._split_model_output(
+            outputs,
+            use_aux_hidden_state_outputs,
+        )
+        return hidden_states
+
     @torch.inference_mode()
     def _dummy_run(
         self,
@@ -8030,6 +9472,8 @@ class GPUModelRunner(
                     slot_mappings=slot_mappings_by_group,
                     use_spec_decode=self.speculative_config is not None,
                 )
+                if cudagraph_runtime_mode != CUDAGraphMode.NONE:
+                    self._materialize_lazy_attention_metadata(attn_metadata)
 
         with self.maybe_dummy_run_with_lora(
             self.lora_config,
@@ -8108,10 +9552,10 @@ class GPUModelRunner(
                     **model_kwargs,
                 )
 
-            if self.use_aux_hidden_state_outputs:
-                hidden_states, _ = outputs
-            else:
-                hidden_states = outputs
+            hidden_states = self._unwrap_dummy_hidden_states(
+                outputs,
+                self.use_aux_hidden_state_outputs,
+            )
 
             if self.speculative_config and (
                 self.speculative_config.use_eagle()

@@ -13,6 +13,8 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm.triton_utils import HAS_TRITON, tl, triton
+
 
 @dataclass(frozen=True)
 class DynamicTreeBuildOutput:
@@ -99,6 +101,1408 @@ class DynamicTreeVerifyOutput:
     accept_token_num: torch.Tensor
     # [batch_size, num_spec_steps], target token for root/accepted/bonus slots.
     accept_token: torch.Tensor
+
+
+@dataclass(frozen=True)
+class StaticTopKCompactMetadataOutput:
+    """Fixed-width compact metadata built from static-tree top-k nodes.
+
+    This is the oracle contract for the DDT selected-subtree handoff kernel.
+    All metadata tensors are root-inclusive.  ``selected_static_nodes`` and
+    ``selected_token_ids`` exclude the root and are padded to
+    ``max_tree_nodes - 1``.
+    """
+
+    selected_static_nodes: torch.Tensor
+    selected_token_ids: torch.Tensor
+    retrieve_index: torch.Tensor
+    retrieve_next_token: torch.Tensor
+    retrieve_next_sibling: torch.Tensor
+    parent: torch.Tensor
+    target_mask: torch.Tensor
+    position_offsets: torch.Tensor
+    tree_valid: torch.Tensor
+    num_nodes: torch.Tensor
+    num_spec_steps: torch.Tensor
+
+
+def build_static_topk_compact_metadata(
+    topk_static_nodes: torch.Tensor,
+    valid_topk: torch.Tensor,
+    static_tokens: torch.Tensor,
+    static_parent_indices: torch.Tensor,
+    static_position_offsets: torch.Tensor,
+    *,
+    max_tree_nodes: int | None = None,
+) -> StaticTopKCompactMetadataOutput:
+    """Build compact DDT metadata from static-tree top-k selections.
+
+    The output mirrors ``EagleProposer._get_dynamic_tree_metadata_template``
+    but returns fixed-width tensors that are suitable for a later GPU-side
+    compaction kernel.  The reference implementation intentionally uses Python
+    loops so the tensor contract is easy to inspect and test first.
+    """
+
+    if topk_static_nodes.ndim != 2:
+        raise ValueError(
+            f"topk_static_nodes must be 2D, got {topk_static_nodes.shape}"
+        )
+    if valid_topk.shape != topk_static_nodes.shape:
+        raise ValueError(
+            "valid_topk must have the same shape as topk_static_nodes, got "
+            f"{valid_topk.shape} and {topk_static_nodes.shape}"
+        )
+    if static_tokens.ndim != 2:
+        raise ValueError(f"static_tokens must be 2D, got {static_tokens.shape}")
+    if static_tokens.shape[0] != topk_static_nodes.shape[0]:
+        raise ValueError(
+            "static_tokens and topk_static_nodes batch size mismatch: "
+            f"{static_tokens.shape[0]} vs {topk_static_nodes.shape[0]}"
+        )
+    if static_parent_indices.ndim != 1:
+        raise ValueError(
+            "static_parent_indices must be 1D, got "
+            f"{static_parent_indices.shape}"
+        )
+    if static_position_offsets.ndim != 1:
+        raise ValueError(
+            "static_position_offsets must be 1D, got "
+            f"{static_position_offsets.shape}"
+        )
+    static_width = static_tokens.shape[1]
+    if static_parent_indices.shape[0] < static_width:
+        raise ValueError(
+            "static_parent_indices is narrower than static_tokens: "
+            f"{static_parent_indices.shape[0]} < {static_width}"
+        )
+    if static_position_offsets.shape[0] < static_width:
+        raise ValueError(
+            "static_position_offsets is narrower than static_tokens: "
+            f"{static_position_offsets.shape[0]} < {static_width}"
+        )
+
+    batch_size, topk_count = topk_static_nodes.shape
+    if max_tree_nodes is None:
+        max_tree_nodes = static_width
+    if max_tree_nodes <= 0:
+        raise ValueError(f"max_tree_nodes must be positive, got {max_tree_nodes}")
+    if max_tree_nodes > static_width:
+        raise ValueError(
+            "max_tree_nodes cannot exceed static tree width including root: "
+            f"{max_tree_nodes} > {static_width}"
+        )
+
+    device = topk_static_nodes.device
+    selected_width = max_tree_nodes - 1
+    selected_static_nodes = torch.zeros(
+        (batch_size, selected_width), dtype=torch.int32, device=device
+    )
+    selected_token_ids = torch.zeros(
+        (batch_size, selected_width), dtype=static_tokens.dtype, device=device
+    )
+    retrieve_index = (
+        torch.arange(max_tree_nodes, dtype=torch.int32, device=device)
+        .expand(batch_size, -1)
+        .clone()
+    )
+    retrieve_next_token = torch.full(
+        (batch_size, max_tree_nodes), -1, dtype=torch.int32, device=device
+    )
+    retrieve_next_sibling = torch.full(
+        (batch_size, max_tree_nodes), -1, dtype=torch.int32, device=device
+    )
+    parent = torch.full(
+        (batch_size, max_tree_nodes), -1, dtype=torch.int32, device=device
+    )
+    target_mask = torch.zeros(
+        (batch_size, max_tree_nodes), dtype=torch.int32, device=device
+    )
+    position_offsets = torch.zeros(
+        (batch_size, max_tree_nodes), dtype=torch.int64, device=device
+    )
+    tree_valid = torch.zeros(batch_size, dtype=torch.bool, device=device)
+    num_nodes = torch.ones(batch_size, dtype=torch.int32, device=device)
+    num_spec_steps = torch.ones(batch_size, dtype=torch.int32, device=device)
+
+    topk_static_nodes_cpu = topk_static_nodes.detach().cpu().tolist()
+    valid_topk_cpu = valid_topk.detach().cpu().tolist()
+    static_tokens_cpu = static_tokens.detach().cpu().tolist()
+    static_parent_cpu = static_parent_indices.detach().cpu().tolist()
+    static_position_cpu = static_position_offsets.detach().cpu().tolist()
+
+    for batch_idx in range(batch_size):
+        token_by_static_node: dict[int, int] = {}
+        for static_idx, is_valid in zip(
+            topk_static_nodes_cpu[batch_idx],
+            valid_topk_cpu[batch_idx],
+            strict=True,
+        ):
+            if not bool(is_valid):
+                continue
+            cur_static_idx = int(static_idx)
+            while cur_static_idx > 0:
+                if cur_static_idx >= static_width:
+                    break
+                token_by_static_node[cur_static_idx] = int(
+                    static_tokens_cpu[batch_idx][cur_static_idx]
+                )
+                cur_static_idx = int(static_parent_cpu[cur_static_idx])
+
+        if not token_by_static_node:
+            continue
+        packed_static_nodes = sorted(token_by_static_node)
+        row_num_nodes = min(len(packed_static_nodes) + 1, max_tree_nodes)
+        packed_static_nodes = packed_static_nodes[: row_num_nodes - 1]
+        static_to_packed = {
+            static_idx: packed_idx + 1
+            for packed_idx, static_idx in enumerate(packed_static_nodes)
+        }
+        children_by_parent: dict[int, list[int]] = {}
+        for packed_idx, static_idx in enumerate(packed_static_nodes, start=1):
+            selected_static_nodes[batch_idx, packed_idx - 1] = static_idx
+            selected_token_ids[batch_idx, packed_idx - 1] = token_by_static_node[
+                static_idx
+            ]
+            position_offsets[batch_idx, packed_idx] = int(
+                static_position_cpu[static_idx]
+            )
+            parent_static_idx = int(static_parent_cpu[static_idx])
+            if parent_static_idx == 0 or parent_static_idx in static_to_packed:
+                parent_idx = static_to_packed.get(parent_static_idx, 0)
+                parent[batch_idx, packed_idx] = parent_idx
+                children_by_parent.setdefault(parent_idx, []).append(packed_idx)
+
+        for parent_idx, child_indices in children_by_parent.items():
+            first_child = -1
+            for child_idx in sorted(child_indices, reverse=True):
+                retrieve_next_sibling[batch_idx, child_idx] = first_child
+                first_child = child_idx
+            retrieve_next_token[batch_idx, parent_idx] = first_child
+
+        target_mask[batch_idx, :row_num_nodes] = 1
+        tree_valid[batch_idx] = True
+        num_nodes[batch_idx] = row_num_nodes
+        max_depth = max(
+            (
+                int(static_position_cpu[static_idx])
+                for static_idx in packed_static_nodes
+            ),
+            default=0,
+        )
+        num_spec_steps[batch_idx] = max_depth + 1
+
+    return StaticTopKCompactMetadataOutput(
+        selected_static_nodes=selected_static_nodes,
+        selected_token_ids=selected_token_ids,
+        retrieve_index=retrieve_index,
+        retrieve_next_token=retrieve_next_token,
+        retrieve_next_sibling=retrieve_next_sibling,
+        parent=parent,
+        target_mask=target_mask,
+        position_offsets=position_offsets,
+        tree_valid=tree_valid,
+        num_nodes=num_nodes,
+        num_spec_steps=num_spec_steps,
+    )
+
+
+def build_selected_bool_compact_metadata(
+    selected_bool: torch.Tensor,
+    static_tokens: torch.Tensor,
+    static_parent_indices: torch.Tensor,
+    static_position_offsets: torch.Tensor,
+    *,
+    max_tree_nodes: int | None = None,
+) -> StaticTopKCompactMetadataOutput:
+    """Build compact DDT metadata from an ancestor-closed static bool mask."""
+
+    if selected_bool.ndim != 2:
+        raise ValueError(f"selected_bool must be 2D, got {selected_bool.shape}")
+    if static_tokens.ndim != 2:
+        raise ValueError(f"static_tokens must be 2D, got {static_tokens.shape}")
+    if static_tokens.shape != selected_bool.shape:
+        raise ValueError(
+            "static_tokens and selected_bool shape mismatch: "
+            f"{static_tokens.shape} vs {selected_bool.shape}"
+        )
+    if static_parent_indices.ndim != 1:
+        raise ValueError(
+            "static_parent_indices must be 1D, got "
+            f"{static_parent_indices.shape}"
+        )
+    if static_position_offsets.ndim != 1:
+        raise ValueError(
+            "static_position_offsets must be 1D, got "
+            f"{static_position_offsets.shape}"
+        )
+    static_width = static_tokens.shape[1]
+    if static_parent_indices.shape[0] < static_width:
+        raise ValueError(
+            "static_parent_indices is narrower than static_tokens: "
+            f"{static_parent_indices.shape[0]} < {static_width}"
+        )
+    if static_position_offsets.shape[0] < static_width:
+        raise ValueError(
+            "static_position_offsets is narrower than static_tokens: "
+            f"{static_position_offsets.shape[0]} < {static_width}"
+        )
+
+    batch_size = selected_bool.shape[0]
+    if max_tree_nodes is None:
+        max_tree_nodes = static_width
+    if max_tree_nodes <= 0:
+        raise ValueError(f"max_tree_nodes must be positive, got {max_tree_nodes}")
+    if max_tree_nodes > static_width:
+        raise ValueError(
+            "max_tree_nodes cannot exceed static tree width including root: "
+            f"{max_tree_nodes} > {static_width}"
+        )
+
+    device = selected_bool.device
+    selected_width = max_tree_nodes - 1
+    selected_static_nodes = torch.zeros(
+        (batch_size, selected_width), dtype=torch.int32, device=device
+    )
+    selected_token_ids = torch.zeros(
+        (batch_size, selected_width), dtype=static_tokens.dtype, device=device
+    )
+    retrieve_index = (
+        torch.arange(max_tree_nodes, dtype=torch.int32, device=device)
+        .expand(batch_size, -1)
+        .clone()
+    )
+    retrieve_next_token = torch.full(
+        (batch_size, max_tree_nodes), -1, dtype=torch.int32, device=device
+    )
+    retrieve_next_sibling = torch.full(
+        (batch_size, max_tree_nodes), -1, dtype=torch.int32, device=device
+    )
+    parent = torch.full(
+        (batch_size, max_tree_nodes), -1, dtype=torch.int32, device=device
+    )
+    target_mask = torch.zeros(
+        (batch_size, max_tree_nodes), dtype=torch.int32, device=device
+    )
+    position_offsets = torch.zeros(
+        (batch_size, max_tree_nodes), dtype=torch.int64, device=device
+    )
+    tree_valid = torch.zeros(batch_size, dtype=torch.bool, device=device)
+    num_nodes = torch.ones(batch_size, dtype=torch.int32, device=device)
+    num_spec_steps = torch.ones(batch_size, dtype=torch.int32, device=device)
+
+    selected_bool_cpu = selected_bool.detach().cpu().tolist()
+    static_tokens_cpu = static_tokens.detach().cpu().tolist()
+    static_parent_cpu = static_parent_indices.detach().cpu().tolist()
+    static_position_cpu = static_position_offsets.detach().cpu().tolist()
+
+    for batch_idx in range(batch_size):
+        packed_static_nodes = [
+            static_idx
+            for static_idx in range(1, static_width)
+            if bool(selected_bool_cpu[batch_idx][static_idx])
+        ][:selected_width]
+        if not packed_static_nodes:
+            continue
+        row_num_nodes = len(packed_static_nodes) + 1
+        static_to_packed = {
+            static_idx: packed_idx + 1
+            for packed_idx, static_idx in enumerate(packed_static_nodes)
+        }
+        children_by_parent: dict[int, list[int]] = {}
+        for packed_idx, static_idx in enumerate(packed_static_nodes, start=1):
+            selected_static_nodes[batch_idx, packed_idx - 1] = static_idx
+            selected_token_ids[batch_idx, packed_idx - 1] = int(
+                static_tokens_cpu[batch_idx][static_idx]
+            )
+            position_offsets[batch_idx, packed_idx] = int(
+                static_position_cpu[static_idx]
+            )
+            parent_static_idx = int(static_parent_cpu[static_idx])
+            if parent_static_idx == 0 or parent_static_idx in static_to_packed:
+                parent_idx = static_to_packed.get(parent_static_idx, 0)
+                parent[batch_idx, packed_idx] = parent_idx
+                children_by_parent.setdefault(parent_idx, []).append(packed_idx)
+
+        for parent_idx, child_indices in children_by_parent.items():
+            first_child = -1
+            for child_idx in sorted(child_indices, reverse=True):
+                retrieve_next_sibling[batch_idx, child_idx] = first_child
+                first_child = child_idx
+            retrieve_next_token[batch_idx, parent_idx] = first_child
+
+        target_mask[batch_idx, :row_num_nodes] = 1
+        tree_valid[batch_idx] = True
+        num_nodes[batch_idx] = row_num_nodes
+        max_depth = max(
+            (
+                int(static_position_cpu[static_idx])
+                for static_idx in packed_static_nodes
+            ),
+            default=0,
+        )
+        num_spec_steps[batch_idx] = max_depth + 1
+
+    return StaticTopKCompactMetadataOutput(
+        selected_static_nodes=selected_static_nodes,
+        selected_token_ids=selected_token_ids,
+        retrieve_index=retrieve_index,
+        retrieve_next_token=retrieve_next_token,
+        retrieve_next_sibling=retrieve_next_sibling,
+        parent=parent,
+        target_mask=target_mask,
+        position_offsets=position_offsets,
+        tree_valid=tree_valid,
+        num_nodes=num_nodes,
+        num_spec_steps=num_spec_steps,
+    )
+
+
+@triton.jit
+def _build_static_topk_compact_metadata_triton_kernel(
+    topk_static_nodes_ptr,
+    valid_topk_ptr,
+    static_tokens_ptr,
+    static_parent_indices_ptr,
+    static_position_offsets_ptr,
+    selected_static_nodes_ptr,
+    selected_token_ids_ptr,
+    retrieve_index_ptr,
+    retrieve_next_token_ptr,
+    retrieve_next_sibling_ptr,
+    parent_ptr,
+    target_mask_ptr,
+    position_offsets_ptr,
+    tree_valid_ptr,
+    num_nodes_ptr,
+    num_spec_steps_ptr,
+    topk_static_nodes_stride_b: tl.constexpr,
+    topk_static_nodes_stride_k: tl.constexpr,
+    valid_topk_stride_b: tl.constexpr,
+    valid_topk_stride_k: tl.constexpr,
+    static_tokens_stride_b: tl.constexpr,
+    static_tokens_stride_w: tl.constexpr,
+    selected_static_nodes_stride_b: tl.constexpr,
+    selected_static_nodes_stride_w: tl.constexpr,
+    selected_token_ids_stride_b: tl.constexpr,
+    selected_token_ids_stride_w: tl.constexpr,
+    retrieve_index_stride_b: tl.constexpr,
+    retrieve_index_stride_w: tl.constexpr,
+    retrieve_next_token_stride_b: tl.constexpr,
+    retrieve_next_token_stride_w: tl.constexpr,
+    retrieve_next_sibling_stride_b: tl.constexpr,
+    retrieve_next_sibling_stride_w: tl.constexpr,
+    parent_stride_b: tl.constexpr,
+    parent_stride_w: tl.constexpr,
+    target_mask_stride_b: tl.constexpr,
+    target_mask_stride_w: tl.constexpr,
+    position_offsets_stride_b: tl.constexpr,
+    position_offsets_stride_w: tl.constexpr,
+    TOPK_COUNT: tl.constexpr,
+    STATIC_WIDTH: tl.constexpr,
+    MAX_TREE_NODES: tl.constexpr,
+):
+    req_idx = tl.program_id(0)
+
+    for local_idx in range(MAX_TREE_NODES):
+        tl.store(
+            retrieve_index_ptr
+            + req_idx * retrieve_index_stride_b
+            + local_idx * retrieve_index_stride_w,
+            local_idx,
+        )
+        tl.store(
+            retrieve_next_token_ptr
+            + req_idx * retrieve_next_token_stride_b
+            + local_idx * retrieve_next_token_stride_w,
+            -1,
+        )
+        tl.store(
+            retrieve_next_sibling_ptr
+            + req_idx * retrieve_next_sibling_stride_b
+            + local_idx * retrieve_next_sibling_stride_w,
+            -1,
+        )
+        tl.store(
+            parent_ptr + req_idx * parent_stride_b + local_idx * parent_stride_w,
+            -1,
+        )
+        tl.store(
+            target_mask_ptr
+            + req_idx * target_mask_stride_b
+            + local_idx * target_mask_stride_w,
+            0,
+        )
+        tl.store(
+            position_offsets_ptr
+            + req_idx * position_offsets_stride_b
+            + local_idx * position_offsets_stride_w,
+            0,
+        )
+
+    for selected_pos in range(MAX_TREE_NODES - 1):
+        tl.store(
+            selected_static_nodes_ptr
+            + req_idx * selected_static_nodes_stride_b
+            + selected_pos * selected_static_nodes_stride_w,
+            0,
+        )
+        tl.store(
+            selected_token_ids_ptr
+            + req_idx * selected_token_ids_stride_b
+            + selected_pos * selected_token_ids_stride_w,
+            0,
+        )
+
+    packed_count = tl.full((), 0, tl.int64)
+    max_depth = tl.full((), 0, tl.int64)
+
+    for static_idx in range(1, STATIC_WIDTH):
+        selected = tl.full((), False, tl.int1)
+        for topk_idx in range(TOPK_COUNT):
+            valid = tl.load(
+                valid_topk_ptr
+                + req_idx * valid_topk_stride_b
+                + topk_idx * valid_topk_stride_k
+            )
+            cur_static_idx = tl.load(
+                topk_static_nodes_ptr
+                + req_idx * topk_static_nodes_stride_b
+                + topk_idx * topk_static_nodes_stride_k
+            ).to(tl.int64)
+            for _ in range(STATIC_WIDTH):
+                active = valid & (cur_static_idx > 0) & (
+                    cur_static_idx < STATIC_WIDTH
+                )
+                selected = selected | (active & (cur_static_idx == static_idx))
+                cur_static_idx = tl.load(
+                    static_parent_indices_ptr + cur_static_idx,
+                    mask=active,
+                    other=0,
+                ).to(tl.int64)
+
+        can_pack = selected & (packed_count < MAX_TREE_NODES - 1)
+        packed_local_idx = packed_count + 1
+        token_id = tl.load(
+            static_tokens_ptr
+            + req_idx * static_tokens_stride_b
+            + static_idx * static_tokens_stride_w,
+            mask=can_pack,
+            other=0,
+        )
+        static_position = tl.load(
+            static_position_offsets_ptr + static_idx,
+            mask=can_pack,
+            other=0,
+        ).to(tl.int64)
+        tl.store(
+            selected_static_nodes_ptr
+            + req_idx * selected_static_nodes_stride_b
+            + packed_count * selected_static_nodes_stride_w,
+            static_idx,
+            mask=can_pack,
+        )
+        tl.store(
+            selected_token_ids_ptr
+            + req_idx * selected_token_ids_stride_b
+            + packed_count * selected_token_ids_stride_w,
+            token_id,
+            mask=can_pack,
+        )
+        tl.store(
+            target_mask_ptr
+            + req_idx * target_mask_stride_b
+            + packed_local_idx * target_mask_stride_w,
+            1,
+            mask=can_pack,
+        )
+        tl.store(
+            position_offsets_ptr
+            + req_idx * position_offsets_stride_b
+            + packed_local_idx * position_offsets_stride_w,
+            static_position,
+            mask=can_pack,
+        )
+
+        parent_static_idx = tl.load(
+            static_parent_indices_ptr + static_idx,
+            mask=can_pack,
+            other=0,
+        ).to(tl.int64)
+        parent_local_idx = tl.full((), 0, tl.int64)
+        found_parent = parent_static_idx == 0
+        for packed_pos in range(MAX_TREE_NODES - 1):
+            prior_active = can_pack & (packed_pos < packed_count)
+            prior_static_idx = tl.load(
+                selected_static_nodes_ptr
+                + req_idx * selected_static_nodes_stride_b
+                + packed_pos * selected_static_nodes_stride_w,
+                mask=prior_active,
+                other=-1,
+            ).to(tl.int64)
+            match_parent = prior_active & (prior_static_idx == parent_static_idx)
+            parent_local_idx = tl.where(
+                match_parent,
+                packed_pos + 1,
+                parent_local_idx,
+            )
+            found_parent = found_parent | match_parent
+        tl.store(
+            parent_ptr
+            + req_idx * parent_stride_b
+            + packed_local_idx * parent_stride_w,
+            parent_local_idx,
+            mask=can_pack & found_parent,
+        )
+
+        packed_count = tl.where(can_pack, packed_count + 1, packed_count)
+        max_depth = tl.where(
+            can_pack & (static_position > max_depth),
+            static_position,
+            max_depth,
+        )
+
+    valid_tree = packed_count > 0
+    row_num_nodes = packed_count + 1
+    tl.store(tree_valid_ptr + req_idx, valid_tree)
+    tl.store(num_nodes_ptr + req_idx, row_num_nodes)
+    tl.store(num_spec_steps_ptr + req_idx, max_depth + 1)
+    tl.store(
+        target_mask_ptr + req_idx * target_mask_stride_b,
+        1,
+        mask=valid_tree,
+    )
+
+    for parent_idx in range(MAX_TREE_NODES):
+        first_child = tl.full((), -1, tl.int64)
+        for reverse_child_idx in range(MAX_TREE_NODES - 1):
+            child_idx = MAX_TREE_NODES - 1 - reverse_child_idx
+            child_active = child_idx <= packed_count
+            child_parent = tl.load(
+                parent_ptr + req_idx * parent_stride_b + child_idx * parent_stride_w,
+                mask=child_active,
+                other=-2,
+            ).to(tl.int64)
+            is_child = child_active & (child_parent == parent_idx)
+            tl.store(
+                retrieve_next_sibling_ptr
+                + req_idx * retrieve_next_sibling_stride_b
+                + child_idx * retrieve_next_sibling_stride_w,
+                first_child,
+                mask=is_child,
+            )
+            first_child = tl.where(is_child, child_idx, first_child)
+        tl.store(
+            retrieve_next_token_ptr
+            + req_idx * retrieve_next_token_stride_b
+            + parent_idx * retrieve_next_token_stride_w,
+            first_child,
+            mask=parent_idx < row_num_nodes,
+        )
+
+
+def build_static_topk_compact_metadata_kernel(
+    topk_static_nodes: torch.Tensor,
+    valid_topk: torch.Tensor,
+    static_tokens: torch.Tensor,
+    static_parent_indices: torch.Tensor,
+    static_position_offsets: torch.Tensor,
+    *,
+    max_tree_nodes: int | None = None,
+) -> StaticTopKCompactMetadataOutput:
+    """Triton candidate for fixed-width static top-k compact metadata build."""
+
+    if topk_static_nodes.device.type != "cuda" or not HAS_TRITON:
+        return build_static_topk_compact_metadata(
+            topk_static_nodes,
+            valid_topk,
+            static_tokens,
+            static_parent_indices,
+            static_position_offsets,
+            max_tree_nodes=max_tree_nodes,
+        )
+
+    if max_tree_nodes is None:
+        max_tree_nodes = static_tokens.shape[1]
+    reference_error_check = build_static_topk_compact_metadata
+    if (
+        topk_static_nodes.ndim != 2
+        or valid_topk.shape != topk_static_nodes.shape
+        or static_tokens.ndim != 2
+        or static_tokens.shape[0] != topk_static_nodes.shape[0]
+        or static_parent_indices.ndim != 1
+        or static_position_offsets.ndim != 1
+        or max_tree_nodes <= 0
+        or max_tree_nodes > static_tokens.shape[1]
+    ):
+        return reference_error_check(
+            topk_static_nodes,
+            valid_topk,
+            static_tokens,
+            static_parent_indices,
+            static_position_offsets,
+            max_tree_nodes=max_tree_nodes,
+        )
+
+    topk_static_nodes = topk_static_nodes.contiguous()
+    valid_topk = valid_topk.contiguous()
+    static_tokens = static_tokens.contiguous()
+    static_parent_indices = static_parent_indices.contiguous()
+    static_position_offsets = static_position_offsets.contiguous()
+
+    batch_size, topk_count = topk_static_nodes.shape
+    static_width = static_tokens.shape[1]
+    device = topk_static_nodes.device
+    selected_width = max_tree_nodes - 1
+    selected_static_nodes = torch.empty(
+        (batch_size, selected_width), dtype=torch.int32, device=device
+    )
+    selected_token_ids = torch.empty(
+        (batch_size, selected_width), dtype=static_tokens.dtype, device=device
+    )
+    retrieve_index = torch.empty(
+        (batch_size, max_tree_nodes), dtype=torch.int32, device=device
+    )
+    retrieve_next_token = torch.empty_like(retrieve_index)
+    retrieve_next_sibling = torch.empty_like(retrieve_index)
+    parent = torch.empty_like(retrieve_index)
+    target_mask = torch.empty_like(retrieve_index)
+    position_offsets = torch.empty(
+        (batch_size, max_tree_nodes), dtype=torch.int64, device=device
+    )
+    tree_valid = torch.empty(batch_size, dtype=torch.bool, device=device)
+    num_nodes = torch.empty(batch_size, dtype=torch.int32, device=device)
+    num_spec_steps = torch.empty(batch_size, dtype=torch.int32, device=device)
+
+    _build_static_topk_compact_metadata_triton_kernel[(batch_size,)](
+        topk_static_nodes,
+        valid_topk,
+        static_tokens,
+        static_parent_indices,
+        static_position_offsets,
+        selected_static_nodes,
+        selected_token_ids,
+        retrieve_index,
+        retrieve_next_token,
+        retrieve_next_sibling,
+        parent,
+        target_mask,
+        position_offsets,
+        tree_valid,
+        num_nodes,
+        num_spec_steps,
+        topk_static_nodes.stride(0),
+        topk_static_nodes.stride(1),
+        valid_topk.stride(0),
+        valid_topk.stride(1),
+        static_tokens.stride(0),
+        static_tokens.stride(1),
+        selected_static_nodes.stride(0),
+        selected_static_nodes.stride(1),
+        selected_token_ids.stride(0),
+        selected_token_ids.stride(1),
+        retrieve_index.stride(0),
+        retrieve_index.stride(1),
+        retrieve_next_token.stride(0),
+        retrieve_next_token.stride(1),
+        retrieve_next_sibling.stride(0),
+        retrieve_next_sibling.stride(1),
+        parent.stride(0),
+        parent.stride(1),
+        target_mask.stride(0),
+        target_mask.stride(1),
+        position_offsets.stride(0),
+        position_offsets.stride(1),
+        TOPK_COUNT=topk_count,
+        STATIC_WIDTH=static_width,
+        MAX_TREE_NODES=max_tree_nodes,
+    )
+
+    return StaticTopKCompactMetadataOutput(
+        selected_static_nodes=selected_static_nodes,
+        selected_token_ids=selected_token_ids,
+        retrieve_index=retrieve_index,
+        retrieve_next_token=retrieve_next_token,
+        retrieve_next_sibling=retrieve_next_sibling,
+        parent=parent,
+        target_mask=target_mask,
+        position_offsets=position_offsets,
+        tree_valid=tree_valid,
+        num_nodes=num_nodes,
+        num_spec_steps=num_spec_steps,
+    )
+
+
+@triton.jit
+def _build_selected_bool_compact_metadata_triton_kernel(
+    selected_bool_ptr,
+    static_tokens_ptr,
+    static_parent_indices_ptr,
+    static_position_offsets_ptr,
+    selected_static_nodes_ptr,
+    selected_token_ids_ptr,
+    retrieve_index_ptr,
+    retrieve_next_token_ptr,
+    retrieve_next_sibling_ptr,
+    parent_ptr,
+    target_mask_ptr,
+    position_offsets_ptr,
+    tree_valid_ptr,
+    num_nodes_ptr,
+    num_spec_steps_ptr,
+    selected_bool_stride_b: tl.constexpr,
+    selected_bool_stride_w: tl.constexpr,
+    static_tokens_stride_b: tl.constexpr,
+    static_tokens_stride_w: tl.constexpr,
+    selected_static_nodes_stride_b: tl.constexpr,
+    selected_static_nodes_stride_w: tl.constexpr,
+    selected_token_ids_stride_b: tl.constexpr,
+    selected_token_ids_stride_w: tl.constexpr,
+    retrieve_index_stride_b: tl.constexpr,
+    retrieve_index_stride_w: tl.constexpr,
+    retrieve_next_token_stride_b: tl.constexpr,
+    retrieve_next_token_stride_w: tl.constexpr,
+    retrieve_next_sibling_stride_b: tl.constexpr,
+    retrieve_next_sibling_stride_w: tl.constexpr,
+    parent_stride_b: tl.constexpr,
+    parent_stride_w: tl.constexpr,
+    target_mask_stride_b: tl.constexpr,
+    target_mask_stride_w: tl.constexpr,
+    position_offsets_stride_b: tl.constexpr,
+    position_offsets_stride_w: tl.constexpr,
+    STATIC_WIDTH: tl.constexpr,
+    MAX_TREE_NODES: tl.constexpr,
+):
+    req_idx = tl.program_id(0)
+
+    for local_idx in range(MAX_TREE_NODES):
+        tl.store(
+            retrieve_index_ptr
+            + req_idx * retrieve_index_stride_b
+            + local_idx * retrieve_index_stride_w,
+            local_idx,
+        )
+        tl.store(
+            retrieve_next_token_ptr
+            + req_idx * retrieve_next_token_stride_b
+            + local_idx * retrieve_next_token_stride_w,
+            -1,
+        )
+        tl.store(
+            retrieve_next_sibling_ptr
+            + req_idx * retrieve_next_sibling_stride_b
+            + local_idx * retrieve_next_sibling_stride_w,
+            -1,
+        )
+        tl.store(
+            parent_ptr + req_idx * parent_stride_b + local_idx * parent_stride_w,
+            -1,
+        )
+        tl.store(
+            target_mask_ptr
+            + req_idx * target_mask_stride_b
+            + local_idx * target_mask_stride_w,
+            0,
+        )
+        tl.store(
+            position_offsets_ptr
+            + req_idx * position_offsets_stride_b
+            + local_idx * position_offsets_stride_w,
+            0,
+        )
+
+    for selected_pos in range(MAX_TREE_NODES - 1):
+        tl.store(
+            selected_static_nodes_ptr
+            + req_idx * selected_static_nodes_stride_b
+            + selected_pos * selected_static_nodes_stride_w,
+            0,
+        )
+        tl.store(
+            selected_token_ids_ptr
+            + req_idx * selected_token_ids_stride_b
+            + selected_pos * selected_token_ids_stride_w,
+            0,
+        )
+
+    packed_count = tl.full((), 0, tl.int64)
+    max_depth = tl.full((), 0, tl.int64)
+
+    for static_idx in range(1, STATIC_WIDTH):
+        selected = tl.load(
+            selected_bool_ptr
+            + req_idx * selected_bool_stride_b
+            + static_idx * selected_bool_stride_w
+        )
+        can_pack = selected & (packed_count < MAX_TREE_NODES - 1)
+        packed_local_idx = packed_count + 1
+        token_id = tl.load(
+            static_tokens_ptr
+            + req_idx * static_tokens_stride_b
+            + static_idx * static_tokens_stride_w,
+            mask=can_pack,
+            other=0,
+        )
+        static_position = tl.load(
+            static_position_offsets_ptr + static_idx,
+            mask=can_pack,
+            other=0,
+        ).to(tl.int64)
+        tl.store(
+            selected_static_nodes_ptr
+            + req_idx * selected_static_nodes_stride_b
+            + packed_count * selected_static_nodes_stride_w,
+            static_idx,
+            mask=can_pack,
+        )
+        tl.store(
+            selected_token_ids_ptr
+            + req_idx * selected_token_ids_stride_b
+            + packed_count * selected_token_ids_stride_w,
+            token_id,
+            mask=can_pack,
+        )
+        tl.store(
+            target_mask_ptr
+            + req_idx * target_mask_stride_b
+            + packed_local_idx * target_mask_stride_w,
+            1,
+            mask=can_pack,
+        )
+        tl.store(
+            position_offsets_ptr
+            + req_idx * position_offsets_stride_b
+            + packed_local_idx * position_offsets_stride_w,
+            static_position,
+            mask=can_pack,
+        )
+
+        parent_static_idx = tl.load(
+            static_parent_indices_ptr + static_idx,
+            mask=can_pack,
+            other=0,
+        ).to(tl.int64)
+        parent_local_idx = tl.full((), 0, tl.int64)
+        found_parent = parent_static_idx == 0
+        for packed_pos in range(MAX_TREE_NODES - 1):
+            prior_active = can_pack & (packed_pos < packed_count)
+            prior_static_idx = tl.load(
+                selected_static_nodes_ptr
+                + req_idx * selected_static_nodes_stride_b
+                + packed_pos * selected_static_nodes_stride_w,
+                mask=prior_active,
+                other=-1,
+            ).to(tl.int64)
+            match_parent = prior_active & (prior_static_idx == parent_static_idx)
+            parent_local_idx = tl.where(
+                match_parent,
+                packed_pos + 1,
+                parent_local_idx,
+            )
+            found_parent = found_parent | match_parent
+        tl.store(
+            parent_ptr
+            + req_idx * parent_stride_b
+            + packed_local_idx * parent_stride_w,
+            parent_local_idx,
+            mask=can_pack & found_parent,
+        )
+
+        packed_count = tl.where(can_pack, packed_count + 1, packed_count)
+        max_depth = tl.where(
+            can_pack & (static_position > max_depth),
+            static_position,
+            max_depth,
+        )
+
+    valid_tree = packed_count > 0
+    row_num_nodes = packed_count + 1
+    tl.store(tree_valid_ptr + req_idx, valid_tree)
+    tl.store(num_nodes_ptr + req_idx, row_num_nodes)
+    tl.store(num_spec_steps_ptr + req_idx, max_depth + 1)
+    tl.store(
+        target_mask_ptr + req_idx * target_mask_stride_b,
+        1,
+        mask=valid_tree,
+    )
+
+    for parent_idx in range(MAX_TREE_NODES):
+        first_child = tl.full((), -1, tl.int64)
+        for reverse_child_idx in range(MAX_TREE_NODES - 1):
+            child_idx = MAX_TREE_NODES - 1 - reverse_child_idx
+            child_active = child_idx <= packed_count
+            child_parent = tl.load(
+                parent_ptr + req_idx * parent_stride_b + child_idx * parent_stride_w,
+                mask=child_active,
+                other=-2,
+            ).to(tl.int64)
+            is_child = child_active & (child_parent == parent_idx)
+            tl.store(
+                retrieve_next_sibling_ptr
+                + req_idx * retrieve_next_sibling_stride_b
+                + child_idx * retrieve_next_sibling_stride_w,
+                first_child,
+                mask=is_child,
+            )
+            first_child = tl.where(is_child, child_idx, first_child)
+        tl.store(
+            retrieve_next_token_ptr
+            + req_idx * retrieve_next_token_stride_b
+            + parent_idx * retrieve_next_token_stride_w,
+            first_child,
+            mask=parent_idx < row_num_nodes,
+        )
+
+
+def build_selected_bool_compact_metadata_kernel(
+    selected_bool: torch.Tensor,
+    static_tokens: torch.Tensor,
+    static_parent_indices: torch.Tensor,
+    static_position_offsets: torch.Tensor,
+    *,
+    max_tree_nodes: int | None = None,
+) -> StaticTopKCompactMetadataOutput:
+    """Triton candidate for bool-mask compact metadata build."""
+
+    if selected_bool.device.type != "cuda" or not HAS_TRITON:
+        return build_selected_bool_compact_metadata(
+            selected_bool,
+            static_tokens,
+            static_parent_indices,
+            static_position_offsets,
+            max_tree_nodes=max_tree_nodes,
+        )
+
+    if max_tree_nodes is None:
+        max_tree_nodes = static_tokens.shape[1]
+    reference_error_check = build_selected_bool_compact_metadata
+    if (
+        selected_bool.ndim != 2
+        or static_tokens.ndim != 2
+        or static_tokens.shape != selected_bool.shape
+        or static_parent_indices.ndim != 1
+        or static_position_offsets.ndim != 1
+        or max_tree_nodes <= 0
+        or max_tree_nodes > static_tokens.shape[1]
+    ):
+        return reference_error_check(
+            selected_bool,
+            static_tokens,
+            static_parent_indices,
+            static_position_offsets,
+            max_tree_nodes=max_tree_nodes,
+        )
+
+    selected_bool = selected_bool.contiguous()
+    static_tokens = static_tokens.contiguous()
+    static_parent_indices = static_parent_indices.contiguous()
+    static_position_offsets = static_position_offsets.contiguous()
+
+    batch_size = selected_bool.shape[0]
+    static_width = static_tokens.shape[1]
+    device = selected_bool.device
+    selected_width = max_tree_nodes - 1
+    selected_static_nodes = torch.empty(
+        (batch_size, selected_width), dtype=torch.int32, device=device
+    )
+    selected_token_ids = torch.empty(
+        (batch_size, selected_width), dtype=static_tokens.dtype, device=device
+    )
+    retrieve_index = torch.empty(
+        (batch_size, max_tree_nodes), dtype=torch.int32, device=device
+    )
+    retrieve_next_token = torch.empty_like(retrieve_index)
+    retrieve_next_sibling = torch.empty_like(retrieve_index)
+    parent = torch.empty_like(retrieve_index)
+    target_mask = torch.empty_like(retrieve_index)
+    position_offsets = torch.empty(
+        (batch_size, max_tree_nodes), dtype=torch.int64, device=device
+    )
+    tree_valid = torch.empty(batch_size, dtype=torch.bool, device=device)
+    num_nodes = torch.empty(batch_size, dtype=torch.int32, device=device)
+    num_spec_steps = torch.empty(batch_size, dtype=torch.int32, device=device)
+
+    _build_selected_bool_compact_metadata_triton_kernel[(batch_size,)](
+        selected_bool,
+        static_tokens,
+        static_parent_indices,
+        static_position_offsets,
+        selected_static_nodes,
+        selected_token_ids,
+        retrieve_index,
+        retrieve_next_token,
+        retrieve_next_sibling,
+        parent,
+        target_mask,
+        position_offsets,
+        tree_valid,
+        num_nodes,
+        num_spec_steps,
+        selected_bool.stride(0),
+        selected_bool.stride(1),
+        static_tokens.stride(0),
+        static_tokens.stride(1),
+        selected_static_nodes.stride(0),
+        selected_static_nodes.stride(1),
+        selected_token_ids.stride(0),
+        selected_token_ids.stride(1),
+        retrieve_index.stride(0),
+        retrieve_index.stride(1),
+        retrieve_next_token.stride(0),
+        retrieve_next_token.stride(1),
+        retrieve_next_sibling.stride(0),
+        retrieve_next_sibling.stride(1),
+        parent.stride(0),
+        parent.stride(1),
+        target_mask.stride(0),
+        target_mask.stride(1),
+        position_offsets.stride(0),
+        position_offsets.stride(1),
+        STATIC_WIDTH=static_width,
+        MAX_TREE_NODES=max_tree_nodes,
+    )
+
+    return StaticTopKCompactMetadataOutput(
+        selected_static_nodes=selected_static_nodes,
+        selected_token_ids=selected_token_ids,
+        retrieve_index=retrieve_index,
+        retrieve_next_token=retrieve_next_token,
+        retrieve_next_sibling=retrieve_next_sibling,
+        parent=parent,
+        target_mask=target_mask,
+        position_offsets=position_offsets,
+        tree_valid=tree_valid,
+        num_nodes=num_nodes,
+        num_spec_steps=num_spec_steps,
+    )
+
+
+@triton.jit
+def _verify_dynamic_tree_greedy_triton_kernel(
+    candidates_ptr,
+    retrieve_index_ptr,
+    retrieve_next_token_ptr,
+    retrieve_next_sibling_ptr,
+    target_predict_ptr,
+    tree_valid_ptr,
+    target_mask_ptr,
+    predicts_ptr,
+    accept_index_ptr,
+    accept_token_num_ptr,
+    accept_token_ptr,
+    candidates_stride_b: tl.constexpr,
+    candidates_stride_w: tl.constexpr,
+    retrieve_index_stride_b: tl.constexpr,
+    retrieve_index_stride_w: tl.constexpr,
+    retrieve_next_token_stride_b: tl.constexpr,
+    retrieve_next_token_stride_w: tl.constexpr,
+    retrieve_next_sibling_stride_b: tl.constexpr,
+    retrieve_next_sibling_stride_w: tl.constexpr,
+    target_predict_stride_b: tl.constexpr,
+    target_predict_stride_w: tl.constexpr,
+    tree_valid_stride: tl.constexpr,
+    target_mask_stride_b: tl.constexpr,
+    target_mask_stride_w: tl.constexpr,
+    predicts_stride_b: tl.constexpr,
+    predicts_stride_w: tl.constexpr,
+    accept_index_stride_b: tl.constexpr,
+    accept_index_stride_s: tl.constexpr,
+    accept_token_stride_b: tl.constexpr,
+    accept_token_stride_s: tl.constexpr,
+    NUM_SPEC_STEPS: tl.constexpr,
+    MAX_TREE_NODES: tl.constexpr,
+    HAS_TARGET_MASK: tl.constexpr,
+    LINEAR_KV_SAFE: tl.constexpr,
+):
+    req_idx = tl.program_id(0)
+
+    valid = tl.load(tree_valid_ptr + req_idx * tree_valid_stride)
+    last_accepted = tl.load(
+        retrieve_index_ptr
+        + req_idx * retrieve_index_stride_b
+        + 0 * retrieve_index_stride_w
+    ).to(tl.int64)
+    last_accepted = tl.where(valid, last_accepted, 0)
+
+    root_token = tl.load(
+        target_predict_ptr
+        + req_idx * target_predict_stride_b
+        + last_accepted * target_predict_stride_w
+    )
+    tl.store(
+        accept_index_ptr
+        + req_idx * accept_index_stride_b
+        + 0 * accept_index_stride_s,
+        last_accepted,
+    )
+    tl.store(
+        accept_token_ptr
+        + req_idx * accept_token_stride_b
+        + 0 * accept_token_stride_s,
+        root_token,
+    )
+    invalid_root_token = tl.load(target_predict_ptr + req_idx * target_predict_stride_b)
+    tl.store(
+        predicts_ptr + req_idx * predicts_stride_b,
+        invalid_root_token,
+        mask=~valid,
+    )
+
+    active = valid
+    cur_index = tl.full((), 0, tl.int64)
+    num_accepted = tl.full((), 0, tl.int64)
+
+    for output_idx in range(1, NUM_SPEC_STEPS):
+        safe_cur_index = tl.maximum(cur_index, 0)
+        next_child = tl.load(
+            retrieve_next_token_ptr
+            + req_idx * retrieve_next_token_stride_b
+            + safe_cur_index * retrieve_next_token_stride_w
+        ).to(tl.int64)
+        cur_index = tl.where(active, next_child, cur_index)
+
+        found = tl.full((), False, tl.int1)
+        accepted_local_idx = tl.full((), 0, tl.int64)
+        next_cur_index = cur_index
+
+        for _ in range(MAX_TREE_NODES):
+            sibling_active = active & (~found) & (next_cur_index >= 0)
+            safe_sibling_idx = tl.maximum(next_cur_index, 0)
+            draft_local_idx = tl.load(
+                retrieve_index_ptr
+                + req_idx * retrieve_index_stride_b
+                + safe_sibling_idx * retrieve_index_stride_w,
+                mask=sibling_active,
+                other=0,
+            ).to(tl.int64)
+            draft_token_id = tl.load(
+                candidates_ptr
+                + req_idx * candidates_stride_b
+                + safe_sibling_idx * candidates_stride_w,
+                mask=sibling_active,
+                other=-1,
+            )
+            target_token_id = tl.load(
+                target_predict_ptr
+                + req_idx * target_predict_stride_b
+                + last_accepted * target_predict_stride_w
+            )
+            if HAS_TARGET_MASK:
+                allowed_by_mask = tl.load(
+                    target_mask_ptr
+                    + req_idx * target_mask_stride_b
+                    + safe_sibling_idx * target_mask_stride_w,
+                    mask=sibling_active,
+                    other=0,
+                ) != 0
+            else:
+                allowed_by_mask = tl.full((), True, tl.int1)
+            if LINEAR_KV_SAFE:
+                next_linear_local_idx = num_accepted + 1
+                kv_slot_is_linear_prefix = (
+                    (draft_local_idx == next_linear_local_idx)
+                    & (safe_sibling_idx == next_linear_local_idx)
+                )
+            else:
+                kv_slot_is_linear_prefix = tl.full((), True, tl.int1)
+
+            match = (
+                sibling_active
+                & (draft_token_id == target_token_id)
+                & allowed_by_mask
+                & kv_slot_is_linear_prefix
+            )
+            accepted_local_idx = tl.where(
+                match,
+                draft_local_idx,
+                accepted_local_idx,
+            )
+            next_sibling = tl.load(
+                retrieve_next_sibling_ptr
+                + req_idx * retrieve_next_sibling_stride_b
+                + safe_sibling_idx * retrieve_next_sibling_stride_w,
+                mask=sibling_active,
+                other=next_cur_index,
+            ).to(tl.int64)
+            next_cur_index = tl.where(
+                match,
+                safe_sibling_idx,
+                tl.where(sibling_active, next_sibling, next_cur_index),
+            )
+            found = found | match
+
+        matched = active & found
+        prev_target_token_id = tl.load(
+            target_predict_ptr
+            + req_idx * target_predict_stride_b
+            + last_accepted * target_predict_stride_w
+        )
+        tl.store(
+            predicts_ptr
+            + req_idx * predicts_stride_b
+            + last_accepted * predicts_stride_w,
+            prev_target_token_id,
+            mask=matched,
+        )
+        num_accepted = tl.where(matched, num_accepted + 1, num_accepted)
+        accepted_token = tl.load(
+            target_predict_ptr
+            + req_idx * target_predict_stride_b
+            + accepted_local_idx * target_predict_stride_w,
+            mask=matched,
+            other=0,
+        )
+        tl.store(
+            accept_index_ptr
+            + req_idx * accept_index_stride_b
+            + output_idx * accept_index_stride_s,
+            accepted_local_idx,
+            mask=matched,
+        )
+        tl.store(
+            accept_token_ptr
+            + req_idx * accept_token_stride_b
+            + output_idx * accept_token_stride_s,
+            accepted_token,
+            mask=matched,
+        )
+        last_accepted = tl.where(matched, accepted_local_idx, last_accepted)
+        active = matched
+        cur_index = next_cur_index
+
+    final_token = tl.load(
+        target_predict_ptr
+        + req_idx * target_predict_stride_b
+        + last_accepted * target_predict_stride_w
+    )
+    tl.store(
+        predicts_ptr
+        + req_idx * predicts_stride_b
+        + last_accepted * predicts_stride_w,
+        final_token,
+        mask=valid,
+    )
+    tl.store(accept_token_num_ptr + req_idx, num_accepted)
+
+
+def verify_dynamic_tree_greedy_kernel(
+    candidates: torch.Tensor,
+    retrieve_index: torch.Tensor,
+    retrieve_next_token: torch.Tensor,
+    retrieve_next_sibling: torch.Tensor,
+    target_predict: torch.Tensor,
+    *,
+    num_spec_steps: int,
+    tree_valid: torch.Tensor | None = None,
+    linear_kv_safe: bool = False,
+    target_mask: torch.Tensor | None = None,
+) -> DynamicTreeVerifyOutput:
+    """Triton implementation of :func:`verify_dynamic_tree_greedy`.
+
+    The kernel keeps one program per request and performs the child/sibling
+    traversal without the CPU synchronization points in the torch reference.
+    CPU or non-Triton environments intentionally fall back to the reference.
+    """
+
+    if candidates.device.type != "cuda" or not HAS_TRITON:
+        return verify_dynamic_tree_greedy(
+            candidates,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            target_predict,
+            num_spec_steps=num_spec_steps,
+            tree_valid=tree_valid,
+            linear_kv_safe=linear_kv_safe,
+            target_mask=target_mask,
+        )
+
+    if candidates.ndim != 2:
+        raise ValueError(f"candidates must be 2D, got {candidates.shape}")
+    if target_predict.shape != candidates.shape:
+        raise ValueError(
+            "target_predict must have the same shape as candidates, got "
+            f"{target_predict.shape} and {candidates.shape}"
+        )
+    for name, tensor in (
+        ("retrieve_index", retrieve_index),
+        ("retrieve_next_token", retrieve_next_token),
+        ("retrieve_next_sibling", retrieve_next_sibling),
+    ):
+        if tensor.shape != candidates.shape:
+            raise ValueError(
+                f"{name} must have the same shape as candidates, got "
+                f"{tensor.shape} and {candidates.shape}"
+            )
+    if num_spec_steps <= 0:
+        raise ValueError(f"num_spec_steps must be positive, got {num_spec_steps}")
+
+    batch_size, num_draft_tokens = candidates.shape
+    device = candidates.device
+    if tree_valid is None:
+        tree_valid = torch.ones(batch_size, dtype=torch.bool, device=device)
+    elif tree_valid.shape != (batch_size,):
+        raise ValueError(
+            f"tree_valid must have shape ({batch_size},), got {tree_valid.shape}"
+        )
+    if target_mask is not None and target_mask.shape != (batch_size, num_draft_tokens):
+        raise ValueError(
+            f"target_mask must have shape ({batch_size}, {num_draft_tokens}), "
+            f"got {target_mask.shape}"
+        )
+
+    predicts = torch.zeros_like(target_predict)
+    accept_index = torch.zeros(
+        (batch_size, num_spec_steps), dtype=torch.int64, device=device
+    )
+    accept_token_num = torch.zeros(batch_size, dtype=torch.int64, device=device)
+    accept_token = torch.zeros(
+        (batch_size, num_spec_steps), dtype=torch.int64, device=device
+    )
+    target_mask_arg = target_mask if target_mask is not None else candidates
+
+    _verify_dynamic_tree_greedy_triton_kernel[(batch_size,)](
+        candidates,
+        retrieve_index,
+        retrieve_next_token,
+        retrieve_next_sibling,
+        target_predict,
+        tree_valid,
+        target_mask_arg,
+        predicts,
+        accept_index,
+        accept_token_num,
+        accept_token,
+        candidates.stride(0),
+        candidates.stride(1),
+        retrieve_index.stride(0),
+        retrieve_index.stride(1),
+        retrieve_next_token.stride(0),
+        retrieve_next_token.stride(1),
+        retrieve_next_sibling.stride(0),
+        retrieve_next_sibling.stride(1),
+        target_predict.stride(0),
+        target_predict.stride(1),
+        tree_valid.stride(0),
+        target_mask_arg.stride(0),
+        target_mask_arg.stride(1),
+        predicts.stride(0),
+        predicts.stride(1),
+        accept_index.stride(0),
+        accept_index.stride(1),
+        accept_token.stride(0),
+        accept_token.stride(1),
+        NUM_SPEC_STEPS=num_spec_steps,
+        MAX_TREE_NODES=num_draft_tokens,
+        HAS_TARGET_MASK=target_mask is not None,
+        LINEAR_KV_SAFE=linear_kv_safe,
+    )
+
+    return DynamicTreeVerifyOutput(
+        predicts=predicts,
+        accept_index=accept_index,
+        accept_token_num=accept_token_num,
+        accept_token=accept_token,
+    )
 
 
 class DynamicDraftTreeManager:
@@ -485,61 +1889,136 @@ def verify_dynamic_tree_greedy(
         (batch_size, num_spec_steps), dtype=torch.int64, device=device
     )
 
-    for batch_idx in range(batch_size):
-        if not bool(tree_valid[batch_idx].item()):
-            accept_index[batch_idx, 0] = 0
-            accept_token[batch_idx, 0] = target_predict[batch_idx, 0]
-            predicts[batch_idx, 0] = target_predict[batch_idx, 0]
-            continue
+    batch_arange = torch.arange(batch_size, dtype=torch.int64, device=device)
+    last_accepted_local_idx = retrieve_index[:, 0].to(torch.int64)
+    active = tree_valid.to(torch.bool)
+    accept_index[:, 0] = torch.where(
+        active,
+        last_accepted_local_idx,
+        torch.zeros_like(last_accepted_local_idx),
+    )
+    accept_token[:, 0] = target_predict[
+        batch_arange,
+        accept_index[:, 0],
+    ]
+    predicts[~active, 0] = target_predict[~active, 0]
+    cur_index = torch.zeros(batch_size, dtype=torch.int64, device=device)
+    num_accepted_tokens = torch.zeros(batch_size, dtype=torch.int64, device=device)
 
-        last_accepted_local_idx = int(retrieve_index[batch_idx, 0].item())
-        accept_index[batch_idx, 0] = last_accepted_local_idx
-        accept_token[batch_idx, 0] = target_predict[batch_idx, last_accepted_local_idx]
-        cur_index = 0
-        num_accepted_tokens = 0
+    if target_mask is None:
+        target_mask = torch.ones(
+            (batch_size, num_draft_tokens), dtype=torch.bool, device=device
+        )
+    else:
+        target_mask = target_mask.to(torch.bool)
 
-        for _ in range(1, num_spec_steps):
-            cur_index = int(retrieve_next_token[batch_idx, cur_index].item())
+    max_sibling_steps = num_draft_tokens
+    for output_idx in range(1, num_spec_steps):
+        cur_index = torch.where(
+            active,
+            retrieve_next_token[
+                batch_arange,
+                cur_index.clamp_min(0),
+            ].to(torch.int64),
+            cur_index,
+        )
+        found = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        accepted_draft_local_idx = torch.zeros(
+            batch_size, dtype=torch.int64, device=device
+        )
+        next_cur_index = cur_index
 
-            while cur_index != -1:
-                draft_local_idx = int(retrieve_index[batch_idx, cur_index].item())
-                draft_token_id = candidates[batch_idx, cur_index]
-                target_token_id = target_predict[batch_idx, last_accepted_local_idx]
+        for _ in range(max_sibling_steps):
+            sibling_active = active & ~found & (next_cur_index >= 0)
+            if not bool(sibling_active.any().item()):
+                break
+            safe_cur_index = next_cur_index.clamp_min(0)
+            draft_local_idx = retrieve_index[
+                batch_arange,
+                safe_cur_index,
+            ].to(torch.int64)
+            draft_token_id = candidates[batch_arange, safe_cur_index]
+            target_token_id = target_predict[
+                batch_arange,
+                last_accepted_local_idx,
+            ]
+            allowed_by_mask = target_mask[batch_arange, safe_cur_index]
+            if linear_kv_safe:
                 next_linear_local_idx = num_accepted_tokens + 1
                 kv_slot_is_linear_prefix = (
-                    draft_local_idx == next_linear_local_idx
-                    and cur_index == next_linear_local_idx
+                    (draft_local_idx == next_linear_local_idx)
+                    & (safe_cur_index == next_linear_local_idx)
                 )
-                allowed_by_mask = True
-                if target_mask is not None:
-                    allowed_by_mask = bool(target_mask[batch_idx, cur_index].item())
+            else:
+                kv_slot_is_linear_prefix = torch.ones_like(allowed_by_mask)
 
-                if (
-                    bool((draft_token_id == target_token_id).item())
-                    and allowed_by_mask
-                    and (
-                    not linear_kv_safe or kv_slot_is_linear_prefix
-                    )
-                ):
-                    predicts[batch_idx, last_accepted_local_idx] = target_token_id
-                    num_accepted_tokens += 1
-                    accept_index[batch_idx, num_accepted_tokens] = draft_local_idx
-                    if num_accepted_tokens < num_spec_steps:
-                        accept_token[batch_idx, num_accepted_tokens] = target_predict[
-                            batch_idx, draft_local_idx
-                        ]
-                    last_accepted_local_idx = draft_local_idx
-                    break
+            match = (
+                sibling_active
+                & (draft_token_id == target_token_id)
+                & allowed_by_mask
+                & kv_slot_is_linear_prefix
+            )
+            accepted_draft_local_idx = torch.where(
+                match,
+                draft_local_idx,
+                accepted_draft_local_idx,
+            )
+            next_sibling = retrieve_next_sibling[
+                batch_arange,
+                safe_cur_index,
+            ].to(torch.int64)
+            next_cur_index = torch.where(
+                match,
+                safe_cur_index,
+                torch.where(sibling_active, next_sibling, next_cur_index),
+            )
+            found |= match
 
-                cur_index = int(retrieve_next_sibling[batch_idx, cur_index].item())
-
-            if cur_index == -1:
-                break
-
-        accept_token_num[batch_idx] = num_accepted_tokens
-        predicts[batch_idx, last_accepted_local_idx] = target_predict[
-            batch_idx, last_accepted_local_idx
+        target_token_id = target_predict[
+            batch_arange,
+            last_accepted_local_idx,
         ]
+        predicts[
+            batch_arange[found],
+            last_accepted_local_idx[found],
+        ] = target_token_id[found]
+        matched = active & found
+        num_accepted_tokens = torch.where(
+            matched,
+            num_accepted_tokens + 1,
+            num_accepted_tokens,
+        )
+        accept_index[:, output_idx] = torch.where(
+            matched,
+            accepted_draft_local_idx,
+            accept_index[:, output_idx],
+        )
+        accept_token[:, output_idx] = torch.where(
+            matched,
+            target_predict[
+                batch_arange,
+                accepted_draft_local_idx,
+            ],
+            accept_token[:, output_idx],
+        )
+        last_accepted_local_idx = torch.where(
+            matched,
+            accepted_draft_local_idx,
+            last_accepted_local_idx,
+        )
+        active = matched
+        cur_index = next_cur_index
+        if not bool(active.any().item()):
+            break
+
+    accept_token_num = num_accepted_tokens
+    predicts[
+        batch_arange[tree_valid],
+        last_accepted_local_idx[tree_valid],
+    ] = target_predict[
+        batch_arange[tree_valid],
+        last_accepted_local_idx[tree_valid],
+    ]
 
     return DynamicTreeVerifyOutput(
         predicts=predicts,

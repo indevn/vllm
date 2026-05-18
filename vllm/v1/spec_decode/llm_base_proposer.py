@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import ast
+import os
+import time
 from importlib.util import find_spec
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
 
 import numpy as np
 import torch
@@ -39,7 +41,16 @@ from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import KVCacheConfig, UniformTypeKVCacheSpecs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import _SAMPLING_EPS
-from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.spec_decode.dynamic_tree import (
+    build_selected_bool_compact_metadata_kernel,
+    build_static_topk_compact_metadata_kernel,
+)
+from vllm.v1.spec_decode.metadata import (
+    DynamicTreeCompactArrayView,
+    DynamicTreeCompactMetadata,
+    DynamicTreeDeviceMetadataHandle,
+    SpecDecodeMetadata,
+)
 from vllm.v1.spec_decode.utils import (
     PADDING_SLOT_ID,
     compute_new_slot_mapping,
@@ -56,6 +67,18 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
+
+
+class _DynamicTreeMetadataTemplate(NamedTuple):
+    retrieve_index: list[int]
+    retrieve_next_token: list[int]
+    retrieve_next_sibling: list[int]
+    parent: list[int]
+    target_mask: list[int]
+    position_offsets: list[int]
+    selected_static_nodes: list[int]
+    num_spec_steps: int
+    array_view: DynamicTreeCompactArrayView
 
 
 class SpecDecodeBaseProposer:
@@ -304,6 +327,106 @@ class SpecDecodeBaseProposer:
         self.tree_retrieve_metadata = build_static_tree_retrieve_metadata(
             self.tree_choices
         )
+        self._tree_static_position_offsets = [0] + [
+            len(choice) for choice in self.tree_choices
+        ]
+        tree_choice_to_index = {
+            tuple(choice): index + 1
+            for index, choice in enumerate(self.tree_choices)
+        }
+        self._tree_static_parent_indices = [0] + [
+            tree_choice_to_index.get(tuple(choice[:-1]), 0)
+            for choice in self.tree_choices
+        ]
+        self._tree_static_parent_indices_tensor = torch.tensor(
+            self._tree_static_parent_indices,
+            dtype=torch.int64,
+            device=device,
+        )
+        self._tree_static_position_offsets_tensor = torch.tensor(
+            self._tree_static_position_offsets,
+            dtype=torch.int64,
+            device=device,
+        )
+        static_tree_width = len(self.tree_choices) + 1
+        self._dynamic_tree_static_tokens_buffer = torch.empty(
+            (self.max_batch_size, static_tree_width),
+            dtype=torch.int64,
+            device=device,
+        )
+        self._dynamic_tree_static_scores_buffer = torch.empty(
+            (self.max_batch_size, static_tree_width),
+            dtype=torch.float32,
+            device=device,
+        )
+        self._dynamic_tree_selected_bool_buffer = torch.empty(
+            (self.max_batch_size, static_tree_width),
+            dtype=torch.bool,
+            device=device,
+        )
+        self._dynamic_tree_compact_candidate_nodes_buffer = torch.empty(
+            (self.max_batch_size, static_tree_width),
+            dtype=torch.int64,
+            device=device,
+        )
+        self._dynamic_tree_compact_candidate_valid_buffer = torch.empty(
+            (self.max_batch_size, static_tree_width),
+            dtype=torch.bool,
+            device=device,
+        )
+        self._dynamic_tree_compact_candidate_pack_buffer = torch.empty(
+            (self.max_batch_size, static_tree_width, 3),
+            dtype=torch.int64,
+            device=device,
+        )
+        self._dynamic_tree_static_node_ids_tensor = torch.arange(
+            1,
+            len(self.tree_choices) + 1,
+            dtype=torch.int64,
+            device=device,
+        )
+        self._dynamic_tree_prefix_gather_indices_buffer = torch.empty(
+            len(self.tree_choices),
+            dtype=torch.long,
+            device=device,
+        )
+        pin_memory = is_pin_memory_available()
+        self._dynamic_tree_static_topk_selected_nodes_cpu = torch.empty(
+            (self.max_batch_size, static_tree_width - 1),
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=pin_memory,
+        )
+        self._dynamic_tree_static_topk_selected_tokens_cpu = torch.empty(
+            (self.max_batch_size, static_tree_width - 1),
+            dtype=torch.int64,
+            device="cpu",
+            pin_memory=pin_memory,
+        )
+        self._dynamic_tree_static_topk_num_nodes_cpu = torch.empty(
+            self.max_batch_size,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=pin_memory,
+        )
+        self._dynamic_tree_static_topk_num_spec_steps_cpu = torch.empty(
+            self.max_batch_size,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=pin_memory,
+        )
+        self._dynamic_tree_static_topk_selected_nodes_np = (
+            self._dynamic_tree_static_topk_selected_nodes_cpu.numpy()
+        )
+        self._dynamic_tree_static_topk_selected_tokens_np = (
+            self._dynamic_tree_static_topk_selected_tokens_cpu.numpy()
+        )
+        self._dynamic_tree_static_topk_num_nodes_np = (
+            self._dynamic_tree_static_topk_num_nodes_cpu.numpy()
+        )
+        self._dynamic_tree_static_topk_num_spec_steps_np = (
+            self._dynamic_tree_static_topk_num_spec_steps_cpu.numpy()
+        )
         self._dynamic_tree_max_draft_tokens = (
             self.speculative_config.dynamic_draft_tree_max_draft_tokens
         )
@@ -314,9 +437,27 @@ class SpecDecodeBaseProposer:
             self.speculative_config.dynamic_draft_tree_runtime_mode
         )
         self._dynamic_tree_last_metadata: (
-            list[dict[str, list[int] | list[list[int]] | int | bool] | None] | None
+            list[DynamicTreeCompactMetadata | None]
+            | DynamicTreeDeviceMetadataHandle
+            | None
         ) = None
         self._dynamic_tree_last_draft_token_ids: list[list[int]] | None = None
+        self._dynamic_tree_metadata_handle_seq = 0
+        self._dynamic_tree_metadata_template_cache: dict[
+            tuple[int, ...],
+            _DynamicTreeMetadataTemplate,
+        ] = {}
+        self._tree_draft_stage_profile_enabled = (
+            os.environ.get("VLLM_TREE_ATTN_DRAFT_STAGE_PROFILE") == "1"
+        )
+        self._tree_draft_stage_profile_sync = (
+            os.environ.get("VLLM_TREE_ATTN_DRAFT_STAGE_PROFILE_SYNC") == "1"
+        )
+        self._tree_draft_last_stage_ms: dict[str, float] | None = None
+        self._dynamic_tree_metadata_stage_profile_enabled = (
+            os.environ.get("VLLM_DYNAMIC_TREE_METADATA_STAGE_PROFILE") == "1"
+        )
+        self._dynamic_tree_metadata_last_stage_ms: dict[str, float] | None = None
 
     def _raise_if_padded_drafter_batch_disabled(self):
         if self.speculative_config.disable_padded_drafter_batch:
@@ -324,6 +465,47 @@ class SpecDecodeBaseProposer:
                 "Speculative Decoding with draft models or parallel drafting only "
                 "supports padded drafter batch. Please unset "
                 "disable_padded_drafter_batch in the speculative_config."
+            )
+
+    def _tree_draft_profile_now(self) -> float:
+        device = torch.device(self.device)
+        if self._tree_draft_stage_profile_sync and device.type == "cuda":
+            torch.cuda.synchronize(device)
+        return time.perf_counter()
+
+    def _tree_draft_profile_elapsed_ms(self, start: float) -> float:
+        return (self._tree_draft_profile_now() - start) * 1000.0
+
+    def _tree_draft_profile_start(self) -> float:
+        if not self._tree_draft_stage_profile_enabled:
+            return 0.0
+        return self._tree_draft_profile_now()
+
+    def _tree_draft_profile_record(
+        self,
+        stage_ms: dict[str, float],
+        name: str,
+        start: float,
+    ) -> None:
+        if self._tree_draft_stage_profile_enabled:
+            stage_ms[name] = stage_ms.get(name, 0.0) + (
+                self._tree_draft_profile_elapsed_ms(start)
+            )
+
+    def _dynamic_tree_metadata_profile_start(self) -> float:
+        if not self._dynamic_tree_metadata_stage_profile_enabled:
+            return 0.0
+        return self._tree_draft_profile_now()
+
+    def _dynamic_tree_metadata_profile_record(
+        self,
+        stage_ms: dict[str, float],
+        name: str,
+        start: float,
+    ) -> None:
+        if self._dynamic_tree_metadata_stage_profile_enabled:
+            stage_ms[name] = stage_ms.get(name, 0.0) + (
+                self._tree_draft_profile_elapsed_ms(start)
             )
 
     def _raise_if_multimodal(self):
@@ -446,8 +628,13 @@ class SpecDecodeBaseProposer:
         | list[dict[str, torch.Tensor]]
         | None = None,
     ) -> torch.Tensor:
+        self._tree_draft_last_stage_ms = None
+        draft_stage_ms: dict[str, float] | None = (
+            {} if self._tree_draft_stage_profile_enabled else None
+        )
         batch_size = common_attn_metadata.batch_size()
 
+        stage_start = self._tree_draft_profile_start()
         if self.method in ("eagle3", "dflash"):
             assert isinstance(
                 self.model,
@@ -461,7 +648,14 @@ class SpecDecodeBaseProposer:
                 target_hidden_states
             )
             assert target_hidden_states.shape[-1] == self.hidden_size
+        if draft_stage_ms is not None:
+            self._tree_draft_profile_record(
+                draft_stage_ms,
+                "combine_hidden_states_ms",
+                stage_start,
+            )
 
+        stage_start = self._tree_draft_profile_start()
         num_tokens, token_indices_to_sample, common_attn_metadata = (
             self.set_inputs_first_pass(
                 target_token_ids=target_token_ids,
@@ -485,7 +679,14 @@ class SpecDecodeBaseProposer:
         model_kwargs, slot_mapping_size = self.build_model_inputs_first_pass(
             num_tokens, num_input_tokens, mm_embed_inputs
         )
+        if draft_stage_ms is not None:
+            self._tree_draft_profile_record(
+                draft_stage_ms,
+                "first_pass_prepare_ms",
+                stage_start,
+            )
 
+        stage_start = self._tree_draft_profile_start()
         with set_forward_context(
             per_layer_attn_metadata,
             self.vllm_config,
@@ -502,12 +703,26 @@ class SpecDecodeBaseProposer:
                 hidden_states = last_hidden_states
             else:
                 last_hidden_states, hidden_states = ret_hidden_states
+        if draft_stage_ms is not None:
+            self._tree_draft_profile_record(
+                draft_stage_ms,
+                "first_pass_forward_ms",
+                stage_start,
+            )
 
         sample_hidden_states = last_hidden_states[token_indices_to_sample]
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
+            stage_start = self._tree_draft_profile_start()
             draft_token_ids = self._greedy_sample(sample_hidden_states)
+            if draft_stage_ms is not None:
+                self._tree_draft_profile_record(
+                    draft_stage_ms,
+                    "greedy_sample_ms",
+                    stage_start,
+                )
+                self._tree_draft_last_stage_ms = draft_stage_ms
             return draft_token_ids.view(-1, self.num_speculative_tokens)
 
         if self.uses_mrope:
@@ -518,7 +733,14 @@ class SpecDecodeBaseProposer:
 
         if any(isinstance(md, TreeAttentionMetadata) for md in per_group_attn_metadata):
             # Draft using tree attention - requires full logits for top-k
+            stage_start = self._tree_draft_profile_start()
             logits = self.model.compute_logits(sample_hidden_states)
+            if draft_stage_ms is not None:
+                self._tree_draft_profile_record(
+                    draft_stage_ms,
+                    "root_logits_ms",
+                    stage_start,
+                )
             draft_token_ids_list = self.propose_tree(
                 batch_size=batch_size,
                 logits=logits,
@@ -526,11 +748,21 @@ class SpecDecodeBaseProposer:
                 hidden_states=hidden_states,
                 common_attn_metadata=common_attn_metadata,
                 slot_mappings=slot_mappings,
+                draft_stage_ms=draft_stage_ms,
             )
             # [batch_size, num_tree_tokens]
+            if draft_stage_ms is not None:
+                self._tree_draft_last_stage_ms = draft_stage_ms
             return torch.cat(draft_token_ids_list, dim=1)
 
+        stage_start = self._tree_draft_profile_start()
         draft_token_ids = self._greedy_sample(sample_hidden_states)
+        if draft_stage_ms is not None:
+            self._tree_draft_profile_record(
+                draft_stage_ms,
+                "greedy_sample_ms",
+                stage_start,
+            )
 
         if self.allowed_attn_types is not None:
             for group_md in per_group_attn_metadata:
@@ -569,6 +801,7 @@ class SpecDecodeBaseProposer:
         block_size = self.block_size
         assert block_size > 0, "block_size has not been initialized."
         for token_index in range(self.num_speculative_tokens - 1):
+            stage_start = self._tree_draft_profile_start()
             # Update the inputs.
             # cast to int32 is crucial when eagle model is compiled.
             # tensor.argmax() returns int64 by default.
@@ -647,7 +880,14 @@ class SpecDecodeBaseProposer:
             }
             if self.pass_hidden_states_to_model:
                 model_kwargs["hidden_states"] = self.hidden_states[:input_batch_size]
+            if draft_stage_ms is not None:
+                self._tree_draft_profile_record(
+                    draft_stage_ms,
+                    "linear_step_prepare_ms",
+                    stage_start,
+                )
 
+            stage_start = self._tree_draft_profile_start()
             with set_forward_context(
                 per_layer_attn_metadata,
                 self.vllm_config,
@@ -662,13 +902,28 @@ class SpecDecodeBaseProposer:
                     hidden_states = ret_hidden_states
                 else:
                     last_hidden_states, hidden_states = ret_hidden_states
+            if draft_stage_ms is not None:
+                self._tree_draft_profile_record(
+                    draft_stage_ms,
+                    "linear_step_forward_ms",
+                    stage_start,
+                )
 
+            stage_start = self._tree_draft_profile_start()
             hidden_states = hidden_states[:batch_size]
             draft_token_ids = self._greedy_sample(last_hidden_states[:batch_size])
             draft_token_ids_list.append(draft_token_ids)
+            if draft_stage_ms is not None:
+                self._tree_draft_profile_record(
+                    draft_stage_ms,
+                    "linear_step_sample_ms",
+                    stage_start,
+                )
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
+        if draft_stage_ms is not None:
+            self._tree_draft_last_stage_ms = draft_stage_ms
         return draft_token_ids
 
     def set_inputs_first_pass(
@@ -1013,12 +1268,14 @@ class SpecDecodeBaseProposer:
         slot_mappings: dict[str, torch.Tensor]
         | list[dict[str, torch.Tensor]]
         | None = None,
+        draft_stage_ms: dict[str, float] | None = None,
     ) -> list[torch.Tensor]:
         tree_attn_metadata_builder = self.draft_attn_groups[0].get_metadata_builder()
         assert isinstance(tree_attn_metadata_builder, TreeAttentionMetadataBuilder)
         dynamic_tree_enabled = self.speculative_config.enable_dynamic_draft_tree
         root_candidates_per_req: torch.Tensor | None = None
         root_scores_per_req: torch.Tensor | None = None
+        level_cumulative_scores: torch.Tensor | None = None
         selected_child_offsets_by_level: list[torch.Tensor] = []
         all_tokens_by_level: list[torch.Tensor] = []
         all_scores_by_level: list[torch.Tensor] = []
@@ -1027,30 +1284,46 @@ class SpecDecodeBaseProposer:
         level_num_drafts = total_num_drafts
         # Sample a draft token for each child at the tree root level.
         num_children = self.child_drafts_per_level[0]
+        stage_start = self._tree_draft_profile_start()
         if num_children == 1:
-            draft_token_ids = logits.argmax(dim=-1).view(batch_size, -1)
             if dynamic_tree_enabled:
+                logits_float = logits.to(torch.float32)
+                root_logits, draft_token_ids = torch.max(logits_float, dim=-1)
+                draft_token_ids = draft_token_ids.view(batch_size, -1)
                 root_candidates_per_req = draft_token_ids
-                root_scores_per_req = torch.softmax(
-                    logits.to(torch.float32), dim=-1
-                ).gather(dim=-1, index=draft_token_ids.to(torch.long))
+                root_scores_per_req = torch.exp(
+                    root_logits - torch.logsumexp(logits_float, dim=-1)
+                ).view(batch_size, -1)
+            else:
+                draft_token_ids = logits.argmax(dim=-1).view(batch_size, -1)
         else:
             if dynamic_tree_enabled:
-                root_scores_per_req, root_candidates_per_req = torch.topk(
-                    torch.softmax(logits.to(torch.float32), dim=-1),
-                    num_children,
-                    dim=-1,
+                logits_float = logits.to(torch.float32)
+                root_logits, root_candidates_per_req = torch.topk(
+                    logits_float, num_children, dim=-1
+                )
+                root_scores_per_req = torch.exp(
+                    root_logits - torch.logsumexp(
+                        logits_float, dim=-1, keepdim=True
+                    )
                 )
                 draft_token_ids = root_candidates_per_req.view(batch_size, -1)
             else:
                 draft_token_ids = torch.topk(logits, num_children, dim=-1).indices.view(
                     batch_size, -1
                 )
+        if draft_stage_ms is not None:
+            self._tree_draft_profile_record(
+                draft_stage_ms,
+                "tree_root_select_ms",
+                stage_start,
+            )
         if dynamic_tree_enabled:
             assert root_candidates_per_req is not None
             assert root_scores_per_req is not None
+            level_cumulative_scores = root_scores_per_req
             all_tokens_by_level.append(root_candidates_per_req.to(torch.int64))
-            all_scores_by_level.append(root_scores_per_req.to(torch.float32))
+            all_scores_by_level.append(level_cumulative_scores.to(torch.float32))
             selected_child_offsets_by_level.append(
                 torch.arange(
                     num_children, dtype=torch.int64, device=self.device
@@ -1075,6 +1348,7 @@ class SpecDecodeBaseProposer:
         )
         tree_depth = len(self.cu_drafts_per_level)
         for level in range(tree_depth - 1):
+            stage_start = self._tree_draft_profile_start()
             # Get draft positions for RoPE.
             draft_positions = positions + (level + 1)
             exceeds_max_model_len = (positions + total_num_drafts) >= self.max_model_len
@@ -1151,7 +1425,14 @@ class SpecDecodeBaseProposer:
             self.input_ids[:num_tokens] = input_ids
             self.positions[:num_tokens] = tree_positions.view(-1)
             self.hidden_states[:num_tokens] = tree_hidden_states.view(num_tokens, -1)
+            if draft_stage_ms is not None:
+                self._tree_draft_profile_record(
+                    draft_stage_ms,
+                    "tree_level_prepare_ms",
+                    stage_start,
+                )
 
+            stage_start = self._tree_draft_profile_start()
             cudagraph_runtime_mode, batch_desc = self.cudagraph_dispatcher.dispatch(
                 num_tokens
             )
@@ -1172,7 +1453,14 @@ class SpecDecodeBaseProposer:
                     hidden_states=self.hidden_states[:num_input_tokens],
                     inputs_embeds=None,
                 )
+            if draft_stage_ms is not None:
+                self._tree_draft_profile_record(
+                    draft_stage_ms,
+                    "tree_level_forward_ms",
+                    stage_start,
+                )
 
+            stage_start = self._tree_draft_profile_start()
             # Get the output hidden states for the draft tokens.
             draft_hidden_states = hidden_states[:num_tokens].view(
                 batch_size, query_len, -1
@@ -1185,25 +1473,39 @@ class SpecDecodeBaseProposer:
             logits = self.model.compute_logits(
                 draft_last_hidden_states.reshape(batch_size * level_num_drafts, -1)
             )
+            if draft_stage_ms is not None:
+                self._tree_draft_profile_record(
+                    draft_stage_ms,
+                    "tree_level_logits_ms",
+                    stage_start,
+                )
 
             # Sample a draft token for each child at the next tree level.
             num_children = self.child_drafts_per_level[level + 1]
+            stage_start = self._tree_draft_profile_start()
             if num_children == 1:
-                draft_token_ids = logits.argmax(dim=-1).view(batch_size, -1)
                 if dynamic_tree_enabled:
-                    child_scores = torch.softmax(logits.to(torch.float32), dim=-1)
-                    child_scores = child_scores.gather(
-                        dim=-1, index=draft_token_ids.reshape(-1, 1).to(torch.long)
+                    logits_float = logits.to(torch.float32)
+                    child_logits, draft_token_ids = torch.max(logits_float, dim=-1)
+                    draft_token_ids = draft_token_ids.view(batch_size, -1)
+                    child_scores = torch.exp(
+                        child_logits - torch.logsumexp(logits_float, dim=-1)
                     ).view(batch_size, level_num_drafts)
                     parent_offsets = torch.arange(
                         level_num_drafts, dtype=torch.int64, device=self.device
                     ).expand(batch_size, -1)
+                else:
+                    draft_token_ids = logits.argmax(dim=-1).view(batch_size, -1)
             else:
                 if dynamic_tree_enabled:
-                    child_scores, child_tokens = torch.topk(
-                        torch.softmax(logits.to(torch.float32), dim=-1),
-                        num_children,
-                        dim=-1,
+                    logits_float = logits.to(torch.float32)
+                    child_logits, child_tokens = torch.topk(
+                        logits_float, num_children, dim=-1
+                    )
+                    child_scores = torch.exp(
+                        child_logits - torch.logsumexp(
+                            logits_float, dim=-1, keepdim=True
+                        )
                     )
                     draft_token_ids = child_tokens.view(batch_size, -1)
                     child_scores = child_scores.view(batch_size, -1)
@@ -1218,9 +1520,25 @@ class SpecDecodeBaseProposer:
                     draft_token_ids = torch.topk(
                         logits, num_children, dim=-1
                     ).indices.view(batch_size, -1)
+            if draft_stage_ms is not None:
+                self._tree_draft_profile_record(
+                    draft_stage_ms,
+                    "tree_level_select_ms",
+                    stage_start,
+                )
             if dynamic_tree_enabled:
+                assert level_cumulative_scores is not None
+                parent_cumulative_scores = level_cumulative_scores
                 all_tokens_by_level.append(draft_token_ids.to(torch.int64))
-                all_scores_by_level.append(child_scores.to(torch.float32))
+                level_cumulative_scores = (
+                    torch.gather(
+                        parent_cumulative_scores,
+                        1,
+                        parent_offsets,
+                    )
+                    * child_scores
+                )
+                all_scores_by_level.append(level_cumulative_scores.to(torch.float32))
                 selected_child_offsets_by_level.append(parent_offsets)
             draft_token_ids_list.append(draft_token_ids)
 
@@ -1228,29 +1546,32 @@ class SpecDecodeBaseProposer:
             level_num_drafts = self.cu_drafts_per_level[level + 1] - total_num_drafts
             total_num_drafts = self.cu_drafts_per_level[level + 1]
         if dynamic_tree_enabled:
+            stage_start = self._tree_draft_profile_start()
             build_metadata = self._build_runtime_dynamic_tree_metadata
             self._dynamic_tree_last_metadata = build_metadata(
                 batch_size=batch_size,
                 all_tokens_by_level=all_tokens_by_level,
                 all_scores_by_level=all_scores_by_level,
                 selected_child_offsets_by_level=selected_child_offsets_by_level,
+                scores_are_cumulative=True,
             )
-            draft_tokens_cpu = torch.cat(draft_token_ids_list, dim=1).detach().cpu()
-            self._dynamic_tree_last_draft_token_ids = []
-            for req_idx, tree_metadata in enumerate(self._dynamic_tree_last_metadata):
-                if tree_metadata is None or not tree_metadata.get("tree_valid", False):
-                    self._dynamic_tree_last_draft_token_ids.append([])
-                    continue
-                selected = tree_metadata.get("selected_static_nodes", [])
-                if not isinstance(selected, list):
-                    self._dynamic_tree_last_draft_token_ids.append([])
-                    continue
-                self._dynamic_tree_last_draft_token_ids.append(
-                    [
-                        int(draft_tokens_cpu[req_idx, static_idx - 1].item())
-                        for static_idx in selected
-                        if 0 < int(static_idx) <= draft_tokens_cpu.shape[1]
-                    ]
+            if draft_stage_ms is not None:
+                self._tree_draft_profile_record(
+                    draft_stage_ms,
+                    "dynamic_metadata_build_ms",
+                    stage_start,
+                )
+            stage_start = self._tree_draft_profile_start()
+            # The worker derives DDT draft tokens directly from the typed
+            # metadata selected_token_ids.  Keep the legacy side-channel empty
+            # so old callers can still fall back to it without paying another
+            # per-step list/int copy here.
+            self._dynamic_tree_last_draft_token_ids = None
+            if draft_stage_ms is not None:
+                self._tree_draft_profile_record(
+                    draft_stage_ms,
+                    "dynamic_draft_tokens_cpu_ms",
+                    stage_start,
                 )
         return draft_token_ids_list
 
@@ -1261,13 +1582,19 @@ class SpecDecodeBaseProposer:
         all_tokens_by_level: list[torch.Tensor],
         all_scores_by_level: list[torch.Tensor],
         selected_child_offsets_by_level: list[torch.Tensor],
-    ) -> list[dict[str, list[int] | list[list[int]] | int | bool]]:
+        scores_are_cumulative: bool = False,
+    ) -> list[DynamicTreeCompactMetadata]:
         """Select a request-local DDT verify subtree from live draft scores.
 
         vLLM's current TREE_ATTN backend still computes the full configured
         static tree.  This metadata changes the verifier traversal set and, when
         enabled, also emits a per-request target mask for unselected nodes.
         """
+
+        metadata_stage_ms: dict[str, float] | None = (
+            {} if self._dynamic_tree_metadata_stage_profile_enabled else None
+        )
+        self._dynamic_tree_metadata_last_stage_ms = None
 
         max_selected = (
             self._dynamic_tree_max_draft_tokens
@@ -1278,185 +1605,930 @@ class SpecDecodeBaseProposer:
         if max_selected <= 0:
             raise ValueError("dynamic_draft_tree_max_draft_tokens must be positive")
 
-        metadata_by_req: list[
-            dict[str, list[int] | list[list[int]] | int | bool]
-        ] = []
+        metadata_by_req: list[DynamicTreeCompactMetadata] = []
         tree_depth = len(self.cu_drafts_per_level)
 
-        for req_idx in range(batch_size):
-            static_local_tokens: dict[int, int] = {}
-            static_scores: dict[int, float] = {}
-            parent_for_static: dict[int, int] = {}
-            parent_list = torch.full(
-                (1, max(self.child_drafts_per_level[0] * (tree_depth - 1) + 1, 1)),
-                -1,
+        num_static_nodes = len(self.tree_choices)
+        static_tokens = self._dynamic_tree_static_tokens_buffer[
+            :batch_size, : num_static_nodes + 1
+        ]
+        static_scores = self._dynamic_tree_static_scores_buffer[
+            :batch_size, : num_static_nodes + 1
+        ]
+        selected_bool = self._dynamic_tree_selected_bool_buffer[
+            :batch_size, : num_static_nodes + 1
+        ]
+        static_tokens.zero_()
+        static_scores.fill_(-torch.inf)
+        stage_start = self._dynamic_tree_metadata_profile_start()
+        root_width = all_tokens_by_level[0].shape[1]
+        static_tokens[:, 1 : root_width + 1] = all_tokens_by_level[0].to(torch.int64)
+        static_scores[:, 1 : root_width + 1] = all_scores_by_level[0].to(
+            torch.float32
+        )
+        for level in range(1, tree_depth):
+            level_start = self.cu_drafts_per_level[level - 1]
+            tokens = all_tokens_by_level[level].to(torch.int64)
+            scores = all_scores_by_level[level].to(torch.float32)
+            width = tokens.shape[1]
+            static_start = level_start + 1
+            static_end = static_start + width
+            static_tokens[:, static_start:static_end] = tokens
+            if scores_are_cumulative:
+                static_scores[:, static_start:static_end] = scores
+            else:
+                static_indices = self._dynamic_tree_static_node_ids_tensor[
+                    static_start - 1 : static_end - 1
+                ]
+                parent_indices = self._tree_static_parent_indices_tensor[
+                    static_indices
+                ].unsqueeze(0).expand(batch_size, -1)
+                parent_scores = torch.gather(static_scores, 1, parent_indices)
+                static_scores[:, static_start:static_end] = parent_scores * scores
+        if metadata_stage_ms is not None:
+            self._dynamic_tree_metadata_profile_record(
+                metadata_stage_ms,
+                "materialize_static_scores_ms",
+                stage_start,
+            )
+
+        stage_start = self._dynamic_tree_metadata_profile_start()
+        candidate_scores = static_scores[:, 1:]
+        topk_count = min(max_selected, num_static_nodes)
+        if os.environ.get("VLLM_DYNAMIC_TREE_FAST_TOPK_SELECT") == "1":
+            # DDT only needs the selected node set here.  This avoids a full
+            # stable sort of the configured static tree on every step, but ties
+            # may choose a different sibling.  Keep it opt-in until the
+            # correctness matrix accepts that selector policy.
+            topk_static_nodes = (
+                torch.topk(
+                    candidate_scores,
+                    k=topk_count,
+                    dim=1,
+                ).indices
+                + 1
+            )
+        else:
+            topk_static_nodes = (
+                torch.argsort(
+                    candidate_scores,
+                    dim=1,
+                    descending=True,
+                    stable=True,
+                )[:, :topk_count]
+                + 1
+            )
+        topk_scores = torch.gather(candidate_scores, 1, topk_static_nodes - 1)
+        valid_topk = torch.isfinite(topk_scores)
+        if metadata_stage_ms is not None:
+            self._dynamic_tree_metadata_profile_record(
+                metadata_stage_ms,
+                "select_topk_ms",
+                stage_start,
+            )
+
+        stage_start = self._dynamic_tree_metadata_profile_start()
+        compact_candidate_width = topk_count * (tree_depth + 1)
+        use_static_topk_metadata_kernel = (
+            os.environ.get("VLLM_DYNAMIC_TREE_STATIC_TOPK_METADATA_KERNEL")
+            == "1"
+            and os.environ.get("VLLM_DYNAMIC_TREE_DENSE_CPU_SELECT") != "1"
+            and os.environ.get("VLLM_DYNAMIC_TREE_FULL_CPU_SELECT") != "1"
+            and os.environ.get("VLLM_DYNAMIC_TREE_COMPACT_CANDIDATE_SELECT")
+            != "1"
+            and os.environ.get("VLLM_DYNAMIC_TREE_CPU_CLOSURE_SELECT") != "1"
+        )
+        use_selected_bool_metadata_kernel = (
+            os.environ.get("VLLM_DYNAMIC_TREE_SELECTED_BOOL_METADATA_KERNEL")
+            == "1"
+            and not use_static_topk_metadata_kernel
+            and os.environ.get("VLLM_DYNAMIC_TREE_DENSE_CPU_SELECT") != "1"
+            and os.environ.get("VLLM_DYNAMIC_TREE_FULL_CPU_SELECT") != "1"
+            and os.environ.get("VLLM_DYNAMIC_TREE_COMPACT_CANDIDATE_SELECT")
+            != "1"
+            and os.environ.get("VLLM_DYNAMIC_TREE_CPU_CLOSURE_SELECT") != "1"
+        )
+        use_cpu_closure_select = (
+            os.environ.get("VLLM_DYNAMIC_TREE_CPU_CLOSURE_SELECT") == "1"
+            and os.environ.get("VLLM_DYNAMIC_TREE_DENSE_CPU_SELECT") != "1"
+            and os.environ.get("VLLM_DYNAMIC_TREE_FULL_CPU_SELECT") != "1"
+            and os.environ.get("VLLM_DYNAMIC_TREE_COMPACT_CANDIDATE_SELECT")
+            != "1"
+        )
+        use_compact_candidate_select = (
+            os.environ.get(
+                "VLLM_DYNAMIC_TREE_COMPACT_CANDIDATE_SELECT"
+            ) == "1"
+            and os.environ.get("VLLM_DYNAMIC_TREE_DENSE_CPU_SELECT") != "1"
+            and os.environ.get("VLLM_DYNAMIC_TREE_FULL_CPU_SELECT") != "1"
+            and compact_candidate_width <= num_static_nodes
+        )
+        if (
+            (not use_static_topk_metadata_kernel or use_selected_bool_metadata_kernel)
+            and not use_compact_candidate_select
+            and not use_cpu_closure_select
+        ):
+            selected_bool.zero_()
+            selected_bool.scatter_(1, topk_static_nodes, valid_topk)
+        compact_candidate_nodes = None
+        compact_candidate_valid = None
+        if use_compact_candidate_select:
+            compact_candidate_nodes = (
+                self._dynamic_tree_compact_candidate_nodes_buffer[
+                    :batch_size, :compact_candidate_width
+                ]
+            )
+            compact_candidate_valid = (
+                self._dynamic_tree_compact_candidate_valid_buffer[
+                    :batch_size, :compact_candidate_width
+                ]
+            )
+            compact_candidate_nodes.zero_()
+            compact_candidate_valid.zero_()
+            compact_candidate_nodes[:, :topk_count] = topk_static_nodes
+            compact_candidate_valid[:, :topk_count] = valid_topk
+        parent = self._tree_static_parent_indices_tensor
+        ancestors = topk_static_nodes
+        compact_candidate_offset = topk_count
+        if (
+            not use_static_topk_metadata_kernel or use_selected_bool_metadata_kernel
+        ) and not use_cpu_closure_select:
+            for _ in range(tree_depth):
+                ancestors = parent[ancestors]
+                ancestor_valid = ancestors > 0
+                if not use_compact_candidate_select:
+                    selected_bool.scatter_(
+                        1, ancestors, ancestor_valid & valid_topk
+                    )
+                if use_compact_candidate_select:
+                    assert compact_candidate_nodes is not None
+                    assert compact_candidate_valid is not None
+                    compact_candidate_slice = slice(
+                        compact_candidate_offset,
+                        compact_candidate_offset + topk_count,
+                    )
+                    compact_candidate_nodes[:, compact_candidate_slice] = (
+                        ancestors
+                    )
+                    compact_candidate_valid[:, compact_candidate_slice] = (
+                        ancestor_valid & valid_topk
+                    )
+                    compact_candidate_offset += topk_count
+        if (
+            (not use_static_topk_metadata_kernel or use_selected_bool_metadata_kernel)
+            and not use_compact_candidate_select
+            and not use_cpu_closure_select
+        ):
+            selected_bool[:, 0] = False
+        if metadata_stage_ms is not None:
+            self._dynamic_tree_metadata_profile_record(
+                metadata_stage_ms,
+                "ancestor_scatter_ms",
+                stage_start,
+            )
+
+        stage_start = self._dynamic_tree_metadata_profile_start()
+        prefix_nodes_by_req: list[list[int]] | None = None
+        if self._dynamic_tree_runtime_mode == "prefix_only":
+            depth = self._tree_static_position_offsets_tensor[1:].unsqueeze(0)
+            node_ids = torch.arange(
+                1,
+                num_static_nodes + 1,
                 dtype=torch.int64,
                 device=self.device,
+            ).unsqueeze(0)
+            prefix_score = (
+                depth.to(torch.float32) * 2.0
+                + candidate_scores
+                + (num_static_nodes + 1 - node_ids.to(torch.float32)) * 1e-6
             )
-
-            level_static_indices: list[list[int]] = []
-            first_level_tokens = all_tokens_by_level[0][req_idx]
-            first_level_scores = all_scores_by_level[0][req_idx]
-            first_level_static: list[int] = []
-            for child_idx in range(first_level_tokens.shape[0]):
-                static_idx = child_idx + 1
-                static_local_tokens[static_idx] = int(first_level_tokens[child_idx])
-                static_scores[static_idx] = float(first_level_scores[child_idx])
-                parent_for_static[static_idx] = 0
-                first_level_static.append(static_idx)
-            level_static_indices.append(first_level_static)
-
-            prev_level_static = first_level_static
-            for level in range(1, tree_depth):
-                tokens = all_tokens_by_level[level][req_idx]
-                scores = all_scores_by_level[level][req_idx]
-                parent_offsets = selected_child_offsets_by_level[level][req_idx]
-                level_start = self.cu_drafts_per_level[level - 1]
-                level_static: list[int] = []
-                for flat_idx in range(tokens.shape[0]):
-                    static_idx = level_start + flat_idx + 1
-                    parent_offset = int(parent_offsets[flat_idx])
-                    # Static tree choices are breadth-first sorted, so the
-                    # parent of a node at this level is the previous-level node
-                    # addressed by the flattened child group.  The live top-k
-                    # tensors keep the same shape/order; selected_child_offsets
-                    # is only needed if a future proposer prunes level parents.
-                    parent_offset = flat_idx // self.child_drafts_per_level[level]
-                    if parent_offset >= len(prev_level_static):
-                        parent_static_idx = 0
-                    else:
-                        parent_static_idx = prev_level_static[parent_offset]
-                    parent_for_static[static_idx] = parent_static_idx
-                    static_local_tokens[static_idx] = int(tokens[flat_idx])
-                    static_scores[static_idx] = static_scores.get(
-                        parent_static_idx, 1.0
-                    ) * float(scores[flat_idx])
-                    level_static.append(static_idx)
-                    parent_table_idx = level_start // self.child_drafts_per_level[0]
-                    parent_table_idx += flat_idx // self.child_drafts_per_level[level]
-                    if 0 <= parent_table_idx < parent_list.shape[1]:
-                        parent_list[0, parent_table_idx] = parent_static_idx - 1
-                level_static_indices.append(level_static)
-                prev_level_static = level_static
-
-            selected_static_nodes = sorted(
-                static_scores,
-                key=lambda idx: (-static_scores[idx], idx),
-            )[:max_selected]
-            selected_set = set(selected_static_nodes)
-            # Keep the tree connected.  Adding ancestors may exceed the soft cap
-            # by a small amount, which is preferable to selecting unreachable
-            # high-score descendants.
-            for static_idx in list(selected_static_nodes):
-                parent_idx = parent_for_static.get(static_idx, 0)
-                while parent_idx > 0:
-                    selected_set.add(parent_idx)
-                    parent_idx = parent_for_static.get(parent_idx, 0)
-            selected_static_nodes = sorted(selected_set)
-
-            if not selected_static_nodes:
-                metadata_by_req.append(
-                    {
-                        "retrieve_index": [0],
-                        "retrieve_next_token": [-1],
-                        "retrieve_next_sibling": [-1],
-                        "target_mask": [1],
-                        "position_offsets": [0],
-                        "tree_attn_mask": [[1]],
-                        "selected_static_nodes": [],
-                        "target_mask_enabled": self._enable_dynamic_tree_target_mask,
-                        "num_spec_steps": 1,
-                        "tree_valid": False,
-                        "is_dynamic_tree": True,
-                        "is_linear_chain": True,
-                    }
-                )
-                continue
-            if self._dynamic_tree_runtime_mode == "prefix_only":
-                best_static_idx = min(
-                    static_scores,
-                    key=lambda idx: (
-                        -len(self.tree_choices[idx - 1]),
-                        -static_scores[idx],
-                        idx,
-                    ),
-                )
+            prefix_score = torch.where(
+                torch.isfinite(candidate_scores),
+                prefix_score,
+                torch.full_like(prefix_score, -torch.inf),
+            )
+            best_static = torch.argmax(prefix_score, dim=1) + 1
+            prefix_nodes_by_req = []
+            for req_idx in range(batch_size):
+                cur_static_idx = int(best_static[req_idx].item())
                 prefix_path: list[int] = []
-                cur_static_idx = best_static_idx
                 while cur_static_idx > 0:
                     prefix_path.append(cur_static_idx)
-                    cur_static_idx = parent_for_static.get(cur_static_idx, 0)
-                selected_static_nodes = list(reversed(prefix_path))[:max_selected]
-            packed_static_nodes = selected_static_nodes
-            static_to_packed = {
-                static_idx: packed_idx + 1
-                for packed_idx, static_idx in enumerate(packed_static_nodes)
-            }
-            num_nodes = len(packed_static_nodes) + 1
-            retrieve_index = list(range(num_nodes))
-            retrieve_next_token = [-1] * num_nodes
-            retrieve_next_sibling = [-1] * num_nodes
-            selected_set = set(selected_static_nodes)
-            children_by_parent: dict[int, list[int]] = {}
-            for static_idx in selected_static_nodes:
-                parent_idx = parent_for_static.get(static_idx, 0)
-                if parent_idx == 0 or parent_idx in selected_set:
-                    parent_packed_idx = static_to_packed.get(parent_idx, 0)
-                    child_packed_idx = static_to_packed[static_idx]
-                    children_by_parent.setdefault(parent_packed_idx, []).append(
-                        child_packed_idx
-                    )
-            for parent_idx, child_indices in children_by_parent.items():
-                first_child = -1
-                for child_idx in sorted(child_indices, reverse=True):
-                    retrieve_next_sibling[child_idx] = first_child
-                    first_child = child_idx
-                retrieve_next_token[parent_idx] = first_child
+                    cur_static_idx = self._tree_static_parent_indices[cur_static_idx]
+                prefix_nodes_by_req.append(list(reversed(prefix_path))[:max_selected])
+        if metadata_stage_ms is not None:
+            self._dynamic_tree_metadata_profile_record(
+                metadata_stage_ms,
+                "prefix_select_ms",
+                stage_start,
+            )
 
-            max_depth = max(
-                (
-                    len(self.tree_choices[static_idx - 1])
-                    for static_idx in selected_static_nodes
-                ),
-                default=0,
+        stage_start = self._dynamic_tree_metadata_profile_start()
+        selected_nodes_by_req: list[list[int]] = [[] for _ in range(batch_size)]
+        selected_token_ids_by_req: list[list[int]] = [
+            [] for _ in range(batch_size)
+        ]
+        compact_metadata_output = None
+        compact_metadata_from_default_select = False
+        use_device_metadata_handle = (
+            os.environ.get("VLLM_DYNAMIC_TREE_DEVICE_METADATA_HANDLE") == "1"
+            and self._dynamic_tree_runtime_mode != "prefix_only"
+        )
+        if use_static_topk_metadata_kernel:
+            kernel_stage_start = self._dynamic_tree_metadata_profile_start()
+            compact_metadata_output = build_static_topk_compact_metadata_kernel(
+                topk_static_nodes,
+                valid_topk,
+                static_tokens,
+                self._tree_static_parent_indices_tensor,
+                self._tree_static_position_offsets_tensor,
+                max_tree_nodes=num_static_nodes + 1,
             )
-            target_mask = [1] * num_nodes
-            position_offsets = [0] + [
-                len(self.tree_choices[static_idx - 1])
-                for static_idx in packed_static_nodes
+            if metadata_stage_ms is not None:
+                self._dynamic_tree_metadata_profile_record(
+                    metadata_stage_ms,
+                    "static_topk_metadata_kernel_ms",
+                    kernel_stage_start,
+                )
+            copy_stage_start = self._dynamic_tree_metadata_profile_start()
+            selected_width = compact_metadata_output.selected_static_nodes.shape[1]
+            selected_static_nodes_cpu = (
+                self._dynamic_tree_static_topk_selected_nodes_cpu[
+                    :batch_size, :selected_width
+                ]
+            )
+            selected_token_ids_cpu = (
+                self._dynamic_tree_static_topk_selected_tokens_cpu[
+                    :batch_size, :selected_width
+                ]
+            )
+            num_nodes_cpu = self._dynamic_tree_static_topk_num_nodes_cpu[
+                :batch_size
             ]
-            tree_attn_mask = [[0] * num_nodes for _ in range(num_nodes)]
-            for local_idx in range(num_nodes):
-                tree_attn_mask[local_idx][0] = 1
-                tree_attn_mask[local_idx][local_idx] = 1
-            for static_idx in packed_static_nodes:
-                local_idx = static_to_packed[static_idx]
-                parent_idx = parent_for_static.get(static_idx, 0)
-                while parent_idx > 0:
-                    parent_local_idx = static_to_packed.get(parent_idx)
-                    if parent_local_idx is None:
-                        break
-                    tree_attn_mask[local_idx][parent_local_idx] = 1
-                    parent_idx = parent_for_static.get(parent_idx, 0)
-            metadata_by_req.append(
-                {
-                    "retrieve_index": retrieve_index,
-                    "retrieve_next_token": retrieve_next_token,
-                    "retrieve_next_sibling": retrieve_next_sibling,
-                    "target_mask": target_mask,
-                    "position_offsets": position_offsets,
-                    "tree_attn_mask": tree_attn_mask,
-                    "selected_static_nodes": packed_static_nodes,
-                    "target_mask_enabled": self._enable_dynamic_tree_target_mask,
-                    "num_spec_steps": max_depth + 1,
-                    "tree_valid": True,
-                    "is_dynamic_tree": True,
-                    "is_linear_chain": (
-                        self._dynamic_tree_runtime_mode == "prefix_only"
-                    ),
-                }
+            num_spec_steps_cpu = (
+                self._dynamic_tree_static_topk_num_spec_steps_cpu[:batch_size]
             )
+            selected_static_nodes_cpu.copy_(
+                compact_metadata_output.selected_static_nodes,
+                non_blocking=True,
+            )
+            selected_token_ids_cpu.copy_(
+                compact_metadata_output.selected_token_ids,
+                non_blocking=True,
+            )
+            num_nodes_cpu.copy_(
+                compact_metadata_output.num_nodes,
+                non_blocking=True,
+            )
+            num_spec_steps_cpu.copy_(
+                compact_metadata_output.num_spec_steps,
+                non_blocking=True,
+            )
+            if metadata_stage_ms is not None:
+                self._dynamic_tree_metadata_profile_record(
+                    metadata_stage_ms,
+                    "static_topk_metadata_d2h_copy_ms",
+                    copy_stage_start,
+                )
+            sync_stage_start = self._dynamic_tree_metadata_profile_start()
+            if compact_metadata_output.num_nodes.device.type == "cuda":
+                torch.cuda.current_stream(
+                    compact_metadata_output.num_nodes.device
+                ).synchronize()
+            if metadata_stage_ms is not None:
+                self._dynamic_tree_metadata_profile_record(
+                    metadata_stage_ms,
+                    "static_topk_metadata_d2h_wait_ms",
+                    sync_stage_start,
+                )
+                metadata_stage_ms["static_topk_metadata_sync_ms"] = (
+                    metadata_stage_ms.get("static_topk_metadata_sync_ms", 0.0)
+                    + metadata_stage_ms.get(
+                        "static_topk_metadata_d2h_copy_ms", 0.0
+                    )
+                    + metadata_stage_ms.get(
+                        "static_topk_metadata_d2h_wait_ms", 0.0
+                    )
+                )
+            python_stage_start = self._dynamic_tree_metadata_profile_start()
+            selected_static_nodes_np = (
+                self._dynamic_tree_static_topk_selected_nodes_np[
+                    :batch_size, :selected_width
+                ]
+            )
+            selected_token_ids_np = (
+                self._dynamic_tree_static_topk_selected_tokens_np[
+                    :batch_size, :selected_width
+                ]
+            )
+            num_nodes_np = self._dynamic_tree_static_topk_num_nodes_np[:batch_size]
+            for req_idx in range(batch_size):
+                selected_width = max(0, int(num_nodes_np[req_idx]) - 1)
+                if selected_width == 0:
+                    continue
+                selected_nodes_by_req[req_idx] = [
+                    int(static_idx)
+                    for static_idx in selected_static_nodes_np[
+                        req_idx, :selected_width
+                    ]
+                ]
+                selected_token_ids_by_req[req_idx] = [
+                    int(token_id)
+                    for token_id in selected_token_ids_np[
+                        req_idx, :selected_width
+                    ]
+                ]
+            if metadata_stage_ms is not None:
+                self._dynamic_tree_metadata_profile_record(
+                    metadata_stage_ms,
+                    "static_topk_metadata_python_ms",
+                    python_stage_start,
+                )
+        elif use_selected_bool_metadata_kernel:
+            kernel_stage_start = self._dynamic_tree_metadata_profile_start()
+            compact_metadata_output = build_selected_bool_compact_metadata_kernel(
+                selected_bool,
+                static_tokens,
+                self._tree_static_parent_indices_tensor,
+                self._tree_static_position_offsets_tensor,
+                max_tree_nodes=num_static_nodes + 1,
+            )
+            if metadata_stage_ms is not None:
+                self._dynamic_tree_metadata_profile_record(
+                    metadata_stage_ms,
+                    "selected_bool_metadata_kernel_ms",
+                    kernel_stage_start,
+                )
+            copy_stage_start = self._dynamic_tree_metadata_profile_start()
+            selected_width = compact_metadata_output.selected_static_nodes.shape[1]
+            selected_static_nodes_cpu = (
+                self._dynamic_tree_static_topk_selected_nodes_cpu[
+                    :batch_size, :selected_width
+                ]
+            )
+            selected_token_ids_cpu = (
+                self._dynamic_tree_static_topk_selected_tokens_cpu[
+                    :batch_size, :selected_width
+                ]
+            )
+            num_nodes_cpu = self._dynamic_tree_static_topk_num_nodes_cpu[
+                :batch_size
+            ]
+            num_spec_steps_cpu = (
+                self._dynamic_tree_static_topk_num_spec_steps_cpu[:batch_size]
+            )
+            selected_static_nodes_cpu.copy_(
+                compact_metadata_output.selected_static_nodes,
+                non_blocking=True,
+            )
+            selected_token_ids_cpu.copy_(
+                compact_metadata_output.selected_token_ids,
+                non_blocking=True,
+            )
+            num_nodes_cpu.copy_(
+                compact_metadata_output.num_nodes,
+                non_blocking=True,
+            )
+            num_spec_steps_cpu.copy_(
+                compact_metadata_output.num_spec_steps,
+                non_blocking=True,
+            )
+            if metadata_stage_ms is not None:
+                self._dynamic_tree_metadata_profile_record(
+                    metadata_stage_ms,
+                    "selected_bool_metadata_d2h_copy_ms",
+                    copy_stage_start,
+                )
+            sync_stage_start = self._dynamic_tree_metadata_profile_start()
+            if compact_metadata_output.num_nodes.device.type == "cuda":
+                torch.cuda.current_stream(
+                    compact_metadata_output.num_nodes.device
+                ).synchronize()
+            if metadata_stage_ms is not None:
+                self._dynamic_tree_metadata_profile_record(
+                    metadata_stage_ms,
+                    "selected_bool_metadata_d2h_wait_ms",
+                    sync_stage_start,
+                )
+                metadata_stage_ms["selected_bool_metadata_sync_ms"] = (
+                    metadata_stage_ms.get("selected_bool_metadata_sync_ms", 0.0)
+                    + metadata_stage_ms.get(
+                        "selected_bool_metadata_d2h_copy_ms", 0.0
+                    )
+                    + metadata_stage_ms.get(
+                        "selected_bool_metadata_d2h_wait_ms", 0.0
+                    )
+                )
+            python_stage_start = self._dynamic_tree_metadata_profile_start()
+            selected_static_nodes_np = (
+                self._dynamic_tree_static_topk_selected_nodes_np[
+                    :batch_size, :selected_width
+                ]
+            )
+            selected_token_ids_np = (
+                self._dynamic_tree_static_topk_selected_tokens_np[
+                    :batch_size, :selected_width
+                ]
+            )
+            num_nodes_np = self._dynamic_tree_static_topk_num_nodes_np[:batch_size]
+            for req_idx in range(batch_size):
+                selected_width = max(0, int(num_nodes_np[req_idx]) - 1)
+                if selected_width == 0:
+                    continue
+                selected_nodes_by_req[req_idx] = [
+                    int(static_idx)
+                    for static_idx in selected_static_nodes_np[
+                        req_idx, :selected_width
+                    ]
+                ]
+                selected_token_ids_by_req[req_idx] = [
+                    int(token_id)
+                    for token_id in selected_token_ids_np[
+                        req_idx, :selected_width
+                    ]
+                ]
+            if metadata_stage_ms is not None:
+                self._dynamic_tree_metadata_profile_record(
+                    metadata_stage_ms,
+                    "selected_bool_metadata_python_ms",
+                    python_stage_start,
+                )
+        elif use_cpu_closure_select:
+            static_tokens_np = static_tokens.detach().cpu().numpy()
+            topk_static_nodes_np = topk_static_nodes.detach().cpu().numpy()
+            valid_topk_np = valid_topk.detach().cpu().numpy()
+            for req_idx in range(batch_size):
+                token_by_static_node: dict[int, int] = {}
+                for static_idx_np, is_valid_np in zip(
+                    topk_static_nodes_np[req_idx],
+                    valid_topk_np[req_idx],
+                    strict=True,
+                ):
+                    if not bool(is_valid_np):
+                        continue
+                    static_idx = int(static_idx_np)
+                    while static_idx > 0:
+                        token_by_static_node[static_idx] = int(
+                            static_tokens_np[req_idx, static_idx]
+                        )
+                        static_idx = self._tree_static_parent_indices[static_idx]
+                if not token_by_static_node:
+                    continue
+                selected_static_nodes = sorted(token_by_static_node)
+                selected_nodes_by_req[req_idx] = selected_static_nodes
+                selected_token_ids_by_req[req_idx] = [
+                    token_by_static_node[static_idx]
+                    for static_idx in selected_static_nodes
+                ]
+        elif use_compact_candidate_select:
+            assert compact_candidate_nodes is not None
+            assert compact_candidate_valid is not None
+            compact_candidate_gather_nodes = torch.where(
+                compact_candidate_valid,
+                compact_candidate_nodes,
+                torch.zeros_like(compact_candidate_nodes),
+            )
+            compact_candidate_token_ids = torch.gather(
+                static_tokens,
+                1,
+                compact_candidate_gather_nodes,
+            )
+            pack_stage_start = self._dynamic_tree_metadata_profile_start()
+            compact_candidate_pack = (
+                self._dynamic_tree_compact_candidate_pack_buffer[
+                    :batch_size, :compact_candidate_width
+                ]
+            )
+            compact_candidate_pack[:, :, 0] = compact_candidate_nodes
+            compact_candidate_pack[:, :, 1] = compact_candidate_valid
+            compact_candidate_pack[:, :, 2] = compact_candidate_token_ids
+            if metadata_stage_ms is not None:
+                self._dynamic_tree_metadata_profile_record(
+                    metadata_stage_ms,
+                    "compact_candidate_pack_ms",
+                    pack_stage_start,
+                )
+            sync_stage_start = self._dynamic_tree_metadata_profile_start()
+            compact_candidate_pack_np = (
+                compact_candidate_pack.detach().cpu().numpy()
+            )
+            if metadata_stage_ms is not None:
+                self._dynamic_tree_metadata_profile_record(
+                    metadata_stage_ms,
+                    "compact_candidate_sync_ms",
+                    sync_stage_start,
+                )
+            python_stage_start = self._dynamic_tree_metadata_profile_start()
+            for req_idx in range(batch_size):
+                token_by_static_node: dict[int, int] = {}
+                req_candidate_pack = compact_candidate_pack_np[req_idx]
+                for static_idx_np, is_valid_np, token_id_np in req_candidate_pack:
+                    if not int(is_valid_np):
+                        continue
+                    static_idx = int(static_idx_np)
+                    if static_idx <= 0:
+                        continue
+                    token_by_static_node[static_idx] = int(token_id_np)
+                if not token_by_static_node:
+                    continue
+                selected_static_nodes = sorted(token_by_static_node)
+                selected_nodes_by_req[req_idx] = selected_static_nodes
+                selected_token_ids_by_req[req_idx] = [
+                    token_by_static_node[static_idx]
+                    for static_idx in selected_static_nodes
+                ]
+            if metadata_stage_ms is not None:
+                self._dynamic_tree_metadata_profile_record(
+                    metadata_stage_ms,
+                    "compact_candidate_python_ms",
+                    python_stage_start,
+                )
+        elif os.environ.get("VLLM_DYNAMIC_TREE_DENSE_CPU_SELECT") != "1":
+            nonzero_stage_start = self._dynamic_tree_metadata_profile_start()
+            selected_indices = selected_bool[:, 1:].nonzero(as_tuple=False)
+            if metadata_stage_ms is not None:
+                self._dynamic_tree_metadata_profile_record(
+                    metadata_stage_ms,
+                    "selected_nodes_nonzero_ms",
+                    nonzero_stage_start,
+                )
+            if selected_indices.numel() > 0:
+                gather_stage_start = self._dynamic_tree_metadata_profile_start()
+                selected_token_ids = static_tokens[
+                    selected_indices[:, 0], selected_indices[:, 1] + 1
+                ]
+                if metadata_stage_ms is not None:
+                    self._dynamic_tree_metadata_profile_record(
+                        metadata_stage_ms,
+                        "selected_nodes_gather_ms",
+                        gather_stage_start,
+                    )
+                sync_stage_start = self._dynamic_tree_metadata_profile_start()
+                selected_indices_np = selected_indices.detach().cpu().numpy()
+                selected_token_ids_np = selected_token_ids.detach().cpu().numpy()
+                if metadata_stage_ms is not None:
+                    self._dynamic_tree_metadata_profile_record(
+                        metadata_stage_ms,
+                        "selected_nodes_sync_ms",
+                        sync_stage_start,
+                    )
+                python_stage_start = self._dynamic_tree_metadata_profile_start()
+                for (
+                    req_idx_np,
+                    static_idx_zero_np,
+                ), token_id_np in zip(
+                    selected_indices_np,
+                    selected_token_ids_np,
+                    strict=True,
+                ):
+                    req_idx = int(req_idx_np)
+                    selected_nodes_by_req[req_idx].append(
+                        int(static_idx_zero_np) + 1
+                    )
+                    selected_token_ids_by_req[req_idx].append(int(token_id_np))
+                if metadata_stage_ms is not None:
+                    self._dynamic_tree_metadata_profile_record(
+                        metadata_stage_ms,
+                        "selected_nodes_python_ms",
+                        python_stage_start,
+                    )
+            if use_device_metadata_handle and selected_indices.numel() > 0:
+                kernel_stage_start = self._dynamic_tree_metadata_profile_start()
+                compact_metadata_output = build_selected_bool_compact_metadata_kernel(
+                    selected_bool,
+                    static_tokens,
+                    self._tree_static_parent_indices_tensor,
+                    self._tree_static_position_offsets_tensor,
+                    max_tree_nodes=num_static_nodes + 1,
+                )
+                compact_metadata_from_default_select = True
+                if metadata_stage_ms is not None:
+                    self._dynamic_tree_metadata_profile_record(
+                        metadata_stage_ms,
+                        "hybrid_handle_metadata_kernel_ms",
+                        kernel_stage_start,
+                    )
+        else:
+            selected_bool_np = selected_bool[:, 1:].detach().cpu().numpy()
+            static_tokens_np = static_tokens[:, 1:].detach().cpu().numpy()
+            for req_idx in range(batch_size):
+                static_idx_zero_np = np.nonzero(selected_bool_np[req_idx])[0]
+                if static_idx_zero_np.size == 0:
+                    continue
+                selected_nodes_by_req[req_idx] = (
+                    static_idx_zero_np.astype(np.int64, copy=False) + 1
+                ).tolist()
+                selected_token_ids_by_req[req_idx] = static_tokens_np[
+                    req_idx, static_idx_zero_np
+                ].tolist()
+        if metadata_stage_ms is not None:
+            self._dynamic_tree_metadata_profile_record(
+                metadata_stage_ms,
+                "selected_nodes_cpu_ms",
+                stage_start,
+            )
+
+        stage_start = self._dynamic_tree_metadata_profile_start()
+        if use_device_metadata_handle and compact_metadata_output is not None:
+            if compact_metadata_from_default_select:
+                num_nodes_by_req = tuple(
+                    len(selected_nodes_by_req[req_idx]) + 1
+                    for req_idx in range(batch_size)
+                )
+                num_spec_steps_by_req = tuple(
+                    (
+                        max(
+                            int(self._tree_static_position_offsets[static_idx])
+                            for static_idx in selected_nodes_by_req[req_idx]
+                        )
+                        + 1
+                    )
+                    if selected_nodes_by_req[req_idx]
+                    else 1
+                    for req_idx in range(batch_size)
+                )
+            elif compact_metadata_output.num_nodes.device.type != "cuda":
+                num_nodes_cpu = self._dynamic_tree_static_topk_num_nodes_cpu[
+                    :batch_size
+                ]
+                num_spec_steps_cpu = (
+                    self._dynamic_tree_static_topk_num_spec_steps_cpu[:batch_size]
+                )
+                num_nodes_cpu.copy_(compact_metadata_output.num_nodes)
+                num_spec_steps_cpu.copy_(compact_metadata_output.num_spec_steps)
+                num_nodes_np = self._dynamic_tree_static_topk_num_nodes_np[
+                    :batch_size
+                ]
+                num_spec_steps_np = (
+                    self._dynamic_tree_static_topk_num_spec_steps_np[:batch_size]
+                )
+                num_nodes_by_req = tuple(
+                    int(num_nodes_np[req_idx])
+                    for req_idx in range(batch_size)
+                )
+                num_spec_steps_by_req = tuple(
+                    int(num_spec_steps_np[req_idx])
+                    for req_idx in range(batch_size)
+                )
+            else:
+                num_nodes_np = self._dynamic_tree_static_topk_num_nodes_np[
+                    :batch_size
+                ]
+                num_spec_steps_np = (
+                    self._dynamic_tree_static_topk_num_spec_steps_np[:batch_size]
+                )
+                num_nodes_by_req = tuple(
+                    int(num_nodes_np[req_idx])
+                    for req_idx in range(batch_size)
+                )
+                num_spec_steps_by_req = tuple(
+                    int(num_spec_steps_np[req_idx])
+                    for req_idx in range(batch_size)
+                )
+            self._dynamic_tree_metadata_handle_seq += 1
+            handle = DynamicTreeDeviceMetadataHandle(
+                handle_id=self._dynamic_tree_metadata_handle_seq,
+                req_ids=tuple(str(req_idx) for req_idx in range(batch_size)),
+                selected_static_nodes=compact_metadata_output.selected_static_nodes,
+                selected_token_ids=compact_metadata_output.selected_token_ids,
+                retrieve_index=compact_metadata_output.retrieve_index,
+                retrieve_next_token=compact_metadata_output.retrieve_next_token,
+                retrieve_next_sibling=compact_metadata_output.retrieve_next_sibling,
+                parent=compact_metadata_output.parent,
+                target_mask=compact_metadata_output.target_mask,
+                position_offsets=compact_metadata_output.position_offsets,
+                tree_valid=compact_metadata_output.tree_valid,
+                num_nodes=num_nodes_by_req,
+                num_spec_steps=num_spec_steps_by_req,
+                target_mask_enabled=self._enable_dynamic_tree_target_mask,
+                is_dynamic_tree=True,
+                is_linear_chain=False,
+                select_vectorized=True,
+                selected_token_ids_by_req=tuple(
+                    tuple(selected_token_ids_by_req[req_idx])
+                    for req_idx in range(batch_size)
+                ),
+            )
+            if metadata_stage_ms is not None:
+                self._dynamic_tree_metadata_profile_record(
+                    metadata_stage_ms,
+                    "metadata_objects_ms",
+                    stage_start,
+                )
+                self._dynamic_tree_metadata_last_stage_ms = metadata_stage_ms
+            return handle
+        for req_idx in range(batch_size):
+            selected_static_nodes = selected_nodes_by_req[req_idx]
+            selected_token_ids_for_req = selected_token_ids_by_req[req_idx]
+
+            if not selected_static_nodes:
+                metadata = DynamicTreeCompactMetadata(
+                    retrieve_index=[0],
+                    retrieve_next_token=[-1],
+                    retrieve_next_sibling=[-1],
+                    parent=[-1],
+                    target_mask=[1],
+                    position_offsets=[0],
+                    tree_attn_mask=[[1]],
+                    selected_token_ids=[],
+                    selected_static_nodes=[],
+                    target_mask_enabled=self._enable_dynamic_tree_target_mask,
+                    num_spec_steps=1,
+                    tree_valid=False,
+                    is_dynamic_tree=True,
+                    is_linear_chain=True,
+                    select_vectorized=True,
+                )
+                metadata.as_array_view()
+                metadata_by_req.append(metadata)
+                continue
+            if (
+                self._dynamic_tree_runtime_mode == "prefix_only"
+                and prefix_nodes_by_req is not None
+            ):
+                selected_static_nodes = prefix_nodes_by_req[req_idx]
+                token_by_static_node = dict(
+                    zip(
+                        selected_nodes_by_req[req_idx],
+                        selected_token_ids_by_req[req_idx],
+                        strict=True,
+                    )
+                )
+                if any(
+                    static_idx not in token_by_static_node
+                    for static_idx in selected_static_nodes
+                ):
+                    prefix_width = len(selected_static_nodes)
+                    prefix_gather_indices = (
+                        self._dynamic_tree_prefix_gather_indices_buffer[
+                            :prefix_width
+                        ]
+                    )
+                    prefix_gather_indices.copy_(
+                        torch.as_tensor(
+                            selected_static_nodes,
+                            dtype=torch.long,
+                            device=self.device,
+                        )
+                    )
+                    selected_token_ids_for_req = [
+                        int(token_id)
+                        for token_id in static_tokens[
+                            req_idx, prefix_gather_indices
+                        ]
+                        .detach()
+                        .cpu()
+                        .tolist()
+                    ]
+                else:
+                    selected_token_ids_for_req = [
+                        token_by_static_node[static_idx]
+                        for static_idx in selected_static_nodes
+                    ]
+            template = self._get_dynamic_tree_metadata_template(
+                selected_static_nodes
+            )
+            selected_token_ids = selected_token_ids_for_req
+            metadata = DynamicTreeCompactMetadata(
+                retrieve_index=template.retrieve_index,
+                retrieve_next_token=template.retrieve_next_token,
+                retrieve_next_sibling=template.retrieve_next_sibling,
+                parent=template.parent,
+                target_mask=template.target_mask,
+                position_offsets=template.position_offsets,
+                selected_token_ids=selected_token_ids,
+                tree_attn_mask=None,
+                selected_static_nodes=template.selected_static_nodes,
+                target_mask_enabled=self._enable_dynamic_tree_target_mask,
+                num_spec_steps=template.num_spec_steps,
+                tree_valid=True,
+                is_dynamic_tree=True,
+                is_linear_chain=(
+                    self._dynamic_tree_runtime_mode == "prefix_only"
+                ),
+                select_vectorized=True,
+            )
+            array_view = DynamicTreeCompactArrayView(
+                retrieve_index=template.array_view.retrieve_index,
+                retrieve_next_token=template.array_view.retrieve_next_token,
+                retrieve_next_sibling=template.array_view.retrieve_next_sibling,
+                parent=template.array_view.parent,
+                target_mask=template.array_view.target_mask,
+                position_offsets=template.array_view.position_offsets,
+                tree_attn_mask=None,
+                selected_token_ids=(
+                    DynamicTreeCompactArrayView._optional_int_array(
+                        selected_token_ids,
+                        np.int64,
+                    )
+                ),
+                selected_static_nodes=template.array_view.selected_static_nodes,
+            )
+            object.__setattr__(metadata, "_array_view", array_view)
+            metadata_by_req.append(metadata)
+        if metadata_stage_ms is not None:
+            self._dynamic_tree_metadata_profile_record(
+                metadata_stage_ms,
+                "metadata_objects_ms",
+                stage_start,
+            )
+            self._dynamic_tree_metadata_last_stage_ms = metadata_stage_ms
         return metadata_by_req
+
+    def _get_dynamic_tree_metadata_template(
+        self,
+        selected_static_nodes: list[int],
+    ) -> _DynamicTreeMetadataTemplate:
+        cache_key = tuple(selected_static_nodes)
+        cached = self._dynamic_tree_metadata_template_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        packed_static_nodes = selected_static_nodes
+        static_to_packed = {
+            static_idx: packed_idx + 1
+            for packed_idx, static_idx in enumerate(packed_static_nodes)
+        }
+        num_nodes = len(packed_static_nodes) + 1
+        retrieve_index = list(range(num_nodes))
+        retrieve_next_token = [-1] * num_nodes
+        retrieve_next_sibling = [-1] * num_nodes
+        parent = [-1] * num_nodes
+        selected_set = set(selected_static_nodes)
+        children_by_parent: dict[int, list[int]] = {}
+        for static_idx in selected_static_nodes:
+            parent_idx = self._tree_static_parent_indices[static_idx]
+            if parent_idx == 0 or parent_idx in selected_set:
+                parent_packed_idx = static_to_packed.get(parent_idx, 0)
+                child_packed_idx = static_to_packed[static_idx]
+                parent[child_packed_idx] = parent_packed_idx
+                children_by_parent.setdefault(parent_packed_idx, []).append(
+                    child_packed_idx
+                )
+        for parent_idx, child_indices in children_by_parent.items():
+            first_child = -1
+            for child_idx in sorted(child_indices, reverse=True):
+                retrieve_next_sibling[child_idx] = first_child
+                first_child = child_idx
+            retrieve_next_token[parent_idx] = first_child
+
+        max_depth = max(
+            (
+                int(self._tree_static_position_offsets[static_idx])
+                for static_idx in selected_static_nodes
+            ),
+            default=0,
+        )
+        target_mask = [1] * num_nodes
+        position_offsets = [0] + [
+            int(self._tree_static_position_offsets[static_idx])
+            for static_idx in packed_static_nodes
+        ]
+        array_view = DynamicTreeCompactArrayView(
+            retrieve_index=DynamicTreeCompactArrayView._int_array(
+                retrieve_index,
+                np.int32,
+            ),
+            retrieve_next_token=DynamicTreeCompactArrayView._int_array(
+                retrieve_next_token,
+                np.int32,
+            ),
+            retrieve_next_sibling=DynamicTreeCompactArrayView._int_array(
+                retrieve_next_sibling,
+                np.int32,
+            ),
+            parent=DynamicTreeCompactArrayView._optional_int_array(
+                parent,
+                np.int32,
+            ),
+            target_mask=DynamicTreeCompactArrayView._optional_int_array(
+                target_mask,
+                np.int32,
+            ),
+            position_offsets=DynamicTreeCompactArrayView._optional_int_array(
+                position_offsets,
+                np.int64,
+            ),
+            tree_attn_mask=None,
+            selected_token_ids=None,
+            selected_static_nodes=DynamicTreeCompactArrayView._optional_int_array(
+                packed_static_nodes,
+                np.int32,
+            ),
+        )
+        template = _DynamicTreeMetadataTemplate(
+            retrieve_index=retrieve_index,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            parent=parent,
+            target_mask=target_mask,
+            position_offsets=position_offsets,
+            selected_static_nodes=packed_static_nodes,
+            num_spec_steps=max_depth + 1,
+            array_view=array_view,
+        )
+        self._dynamic_tree_metadata_template_cache[cache_key] = template
+        return template
 
     def prepare_inputs(
         self,

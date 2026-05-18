@@ -305,6 +305,7 @@ def reset_compile_wrapper(model: torch.nn.Module) -> None:
     compilation_counter.num_backend_compilations = 0
     compilation_counter.num_gpu_runner_capture_triggers = 0
     compilation_counter.num_cudagraph_captured = 0
+    compilation_counter.num_cudagraph_replayed = 0
     compilation_counter.num_inductor_compiles = 0
     compilation_counter.num_eager_compiles = 0
     compilation_counter.num_cache_entries_updated = 0

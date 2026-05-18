@@ -34,11 +34,53 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
+from vllm.v1.spec_decode.metadata import (
+    DynamicTreeCompactMetadata,
+    DynamicTreeDeviceMetadataHandle,
+)
 from vllm.v1.structured_output import StructuredOutputManager
 
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 
 pytestmark = pytest.mark.cpu_test
+
+
+def make_dynamic_tree_device_metadata_handle(
+    req_ids: tuple[str, ...],
+) -> DynamicTreeDeviceMetadataHandle:
+    batch_size = len(req_ids)
+    tree_width = 4
+    return DynamicTreeDeviceMetadataHandle(
+        handle_id=1,
+        req_ids=req_ids,
+        selected_static_nodes=torch.tensor(
+            [[1, 2, 3]] * batch_size, dtype=torch.int32
+        ),
+        selected_token_ids=torch.tensor(
+            [[21, 22, 23]] * batch_size, dtype=torch.int64
+        ),
+        retrieve_index=torch.tensor(
+            [[0, 1, 2, 3]] * batch_size, dtype=torch.int32
+        ),
+        retrieve_next_token=torch.tensor(
+            [[1, 3, -1, -1]] * batch_size, dtype=torch.int32
+        ),
+        retrieve_next_sibling=torch.tensor(
+            [[-1, 2, -1, -1]] * batch_size, dtype=torch.int32
+        ),
+        parent=torch.tensor([[-1, 0, 0, 1]] * batch_size, dtype=torch.int32),
+        target_mask=torch.ones((batch_size, tree_width), dtype=torch.int32),
+        position_offsets=torch.tensor(
+            [[0, 1, 1, 2]] * batch_size, dtype=torch.int64
+        ),
+        tree_valid=torch.ones(batch_size, dtype=torch.bool),
+        num_nodes=(tree_width,) * batch_size,
+        num_spec_steps=(3,) * batch_size,
+        target_mask_enabled=True,
+        is_dynamic_tree=True,
+        is_linear_chain=False,
+        select_vectorized=True,
+    )
 
 
 def test_add_requests():
@@ -903,23 +945,107 @@ def test_spec_decode_tree_metadata_scheduled_with_draft_tokens():
     scheduler.update_from_output(output, model_runner_output)
 
     tree_metadata = {
-        req_id: {
-            "retrieve_index": [0, 1, 2, 3, 4],
-            "retrieve_next_token": [1, 3, -1, 4, -1],
-            "retrieve_next_sibling": [-1, 2, -1, -1, -1],
-            "num_spec_steps": 4,
-            "tree_valid": True,
-        }
+        "retrieve_index": [0, 1, 2, 3, 4],
+        "retrieve_next_token": [1, 3, -1, 4, -1],
+        "retrieve_next_sibling": [-1, 2, -1, -1, -1],
+        "num_spec_steps": 4,
+        "tree_valid": True,
     }
-    scheduler.update_draft_token_ids(
-        DraftTokenIds([req_id], [[11, 12, 13, 14]], tree_metadata=tree_metadata)
+    draft_token_ids = DraftTokenIds(
+        [req_id],
+        [[11, 12, 13, 14]],
+        tree_metadata=[DynamicTreeCompactMetadata.from_mapping(tree_metadata)],
     )
+    scheduler.update_draft_token_ids(draft_token_ids)
 
     output = scheduler.schedule()
 
     assert output.scheduled_spec_decode_tokens[req_id] == [11, 12, 13, 14]
     assert output.scheduled_spec_decode_tree_metadata is not None
-    assert output.scheduled_spec_decode_tree_metadata[req_id] == tree_metadata[req_id]
+    assert output.scheduled_spec_decode_tree_metadata == [
+        DynamicTreeCompactMetadata.from_mapping(tree_metadata)
+    ]
+
+
+def test_spec_decode_tree_metadata_is_aligned_to_spec_token_order():
+    scheduler = create_scheduler(num_speculative_tokens=4)
+    requests = create_requests(num_requests=2, num_tokens=1)
+    req_ids = [request.request_id for request in requests]
+    for request in requests:
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    model_runner_output = ModelRunnerOutput(
+        req_ids=req_ids,
+        req_id_to_index={req_id: req_idx for req_idx, req_id in enumerate(req_ids)},
+        sampled_token_ids=[[0], [1]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+    scheduler.update_from_output(output, model_runner_output)
+
+    tree_metadata = {
+        "retrieve_index": [0, 1, 2, 3],
+        "retrieve_next_token": [1, 3, -1, -1],
+        "retrieve_next_sibling": [-1, 2, -1, -1],
+        "parent": [-1, 0, 0, 1],
+        "num_spec_steps": 3,
+        "tree_valid": True,
+    }
+    scheduler.update_draft_token_ids(
+        DraftTokenIds(
+            req_ids,
+            [[], [21, 22, 23]],
+            tree_metadata=[
+                None,
+                DynamicTreeCompactMetadata.from_mapping(tree_metadata),
+            ],
+        )
+    )
+
+    output = scheduler.schedule()
+
+    assert output.scheduled_spec_decode_tokens == {req_ids[1]: [21, 22, 23]}
+    assert output.scheduled_spec_decode_tree_metadata is not None
+    assert output.scheduled_spec_decode_tree_metadata == [
+        DynamicTreeCompactMetadata.from_mapping(tree_metadata),
+    ]
+
+
+def test_spec_decode_device_tree_metadata_handle_is_scheduled_with_drafts():
+    scheduler = create_scheduler(num_speculative_tokens=4)
+    requests = create_requests(num_requests=2, num_tokens=1)
+    req_ids = [request.request_id for request in requests]
+    for request in requests:
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    model_runner_output = ModelRunnerOutput(
+        req_ids=req_ids,
+        req_id_to_index={req_id: req_idx for req_idx, req_id in enumerate(req_ids)},
+        sampled_token_ids=[[0], [1]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+    scheduler.update_from_output(output, model_runner_output)
+
+    handle = make_dynamic_tree_device_metadata_handle(tuple(req_ids))
+    scheduler.update_draft_token_ids(
+        DraftTokenIds(
+            req_ids,
+            [[], [21, 22, 23]],
+            tree_metadata=handle,
+        )
+    )
+
+    output = scheduler.schedule()
+
+    assert output.scheduled_spec_decode_tokens == {req_ids[1]: [21, 22, 23]}
+    assert output.scheduled_spec_decode_tree_metadata is not None
+    assert output.scheduled_spec_decode_tree_metadata == [handle]
+    assert output.scheduled_spec_decode_tree_metadata[0] is handle
 
 
 def test_spec_decoding_stats_empty_output():

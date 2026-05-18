@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
 
@@ -14,6 +15,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import (
     PLACEHOLDER_TOKEN_ID,
     RejectionSampler,
+    _tree_verify_kernel_enabled,
     sample_recovered_tokens,
     tree_rejection_greedy_sample,
 )
@@ -26,6 +28,14 @@ from vllm.v1.spec_decode.dynamic_tree import (
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 DEVICE_TYPE = current_platform.device_type
+
+
+def _cuda_is_usable():
+    try:
+        torch.empty(1, device="cuda")
+    except Exception:
+        return False
+    return True
 
 
 @pytest.fixture
@@ -665,6 +675,70 @@ def test_tree_rejection_root_only_forward_consumes_root_logits_only():
     )
     assert torch.equal(output, expected)
     assert accept_indices[0, 0].item() == 0
+
+
+@pytest.mark.skipif(not _cuda_is_usable(), reason="CUDA is not usable")
+def test_tree_rejection_greedy_sample_kernel_matches_reference(monkeypatch):
+    metadata, logits = create_tree_spec_decode_metadata(
+        draft_token_ids=[[11, 12, 13, 14], [21, 22, 23, 24], []],
+        target_token_ids=[
+            [11, 13, 99, 14, 42],
+            [22, 77, 88, 99, 100],
+            [98, 98, 98, 98, 66],
+        ],
+    )
+    metadata.bonus_logits_indices = torch.tensor(
+        [4, 9, 14], dtype=torch.int32, device=logits.device
+    )
+    metadata.tree_target_mask = torch.tensor(
+        [
+            [1, 1, 1, 1, 1],
+            [1, 1, 1, 1, 1],
+            [0, 0, 0, 0, 0],
+        ],
+        dtype=torch.int32,
+        device=logits.device,
+    )
+    sampling_metadata = create_sampling_metadata(all_greedy=True)
+
+    monkeypatch.delenv("VLLM_TREE_ATTN_VERIFY_KERNEL", raising=False)
+    expected_output, expected_accept_indices = tree_rejection_greedy_sample(
+        metadata,
+        logits,
+        sampling_metadata,
+    )
+    monkeypatch.setenv("VLLM_TREE_ATTN_VERIFY_KERNEL", "1")
+    kernel_output, kernel_accept_indices = tree_rejection_greedy_sample(
+        metadata,
+        logits,
+        sampling_metadata,
+    )
+
+    assert torch.equal(kernel_output, expected_output)
+    assert torch.equal(kernel_accept_indices, expected_accept_indices)
+
+
+def test_tree_verify_kernel_only_disabled_for_accept_trace(monkeypatch):
+    fake_logits = SimpleNamespace(device=SimpleNamespace(type="cuda"))
+    monkeypatch.setattr(
+        "vllm.v1.sample.rejection_sampler.HAS_TRITON",
+        True,
+    )
+    monkeypatch.setenv("VLLM_TREE_ATTN_VERIFY_KERNEL", "1")
+    monkeypatch.delenv("VLLM_TREE_SPEC_TRACE_PATH", raising=False)
+    monkeypatch.delenv("VLLM_SPEC_VERIFY_STATE_TRACE_PATH", raising=False)
+
+    assert _tree_verify_kernel_enabled(fake_logits)
+
+    monkeypatch.setenv("VLLM_TREE_SPEC_TRACE_PATH", "/tmp/tree_trace.jsonl")
+    assert not _tree_verify_kernel_enabled(fake_logits)
+
+    monkeypatch.delenv("VLLM_TREE_SPEC_TRACE_PATH")
+    monkeypatch.setenv(
+        "VLLM_SPEC_VERIFY_STATE_TRACE_PATH",
+        "/tmp/verify_state_trace.jsonl",
+    )
+    assert _tree_verify_kernel_enabled(fake_logits)
 
 
 ########################### Tests for Random Sampling ###################

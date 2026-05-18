@@ -203,6 +203,21 @@ def _make_metadata_with_slice(
         if attn_metadata.tree_attn_bias is not None
         else None
     )
+    tree_retrieve_next_token = (
+        attn_metadata.tree_retrieve_next_token[request_slice]
+        if attn_metadata.tree_retrieve_next_token is not None
+        else None
+    )
+    tree_retrieve_next_sibling = (
+        attn_metadata.tree_retrieve_next_sibling[request_slice]
+        if attn_metadata.tree_retrieve_next_sibling is not None
+        else None
+    )
+    tree_parent = (
+        attn_metadata.tree_parent[request_slice]
+        if attn_metadata.tree_parent is not None
+        else None
+    )
 
     if splits_last_request:
         # NOTE: We use start_locs (the original query_start_loc_cpu) to calculate
@@ -255,6 +270,9 @@ def _make_metadata_with_slice(
         _num_computed_tokens_cpu=num_computed_tokens_cpu,
         tree_target_mask=tree_target_mask,
         tree_attn_bias=tree_attn_bias,
+        tree_retrieve_next_token=tree_retrieve_next_token,
+        tree_retrieve_next_sibling=tree_retrieve_next_sibling,
+        tree_parent=tree_parent,
         tree_root_only=attn_metadata.tree_root_only,
     )
 

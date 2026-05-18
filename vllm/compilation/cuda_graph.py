@@ -358,4 +358,5 @@ class CUDAGraphWrapper:
         # from pre-capture prefetches are satisfied.
         get_offloader().sync_prev_onload()
         entry.cudagraph.replay()
+        compilation_counter.num_cudagraph_replayed += 1
         return entry.output

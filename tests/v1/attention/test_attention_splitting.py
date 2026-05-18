@@ -8,14 +8,17 @@ import torch
 
 from tests.v1.attention.test_attention_backends import BATCH_SPECS
 from tests.v1.attention.utils import BatchSpec, create_common_attn_metadata
+from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.tree_attn import (
     TreeAttentionMetadataBuilder,
     build_static_tree_retrieve_metadata,
+    materialize_tree_attn_bias_from_retrieve_metadata,
 )
 from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
-from vllm.v1.kv_cache_interface import FullAttentionSpec
+from vllm.v1.attention.ops.triton_unified_attention import unified_attention
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVQuantMode
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlice,
     _make_metadata_with_slice,
@@ -106,6 +109,34 @@ def test_tree_attn_builder_keeps_branching_tree_decode_bias():
     assert builder.use_tree_decode_bias
 
 
+def test_tree_attn_cudagraph_support_requires_explicit_probe(monkeypatch):
+    vllm_config = SimpleNamespace(speculative_config=None)
+    kv_cache_spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=16,
+        dtype=torch.float16,
+    )
+
+    monkeypatch.delenv("VLLM_TREE_ATTN_CUDAGRAPH_PROBE", raising=False)
+    assert (
+        TreeAttentionMetadataBuilder.get_cudagraph_support(
+            vllm_config,
+            kv_cache_spec,
+        )
+        == AttentionCGSupport.NEVER
+    )
+
+    monkeypatch.setenv("VLLM_TREE_ATTN_CUDAGRAPH_PROBE", "1")
+    assert (
+        TreeAttentionMetadataBuilder.get_cudagraph_support(
+            vllm_config,
+            kv_cache_spec,
+        )
+        == AttentionCGSupport.UNIFORM_BATCH
+    )
+
+
 def test_branching_tree_attn_bias_only_applies_to_full_tree_decode():
     builder = create_tree_attn_builder(
         speculative_token_tree="[(0,), (1,), (0, 0), (0, 1)]"
@@ -128,6 +159,33 @@ def test_branching_tree_attn_bias_only_applies_to_full_tree_decode():
     assert ordinary_metadata.tree_attn_bias is None
     assert tree_metadata is not None
     assert tree_metadata.tree_attn_bias is not None
+
+
+def test_branching_tree_attn_keeps_short_prefill_out_of_tree_decode():
+    builder = create_tree_attn_builder(
+        speculative_token_tree="[(0,), (1,), (0, 0), (0, 1)]"
+    )
+    mixed_metadata = create_common_attn_metadata(
+        BatchSpec(seq_lens=[20, 11], query_lens=[5, 11]),
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+    mixed_metadata.is_prefilling = torch.tensor([False, True])
+
+    metadata = builder.build(0, mixed_metadata)
+
+    assert metadata.num_decodes == 1
+    assert metadata.num_decode_tokens == 5
+    assert metadata.num_prefills == 1
+    assert metadata.num_prefill_tokens == 11
+    decode_metadata = metadata.decode_metadata
+    assert decode_metadata is not None
+    assert decode_metadata.tree_attn_bias is not None
+    assert decode_metadata.tree_attn_bias.shape == (5, 5)
+    prefill_metadata = metadata.prefill_metadata
+    assert prefill_metadata is not None
+    assert prefill_metadata.tree_attn_bias is None
+    assert prefill_metadata.max_query_len == 11
 
 
 def test_tree_attn_dynamic_target_mask_builds_per_request_bias():
@@ -185,6 +243,462 @@ def test_tree_attn_runtime_bias_applies_dynamic_target_mask():
     assert not torch.isneginf(tree_metadata.tree_attn_bias[0, :, 0]).any()
     assert not torch.isneginf(tree_metadata.tree_attn_bias[1, :, 0]).any()
     assert not torch.isneginf(tree_metadata.tree_attn_bias[1, :, 2]).any()
+
+
+def test_compact_tree_metadata_materializes_dense_bias_oracle():
+    retrieve_next_token = torch.tensor(
+        [
+            [1, -1, -1, -1],
+            [1, 3, -1, -1],
+        ],
+        dtype=torch.int32,
+    )
+    retrieve_next_sibling = torch.tensor(
+        [
+            [-1, 2, 3, -1],
+            [-1, 2, -1, -1],
+        ],
+        dtype=torch.int32,
+    )
+    target_mask = torch.tensor(
+        [
+            [1, 1, 0, 1],
+            [0, 1, 1, 1],
+        ],
+        dtype=torch.int32,
+    )
+    dense_bias = torch.where(
+        torch.tensor(
+            [
+                [
+                    [1, 0, 0, 0],
+                    [1, 1, 0, 0],
+                    [1, 0, 1, 0],
+                    [1, 0, 0, 1],
+                ],
+                [
+                    [1, 0, 0, 0],
+                    [1, 1, 0, 0],
+                    [1, 0, 1, 0],
+                    [1, 1, 0, 1],
+                ],
+            ],
+            dtype=torch.bool,
+        ),
+        torch.zeros((), dtype=torch.float32),
+        torch.full((), -torch.inf, dtype=torch.float32),
+    )
+    expected = dense_bias.clone()
+    expected[0, :, 2] = -torch.inf
+    # Root remains visible even if target_mask clears it.
+    expected[1, :, 0] = dense_bias[1, :, 0]
+
+    actual = materialize_tree_attn_bias_from_retrieve_metadata(
+        retrieve_next_token,
+        retrieve_next_sibling,
+        target_mask,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+
+    assert torch.equal(torch.isfinite(actual), torch.isfinite(expected))
+    assert torch.equal(actual, expected)
+
+
+def test_compact_tree_metadata_keeps_padding_rows_invisible():
+    retrieve_next_token = torch.tensor([[1, -1, -1, -1]], dtype=torch.int32)
+    retrieve_next_sibling = torch.tensor([[-1, 2, -1, -1]], dtype=torch.int32)
+
+    actual = materialize_tree_attn_bias_from_retrieve_metadata(
+        retrieve_next_token,
+        retrieve_next_sibling,
+        None,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+
+    assert torch.isfinite(actual).to(torch.int32).tolist() == [
+        [
+            [1, 0, 0, 0],
+            [1, 1, 0, 0],
+            [1, 0, 1, 0],
+            [0, 0, 0, 0],
+        ]
+    ]
+
+
+def test_tree_attn_compact_decode_switch_uses_kernel_metadata(monkeypatch):
+    monkeypatch.setenv("VLLM_TREE_ATTN_DYNAMIC_MASK_KERNEL", "1")
+    builder = create_tree_attn_builder(
+        speculative_token_tree="[(0,), (1,), (0, 0), (0, 1)]"
+    )
+    full_tree_decode = create_common_attn_metadata(
+        BatchSpec(seq_lens=[20, 28], query_lens=[3, 3]),
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+    full_tree_decode.tree_attn_bias = torch.zeros((2, 3, 3), dtype=torch.float32)
+    full_tree_decode.tree_retrieve_next_token = torch.tensor(
+        [
+            [1, 2, -1],
+            [1, -1, -1],
+        ],
+        dtype=torch.int32,
+    )
+    full_tree_decode.tree_retrieve_next_sibling = torch.tensor(
+        [
+            [-1, -1, -1],
+            [-1, 2, -1],
+        ],
+        dtype=torch.int32,
+    )
+    full_tree_decode.tree_target_mask = torch.tensor(
+        [
+            [1, 1, 0],
+            [1, 1, 1],
+        ],
+        dtype=torch.int32,
+    )
+    full_tree_decode.tree_parent = torch.tensor(
+        [
+            [-1, 0, 0],
+            [-1, 0, 0],
+        ],
+        dtype=torch.int32,
+    )
+
+    tree_metadata = builder.build(0, full_tree_decode).decode_metadata
+
+    assert tree_metadata is not None
+    assert tree_metadata.tree_attn_bias is None
+    assert tree_metadata.use_tree_compact_bias_kernel
+    assert torch.equal(
+        tree_metadata.tree_parent,
+        torch.tensor([[-1, 0, 0], [-1, 0, 0]], dtype=torch.int32),
+    )
+    assert torch.equal(
+        tree_metadata.tree_target_mask,
+        torch.tensor([[1, 1, 0], [1, 1, 1]], dtype=torch.int32),
+    )
+
+
+def test_tree_attn_compact_decode_switch_supports_mixed_q_lens(monkeypatch):
+    monkeypatch.setenv("VLLM_TREE_ATTN_DYNAMIC_MASK_KERNEL", "1")
+    builder = create_tree_attn_builder(
+        speculative_token_tree="[(0,), (1,), (0, 0), (0, 1)]"
+    )
+    mixed_decode = create_common_attn_metadata(
+        BatchSpec(seq_lens=[20, 26], query_lens=[3, 1]),
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+    mixed_decode.tree_attn_bias = torch.zeros((2, 3, 3), dtype=torch.float32)
+    mixed_decode.tree_retrieve_next_token = torch.tensor(
+        [[1, 2, -1], [-1, -1, -1]], dtype=torch.int32
+    )
+    mixed_decode.tree_retrieve_next_sibling = torch.tensor(
+        [[-1, -1, -1], [-1, -1, -1]], dtype=torch.int32
+    )
+    mixed_decode.tree_parent = torch.tensor(
+        [[-1, 0, 0], [-1, -1, -1]], dtype=torch.int32
+    )
+
+    tree_metadata = builder.build(0, mixed_decode).decode_metadata
+
+    assert tree_metadata is not None
+    assert tree_metadata.use_tree_compact_bias_kernel
+    assert tree_metadata.tree_attn_bias is None
+
+
+def test_common_attention_metadata_preserves_compact_tree_metadata():
+    common_metadata = create_common_attn_metadata(
+        BatchSpec(seq_lens=[20, 28], query_lens=[3, 3]),
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+    common_metadata.tree_retrieve_next_token = torch.tensor(
+        [[1, 2, -1], [1, -1, -1]], dtype=torch.int32
+    )
+    common_metadata.tree_retrieve_next_sibling = torch.tensor(
+        [[-1, -1, -1], [-1, 2, -1]], dtype=torch.int32
+    )
+    common_metadata.tree_parent = torch.tensor(
+        [[-1, 0, 0], [-1, 0, 0]], dtype=torch.int32
+    )
+
+    unpadded = common_metadata.unpadded(num_actual_tokens=3, num_actual_reqs=1)
+    sliced = _make_metadata_with_slice(
+        UBatchSlice(slice(1, 2), slice(3, 6)),
+        common_metadata,
+    )
+
+    assert unpadded.tree_retrieve_next_token.tolist() == [[1, 2, -1]]
+    assert unpadded.tree_retrieve_next_sibling.tolist() == [[-1, -1, -1]]
+    assert unpadded.tree_parent.tolist() == [[-1, 0, 0]]
+    assert sliced.tree_retrieve_next_token.tolist() == [[1, -1, -1]]
+    assert sliced.tree_retrieve_next_sibling.tolist() == [[-1, 2, -1]]
+    assert sliced.tree_parent.tolist() == [[-1, 0, 0]]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_tree_attn_compact_kernel_matches_dense_qq_bias_cuda():
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    dtype = torch.float16
+    batch_size = 2
+    tree_width = 4
+    context_len = 8
+    seq_len = context_len + tree_width
+    block_size = 16
+    num_kv_heads = 1
+    num_query_heads = 1
+    head_size = 32
+
+    query = torch.randn(
+        batch_size * tree_width,
+        num_query_heads,
+        head_size,
+        dtype=dtype,
+        device=device,
+    )
+    kv_cache = torch.randn(
+        batch_size,
+        2,
+        block_size,
+        num_kv_heads,
+        head_size,
+        dtype=dtype,
+        device=device,
+    )
+    key_cache = kv_cache[:, 0]
+    value_cache = kv_cache[:, 1]
+    dense_output = torch.empty_like(query)
+    compact_output = torch.empty_like(query)
+    query_start_loc = torch.arange(
+        0,
+        (batch_size + 1) * tree_width,
+        tree_width,
+        dtype=torch.int32,
+        device=device,
+    )
+    seq_lens = torch.full(
+        (batch_size,),
+        seq_len,
+        dtype=torch.int32,
+        device=device,
+    )
+    block_table = torch.arange(
+        batch_size,
+        dtype=torch.int32,
+        device=device,
+    ).view(batch_size, 1)
+    tree_parent = torch.tensor(
+        [
+            [-1, 0, 0, 1],
+            [-1, 0, 0, 1],
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
+    tree_target_mask = torch.tensor(
+        [
+            [1, 1, 0, 1],
+            [1, 1, 1, 1],
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
+
+    visible = torch.zeros(
+        batch_size,
+        tree_width,
+        tree_width,
+        dtype=torch.bool,
+        device=device,
+    )
+    for batch_idx in range(batch_size):
+        for local_idx in range(tree_width):
+            cur_idx = local_idx
+            visited: set[int] = set()
+            while 0 <= cur_idx < tree_width and cur_idx not in visited:
+                visited.add(cur_idx)
+                visible[batch_idx, local_idx, cur_idx] = True
+                if cur_idx == 0:
+                    break
+                cur_idx = int(tree_parent[batch_idx, cur_idx].item())
+    visible &= tree_target_mask.bool().unsqueeze(1)
+    visible[:, :, 0] = True
+    dense_bias = torch.where(
+        visible,
+        torch.zeros((), dtype=torch.float32, device=device),
+        torch.full((), -torch.inf, dtype=torch.float32, device=device),
+    )
+
+    kwargs = dict(
+        cu_seqlens_q=query_start_loc,
+        max_seqlen_q=tree_width,
+        seqused_k=seq_lens,
+        max_seqlen_k=seq_len,
+        softmax_scale=1.0 / head_size**0.5,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=block_table,
+        softcap=0.0,
+        q_descale=None,
+        k_descale=1.0,
+        v_descale=1.0,
+        kv_quant_mode=KVQuantMode.NONE,
+    )
+    unified_attention(
+        query,
+        key_cache,
+        value_cache,
+        dense_output,
+        qq_bias=dense_bias,
+        **kwargs,
+    )
+    unified_attention(
+        query,
+        key_cache,
+        value_cache,
+        compact_output,
+        tree_parent=tree_parent,
+        tree_target_mask=tree_target_mask,
+        **kwargs,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(dense_output, compact_output)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_tree_attn_compact_kernel_matches_dense_mixed_qlen_cuda():
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    dtype = torch.float16
+    tree_width = 4
+    context_lens = [8, 8]
+    q_lens = [4, 1]
+    seq_lens_host = [
+        context_len + q_len for context_len, q_len in zip(context_lens, q_lens)
+    ]
+    block_size = 16
+    num_kv_heads = 1
+    num_query_heads = 1
+    head_size = 32
+    num_tokens = sum(q_lens)
+
+    query = torch.randn(
+        num_tokens,
+        num_query_heads,
+        head_size,
+        dtype=dtype,
+        device=device,
+    )
+    kv_cache = torch.randn(
+        len(q_lens),
+        2,
+        block_size,
+        num_kv_heads,
+        head_size,
+        dtype=dtype,
+        device=device,
+    )
+    key_cache = kv_cache[:, 0]
+    value_cache = kv_cache[:, 1]
+    dense_output = torch.empty_like(query)
+    compact_output = torch.empty_like(query)
+    query_start_loc = torch.tensor(
+        [0, q_lens[0], sum(q_lens)],
+        dtype=torch.int32,
+        device=device,
+    )
+    seq_lens = torch.tensor(seq_lens_host, dtype=torch.int32, device=device)
+    block_table = torch.arange(
+        len(q_lens),
+        dtype=torch.int32,
+        device=device,
+    ).view(len(q_lens), 1)
+    tree_parent = torch.tensor(
+        [
+            [-1, 0, 0, 1],
+            [-1, -1, -1, -1],
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
+    tree_target_mask = torch.tensor(
+        [
+            [1, 1, 0, 1],
+            [0, 0, 0, 0],
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
+
+    visible = torch.zeros(
+        len(q_lens),
+        tree_width,
+        tree_width,
+        dtype=torch.bool,
+        device=device,
+    )
+    for batch_idx, q_len in enumerate(q_lens):
+        if q_len == 1:
+            visible[batch_idx, 0, 0] = True
+            continue
+        for local_idx in range(q_len):
+            cur_idx = local_idx
+            visited: set[int] = set()
+            while 0 <= cur_idx < tree_width and cur_idx not in visited:
+                visited.add(cur_idx)
+                visible[batch_idx, local_idx, cur_idx] = True
+                if cur_idx == 0:
+                    break
+                cur_idx = int(tree_parent[batch_idx, cur_idx].item())
+    visible &= tree_target_mask.bool().unsqueeze(1)
+    visible[:, :, 0] = True
+    dense_bias = torch.where(
+        visible,
+        torch.zeros((), dtype=torch.float32, device=device),
+        torch.full((), -torch.inf, dtype=torch.float32, device=device),
+    )
+
+    kwargs = dict(
+        cu_seqlens_q=query_start_loc,
+        max_seqlen_q=tree_width,
+        seqused_k=seq_lens,
+        max_seqlen_k=max(seq_lens_host),
+        softmax_scale=1.0 / head_size**0.5,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=block_table,
+        softcap=0.0,
+        q_descale=None,
+        k_descale=1.0,
+        v_descale=1.0,
+        kv_quant_mode=KVQuantMode.NONE,
+    )
+    unified_attention(
+        query,
+        key_cache,
+        value_cache,
+        dense_output,
+        qq_bias=dense_bias,
+        **kwargs,
+    )
+    unified_attention(
+        query,
+        key_cache,
+        value_cache,
+        compact_output,
+        tree_parent=tree_parent,
+        tree_target_mask=tree_target_mask,
+        **kwargs,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(dense_output, compact_output)
 
 
 def test_tree_attn_root_only_ignores_runtime_tree_bias():

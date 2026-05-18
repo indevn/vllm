@@ -361,6 +361,9 @@ def make_local_attention_virtual_batches(
         _num_computed_tokens_cpu=torch.from_numpy(num_computed_tokens_local),
         tree_target_mask=common_attn_metadata.tree_target_mask,
         tree_attn_bias=common_attn_metadata.tree_attn_bias,
+        tree_retrieve_next_token=common_attn_metadata.tree_retrieve_next_token,
+        tree_retrieve_next_sibling=common_attn_metadata.tree_retrieve_next_sibling,
+        tree_parent=common_attn_metadata.tree_parent,
         tree_root_only=common_attn_metadata.tree_root_only,
     ), make_block_table
 
@@ -423,6 +426,9 @@ def make_kv_sharing_fast_prefill_common_attn_metadata(
         _num_computed_tokens_cpu=common_attn_metadata._num_computed_tokens_cpu,
         tree_target_mask=common_attn_metadata.tree_target_mask,
         tree_attn_bias=common_attn_metadata.tree_attn_bias,
+        tree_retrieve_next_token=common_attn_metadata.tree_retrieve_next_token,
+        tree_retrieve_next_sibling=common_attn_metadata.tree_retrieve_next_sibling,
+        tree_parent=common_attn_metadata.tree_parent,
         tree_root_only=common_attn_metadata.tree_root_only,
     )
     return common_attn_metadata

@@ -27,6 +27,15 @@ def parse_args() -> argparse.Namespace:
         help="Glob for target-only replay bundle JSON files.",
     )
     parser.add_argument("--output", required=True)
+    parser.add_argument(
+        "--low-margin-threshold",
+        type=float,
+        default=0.25,
+        help=(
+            "Top-1/top-2 margin threshold used to classify near-tie rows. "
+            "Both DDT and target margins must be at or below this value."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -154,6 +163,11 @@ def comparable_tail(record: dict[str, Any]) -> list[int] | None:
     tail = record.get("token_ids_cpu_tail")
     if tail is None:
         return None
+    # Standalone target-only traces can expose placeholder-filled tails before
+    # the sampled output IDs have been committed back to the CPU token table.
+    # Treat these as unavailable evidence instead of a real history mismatch.
+    if any(int(token_id) < 0 for token_id in tail):
+        return None
     local_output_index = record.get("local_output_index")
     output_token_ids = record.get("output_token_ids") or []
     if isinstance(local_output_index, int) and local_output_index > 0:
@@ -173,19 +187,25 @@ def tails_match(
     return case_tail[-compare_width:] == target_tail[-compare_width:]
 
 
-def is_low_margin(value: float | None, threshold: float = 0.25) -> bool:
+def is_low_margin(value: float | None, threshold: float) -> bool:
     return value is not None and value <= threshold
 
 
-def classify(row: dict[str, Any]) -> str:
+def classify(row: dict[str, Any], low_margin_threshold: float = 0.25) -> str:
     if row["mask_ok"] is False:
         return "hard_fail_mask_visibility"
     if row["tails_equal"] is False:
         return "hard_fail_history_mismatch"
     if not row["ddt_top_contains_tokens"] or not row["target_top_contains_tokens"]:
         return "needs_investigation_non_top2"
-    if is_low_margin(row["ddt_margin"]) and is_low_margin(row["target_margin"]):
-        if row["has_tree_metadata"]:
+    if is_low_margin(row["ddt_margin"], low_margin_threshold) and is_low_margin(
+        row["target_margin"], low_margin_threshold
+    ):
+        if (
+            row["has_tree_metadata"]
+            and row["logits_source"] == "tree"
+            and (row["num_draft_tokens"] or 0) > 0
+        ):
             return "low_margin_tree_verify_candidate"
         if row["nonprefix_relocation_pairs_before"] > 0:
             return "post_relocation_q1_low_margin_candidate"
@@ -197,6 +217,7 @@ def classify_bundle(
     path: Path,
     bundle: dict[str, Any],
     target_bundle: dict[str, Any] | None,
+    low_margin_threshold: float = 0.25,
 ) -> dict[str, Any]:
     record = bundle.get("first_diff_record") or {}
     target_record = (
@@ -239,6 +260,7 @@ def classify_bundle(
         "baseline_token": baseline_token,
         "case_token": case_token,
         "has_tree_metadata": record.get("has_tree_metadata"),
+        "num_draft_tokens": record.get("num_draft_tokens"),
         "logits_source": ddt_source,
         "local_output_index": local_output_index,
         "accepted_local_index": accepted_local_index,
@@ -278,7 +300,7 @@ def classify_bundle(
         "target_positions": target_record.get("positions"),
         "target_slot_mapping": target_record.get("slot_mapping"),
     }
-    row["classification"] = classify(row)
+    row["classification"] = classify(row, low_margin_threshold)
     return row
 
 
@@ -295,9 +317,16 @@ def main() -> None:
     for path in case_paths:
         bundle = load_json(path)
         target = target_by_cell_prompt.get((cell_id(path, bundle), bundle["prompt_id"]))
-        rows.append(classify_bundle(path, bundle, target))
+        rows.append(
+            classify_bundle(
+                path,
+                bundle,
+                target,
+                low_margin_threshold=args.low_margin_threshold,
+            )
+        )
 
-    output = {"rows": rows}
+    output = {"low_margin_threshold": args.low_margin_threshold, "rows": rows}
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
