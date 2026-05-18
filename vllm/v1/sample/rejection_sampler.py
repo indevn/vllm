@@ -21,7 +21,7 @@ from vllm.v1.sample.ops.bad_words import apply_bad_words_with_drafts
 from vllm.v1.sample.ops.penalties import apply_all_penalties
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.sample.sampler import Sampler
-from vllm.v1.spec_decode.dynamic_tree import (
+from vllm.v1.spec_decode.dynamic_tree_verify import (
     verify_dynamic_tree_greedy,
 )
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata

@@ -30,7 +30,7 @@ from vllm.platforms import current_platform
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
-from vllm.v1.spec_decode.dynamic_tree import (
+from vllm.v1.spec_decode.dynamic_tree_select import (
     build_static_topk_compact_metadata,
 )
 from vllm.v1.spec_decode.eagle import EagleProposer

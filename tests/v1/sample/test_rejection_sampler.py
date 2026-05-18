@@ -20,7 +20,7 @@ from vllm.v1.sample.rejection_sampler import (
     tree_rejection_greedy_sample,
 )
 from vllm.v1.sample.sampler import Sampler, SamplerOutput
-from vllm.v1.spec_decode.dynamic_tree import (
+from vllm.v1.spec_decode.dynamic_tree_select import (
     DynamicTreeDraftOutput,
     build_dynamic_tree,
     build_dynamic_tree_from_logits,

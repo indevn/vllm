@@ -41,7 +41,7 @@ from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import KVCacheConfig, UniformTypeKVCacheSpecs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import _SAMPLING_EPS
-from vllm.v1.spec_decode.dynamic_tree import (
+from vllm.v1.spec_decode.dynamic_tree_select import (
     build_selected_bool_compact_metadata_kernel,
     build_static_topk_compact_metadata_kernel,
 )

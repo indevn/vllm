@@ -5,7 +5,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from vllm.v1.spec_decode.dynamic_tree import (  # noqa: E402
+from vllm.v1.spec_decode.dynamic_tree_select import (  # noqa: E402
     DynamicDraftTreeManager,
     build_dynamic_tree,
     build_dynamic_tree_from_logits,
@@ -13,6 +13,8 @@ from vllm.v1.spec_decode.dynamic_tree import (  # noqa: E402
     build_selected_bool_compact_metadata_kernel,
     build_static_topk_compact_metadata,
     build_static_topk_compact_metadata_kernel,
+)
+from vllm.v1.spec_decode.dynamic_tree_verify import (  # noqa: E402
     verify_dynamic_tree_greedy,
     verify_dynamic_tree_greedy_from_draft,
     verify_dynamic_tree_greedy_kernel,
