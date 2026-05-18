@@ -69,6 +69,44 @@ The likely upstreamable path is a sequence of small PRs, starting with compact
 metadata oracle tests and typed handoff structures before enabling DDT runtime
 behavior.
 
+## Hardening Steps
+
+The current upstreamable hardening goal is split into five reviewable steps.
+Each step has an explicit acceptance boundary so that future PRs can be small
+and deterministic.
+
+| Step | Artifact | Acceptance boundary |
+| --- | --- | --- |
+| 0. RFC draft | This document plus [DDT Upstreamable Hardening](ddt_upstreamable_hardening.md) | Explains SDT vs DDT, metadata contract, correctness policy, enable policy, non-goals, and PR split. |
+| 1. Compact metadata -> dense TREE_ATTN bias oracle | `materialize_tree_attn_bias_from_retrieve_metadata` and attention tests | CPU oracle covers root-only, prefix-only, branching, padding, mixed q-lens, and target-mask semantics without enabling DDT by default. |
+| 2. Near-tie policy hardening | worker unit tests and classifier regression tests | Fallback is disabled by default, records threshold/reason/truncation when enabled, skips no-draft and invalid rows, and does not participate in clean performance claims. |
+| 3. Runner intrusion reduction | `vllm/v1/spec_decode/dynamic_tree_relocation.py` | First split moves relocation pair/index/cache helpers out of `gpu_model_runner.py` with helper-level tests and unchanged runtime semantics. |
+| 4. Production monitoring contract | [DDT Upstreamable Hardening](ddt_upstreamable_hardening.md) | Defines counters for enable/fallback, graph replay, metadata staging, compact mask, relocation, near-tie, acceptance, and prefix-cache interactions. |
+| 5. Prefix cache / batch shape / context length matrix | regression harnesses under `benchmarks/spec_decode/` | Defines which cells are correctness-claimable, diagnostic-only, or performance-comparable, including prefix-cache hit distribution requirements. |
+
+Focused local evidence can be reproduced with:
+
+```bash
+./.conda/bin/python -m pytest \
+  tests/v1/attention/test_attention_splitting.py \
+  tests/v1/worker/test_gpu_model_runner.py \
+  tests/benchmarks/test_ddt_correctness_regression.py \
+  -k "compact_tree_metadata or tree_attn_compact_decode_switch or dynamic_tree_relocation_helper or tree_near_tie or ddt_regression or outcome_policy or replay_classifier or trace_graph_summary or trace_stage_profile" \
+  -q
+```
+
+The live-server correctness matrix remains separate from unit evidence because
+it requires target-only and DDT vLLM servers with matching trace paths:
+
+```bash
+./.conda/bin/python benchmarks/spec_decode/run_ddt_correctness_regression.py \
+  --suite full \
+  --target-trace /path/to/target_trace.jsonl \
+  --ddt-trace /path/to/ddt_trace.jsonl \
+  --output-dir /tmp/ddt_correctness_full \
+  --low-margin-threshold 0.5
+```
+
 ## Reviewer Notes
 
 This branch is useful for reviewing the systems shape of DDT:
